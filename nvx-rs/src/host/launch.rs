@@ -248,6 +248,12 @@ impl LaunchSpec {
         }
         arguments.push("--memory".into());
         arguments.push(format!("{}M", self.memory_mib).into());
+        // PoC only: lets an experiment on a host whose hypervisor lacks the built-in CPU profile
+        // (`E_PROFILE_UNSUPPORTED`) select `host`. Not a supported setting.
+        if let Some(profile) = std::env::var_os("NVX_POC_CPU_PROFILE").filter(|p| !p.is_empty()) {
+            arguments.push("--cpu-profile".into());
+            arguments.push(profile);
+        }
         arguments.push("--kernel".into());
         arguments.push(self.kernel.clone().into());
         arguments.push("--initrd".into());

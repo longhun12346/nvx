@@ -19,6 +19,7 @@ pub mod instance;
 pub mod launch;
 pub mod network;
 pub mod platform;
+pub mod poc_live;
 pub mod process;
 pub mod report;
 pub mod session;

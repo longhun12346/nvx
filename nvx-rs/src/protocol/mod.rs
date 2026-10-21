@@ -33,9 +33,10 @@ mod tests;
 
 pub use app::{
     APP_CANCEL, APP_ERROR, APP_EXEC, APP_EXIT, APP_FEATURES, APP_HEADER_LEN, APP_MAGIC, APP_MAPS,
+    APP_UNMAP,
     APP_PING, APP_READY, APP_STDERR, APP_STDOUT, APP_STOP, APP_STOPPED, APP_VERSION, AppFrame,
     BUSY, CWD_FAILED, ExitCategory, INVALID_REQUEST, LAUNCH_FAILED, MAPPING_FAILED,
-    MAPPINGS_INCOMPLETE, UNSUPPORTED_OPERATION, decode_app, encode_app,
+    MAPPING_LIMIT, MAPPINGS_INCOMPLETE, UNSUPPORTED_OPERATION, decode_app, encode_app,
 };
 pub use boot::{MAPS_TOKEN, WORKLOAD_ACCOUNT_TOKEN};
 pub use exec::{
@@ -48,6 +49,7 @@ pub use features::GuestFeatures;
 pub use maps::{
     HostMap, MAP_ENTRY_HEADER_LEN, MAP_READ_ONLY, MAPS_HEADER_LEN, MAX_HOST_MAPPINGS,
     MAX_MAP_PATH_BYTES, MapsPayload, decode_maps_payload, encode_maps_payloads,
+    encode_maps_payloads_from,
 };
 pub use outer::{
     CAPABILITY_LEN, OUTER_DATA, OUTER_ERROR, OUTER_HEADER_LEN, OUTER_HOST_ATTACH, OUTER_MAGIC,

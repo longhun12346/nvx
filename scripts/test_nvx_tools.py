@@ -7923,7 +7923,7 @@ class BuildTests(unittest.TestCase):
         )
         self.assertEqual(
             ubuntu_manifest["package_lock_sha256"],
-            "fcdd30223b96fc26e24fcf4b6763a4a2504e9cd25882e68e89fbf6bf45277ef0",
+            "ba053365ab647edab3a923f6669b5ecc32443496da1f42d8130f0599c66d8a73",
         )
         packages = ubuntu.load_package_lock()
         self.assertEqual(
@@ -7931,11 +7931,50 @@ class BuildTests(unittest.TestCase):
             [
                 "busybox-static",
                 "iputils-ping",
+                "libada-url0-3",
+                "libbrotli1",
                 "libcap2",
+                "libcares2",
+                "libexpat1",
+                "libffi8",
+                "libicu78",
                 "libidn2-0",
+                "libllhttp9.3",
+                "libnghttp2-14",
+                "libnode127",
+                "libpython3-stdlib",
+                "libpython3.14-minimal",
+                "libpython3.14-stdlib",
+                "libreadline8t64",
+                "libsimdjson29",
+                "libsimdutf31",
+                "libsqlite3-0",
                 "libunistring5",
+                "libuv1t64",
+                "media-types",
                 "net-tools",
+                "netbase",
                 "netcat-openbsd",
+                "node-acorn",
+                "node-balanced-match",
+                "node-brace-expansion",
+                "node-cjs-module-lexer",
+                "node-corepack",
+                "node-debug",
+                "node-llhttp",
+                "node-lru-cache",
+                "node-minimatch",
+                "node-ms",
+                "node-semver",
+                "node-undici",
+                "node-xtend",
+                "nodejs",
+                "python3",
+                "python3-minimal",
+                "python3.14",
+                "python3.14-minimal",
+                "readline-common",
+                "tzdata",
             ],
         )
 
@@ -11322,10 +11361,11 @@ class ManagedAgentStopTests(unittest.TestCase):
 
     def test_agent_advertises_the_control_features_of_its_mode(self):
         cancel, workload_account, exec_cgroup, environment = (1, 4, 8, 16)
-        exec_cwd, host_mapping_table = (32, 64)
+        exec_cwd, host_mapping_table, runtime_mappings = (32, 64, 128)
         for rootfs, expected in (
-            # Only the direct agent maps host paths, gives each workload a cgroup, and
-            # refuses a working directory that the workload cannot enter. Bit 1, which
+            # Only the direct agent maps host paths (also after readiness), gives each
+            # workload a cgroup, and refuses a working directory that the workload cannot
+            # enter. Bit 1, which
             # announced nvx_map= kernel tokens, is retired.
             (
                 "-",
@@ -11334,7 +11374,8 @@ class ManagedAgentStopTests(unittest.TestCase):
                 | exec_cgroup
                 | environment
                 | exec_cwd
-                | host_mapping_table,
+                | host_mapping_table
+                | runtime_mappings,
             ),
             ("/run/nvx/rootfs", cancel | workload_account | environment),
         ):

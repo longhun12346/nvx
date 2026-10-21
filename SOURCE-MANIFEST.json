@@ -48,7 +48,7 @@
     "archive_keyring_url": "https://archive.ubuntu.com/ubuntu/project/ubuntu-archive-keyring.gpg",
     "archive_keyring_sha256": "80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31",
     "package_lock": "ubuntu/packages.lock.json",
-    "package_lock_sha256": "fcdd30223b96fc26e24fcf4b6763a4a2504e9cd25882e68e89fbf6bf45277ef0",
+    "package_lock_sha256": "ba053365ab647edab3a923f6669b5ecc32443496da1f42d8130f0599c66d8a73",
     "guest_sources": [
       "guest/common",
       "guest/ubuntu",

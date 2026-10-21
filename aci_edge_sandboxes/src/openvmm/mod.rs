@@ -235,6 +235,83 @@ impl OpenVmmBackend {
     }
 }
 
+impl OpenVmmBackend {
+    /// **Proof-of-concept.** Adds one host path to the running guest of `sandbox_id` without a
+    /// restart; see [`nvx::host::poc_live`]. `added_before` is the number of shares that earlier
+    /// calls added, and `request_dir` is the `NVX_POC_LIVE_SHARE_DIR` that the VMM was started
+    /// with.
+    pub fn add_share_poc(
+        &self,
+        sandbox_id: &SandboxId,
+        request_dir: &std::path::Path,
+        added_before: usize,
+        share: &nvx::host::poc_live::LiveShare<'_>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let instance = self.store.instance(sandbox_id);
+        let (runtime, capability) = {
+            let (_guard, _) = self.store.lock_and_load(sandbox_id)?;
+            match self.reconcile(sandbox_id)? {
+                RunState::Provisioned => {
+                    return Err(Error::not_started(format!(
+                        "sandbox {sandbox_id} is not running"
+                    )));
+                }
+                RunState::Running(runtime) => (runtime, instance.read_capability()?),
+            }
+        };
+        instance
+            .add_share_poc(&runtime, &capability, request_dir, added_before, share, timeout)
+            .map_err(exec_error)
+    }
+}
+
+impl OpenVmmBackend {
+    /// **Proof-of-concept.** Removes a share that [`Self::add_share_poc`] added from the running
+    /// guest of `sandbox_id`: the guest unmounts `target`, then the VMM stops exporting `child`.
+    pub fn remove_share_poc(
+        &self,
+        sandbox_id: &SandboxId,
+        request_dir: &std::path::Path,
+        child: &str,
+        target: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let instance = self.store.instance(sandbox_id);
+        let (runtime, capability) = {
+            let (_guard, _) = self.store.lock_and_load(sandbox_id)?;
+            match self.reconcile(sandbox_id)? {
+                RunState::Provisioned => {
+                    return Err(Error::not_started(format!(
+                        "sandbox {sandbox_id} is not running"
+                    )));
+                }
+                RunState::Running(runtime) => (runtime, instance.read_capability()?),
+            }
+        };
+        instance
+            .remove_share_poc(&runtime, &capability, request_dir, child, target, timeout)
+            .map_err(exec_error)
+    }
+}
+
+impl OpenVmmBackend {
+    /// Returns the process ID and start time of the OpenVMM process that runs `sandbox_id`.
+    ///
+    /// The guest's RAM is memory of that process, so a host that wants to bound a sandbox's
+    /// resident memory (for example by trimming its working set while it is idle) needs it. The
+    /// start time lets the caller reject a recycled process ID.
+    pub fn vmm_process(&self, sandbox_id: &SandboxId) -> Result<(u32, u64)> {
+        let (_guard, _) = self.store.lock_and_load(sandbox_id)?;
+        match self.reconcile(sandbox_id)? {
+            RunState::Provisioned => Err(Error::not_started(format!(
+                "sandbox {sandbox_id} is not running"
+            ))),
+            RunState::Running(runtime) => Ok((runtime.pid, runtime.start_time)),
+        }
+    }
+}
+
 /// Converts the contract's network section and the sandbox spec's host-loopback forwards into
 /// NVX's network posture, under the contract's field names. An omitted host-loopback access is
 /// denied.

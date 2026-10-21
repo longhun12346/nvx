@@ -36,6 +36,7 @@
 #define APP_CANCEL 4U
 #define APP_FEATURES 5U
 #define APP_MAPS 6U
+#define APP_UNMAP 7U
 #define APP_READY 0x81U
 #define APP_STDOUT 0x82U
 #define APP_STDERR 0x83U
@@ -60,6 +61,8 @@
 #define FEATURE_EXEC_ENVIRONMENT (1U << 4)
 #define FEATURE_EXEC_CWD (1U << 5)
 #define FEATURE_HOST_MAPPING_TABLE (1U << 6)
+/* APP_MAPS may append entries beyond the announced count once it is mounted. */
+#define FEATURE_RUNTIME_MAPPINGS (1U << 7)
 
 #define MAX_ARGUMENTS 64U
 #define MAX_ARGUMENT_LEN 4096U
@@ -142,10 +145,25 @@ struct exec_config {
  * Host mappings that nvx_maps= announces and APP_MAPS requests deliver. Until
  * every announced mapping is mounted, workloads are refused.
  */
+#define MAX_RUNTIME_MAPPINGS 256U
+
 struct host_mappings {
     uint32_t expected;
     uint32_t applied;
     int failed;
+    /*
+     * Targets of the mappings that APP_MAPS appended at run time and that
+     * APP_UNMAP may still unmount; NULL marks a free slot. Mappings of the
+     * announced table are never listed, so the host cannot unmount them.
+     */
+    char *runtime_targets[MAX_RUNTIME_MAPPINGS];
+    /*
+     * Sequence number of the next runtime APP_MAPS request. Runtime mappings do not
+     * use the table's entry indices, so the table's bound does not limit how often
+     * mappings are added and removed; only MAX_RUNTIME_MAPPINGS limits how many are
+     * mounted at once.
+     */
+    uint32_t runtime_next;
 };
 
 #define LAUNCH_STAGE_CWD 1
@@ -2125,17 +2143,109 @@ static uint32_t agent_features(const struct agent_config *config)
         FEATURE_CANCEL | FEATURE_WORKLOAD_ACCOUNT | FEATURE_EXEC_ENVIRONMENT;
 
     if (config->direct) {
-        features |= FEATURE_HOST_MAPPING_TABLE | FEATURE_EXEC_CGROUP | FEATURE_EXEC_CWD;
+        features |= FEATURE_HOST_MAPPING_TABLE | FEATURE_RUNTIME_MAPPINGS | FEATURE_EXEC_CGROUP |
+                    FEATURE_EXEC_CWD;
     }
     return features;
 }
 
 /*
+ * Mounts one mapping that APP_MAPS appends at run time and lists its target for
+ * APP_UNMAP. A failure leaves the agent as it was: unlike a mapping of the
+ * announced table, it does not make later workloads fail, and the sequence
+ * number is not used up, so the host may retry. A full list is reported as
+ * "mapping-limit" so that the host can tell it from a failed mount.
+ */
+static int mount_runtime_mapping(
+    struct control_session *session,
+    struct host_mappings *mappings,
+    uint64_t request_id,
+    const char *source,
+    const char *target,
+    int read_only)
+{
+    uint32_t slot;
+    uint32_t free_slot = MAX_RUNTIME_MAPPINGS;
+    char *copy;
+
+    for (slot = 0; slot < MAX_RUNTIME_MAPPINGS; ++slot) {
+        if (mappings->runtime_targets[slot] == NULL) {
+            if (free_slot == MAX_RUNTIME_MAPPINGS) {
+                free_slot = slot;
+            }
+        } else if (strcmp(mappings->runtime_targets[slot], target) == 0) {
+            return send_app_error(session, request_id, EEXIST, "mapping-failed");
+        }
+    }
+    if (free_slot == MAX_RUNTIME_MAPPINGS || mappings->runtime_next == UINT32_MAX) {
+        return send_app_error(session, request_id, ENOSPC, "mapping-limit");
+    }
+    copy = strdup(target);
+    if (copy == NULL) {
+        return send_app_error(session, request_id, ENOMEM, "mapping-failed");
+    }
+    if (apply_host_mapping(source, target, read_only) != 0) {
+        int status = errno;
+
+        free(copy);
+        portb_error("host-mapping", status);
+        return send_app_error(session, request_id, status, "mapping-failed");
+    }
+    mappings->runtime_targets[free_slot] = copy;
+    ++mappings->runtime_next;
+    return send_app_frame(session, APP_READY, request_id, 0, NULL, 0);
+}
+
+/*
+ * Unmounts the runtime mapping at the guest path that an APP_UNMAP request
+ * carries. Only a mapping that APP_MAPS appended at run time qualifies, never
+ * one of the announced table. The session is serial, so no workload uses the
+ * mapping, and the host removes the export only after this succeeds.
+ */
+static int handle_unmap(
+    struct control_session *session,
+    struct host_mappings *mappings,
+    const struct app_request *request)
+{
+    char target[MAX_GUEST_PATH];
+    uint32_t slot;
+
+    if (mappings->failed || mappings->expected == 0 || request->payload_len == 0 ||
+        request->payload_len >= sizeof(target) || request->payload[0] != '/' ||
+        memchr(request->payload, '\0', request->payload_len) != NULL) {
+        return send_app_error(session, request->request_id, 22, "invalid-request");
+    }
+    memcpy(target, request->payload, request->payload_len);
+    target[request->payload_len] = '\0';
+    for (slot = 0; slot < MAX_RUNTIME_MAPPINGS; ++slot) {
+        if (mappings->runtime_targets[slot] != NULL &&
+            strcmp(mappings->runtime_targets[slot], target) == 0) {
+            if (umount(target) != 0) {
+                int status = errno;
+
+                portb_error("host-unmap", status);
+                return send_app_error(session, request->request_id, status, "mapping-failed");
+            }
+            free(mappings->runtime_targets[slot]);
+            mappings->runtime_targets[slot] = NULL;
+            return send_app_frame(session, APP_READY, request->request_id, 0, NULL, 0);
+        }
+    }
+    return send_app_error(session, request->request_id, 22, "invalid-request");
+}
+
+/*
  * Mounts the entries FIRST to FIRST + COUNT - 1 of the host mapping table that
- * an APP_MAPS request carries after its 32-bit FIRST and COUNT. Entries arrive
- * in order and only up to the number that nvx_maps= announced, before any
- * workload runs. The whole request is checked before anything is mounted, and
- * a mapping that fails to mount fails every later workload.
+ * an APP_MAPS request carries after its 32-bit FIRST and COUNT. Entries of the
+ * announced table arrive in order and only up to the number that nvx_maps=
+ * announced, before any workload runs. The whole request is checked before
+ * anything is mounted, and a mapping that fails to mount fails every later
+ * workload.
+ *
+ * Once the announced table is mounted, a request instead appends one runtime
+ * mapping: FIRST is then the sequence number of runtime requests (not a table
+ * index), and COUNT is 1. Without an announced table (a layered root never
+ * parses nvx_maps=) there is nothing to append to, and the request is invalid.
  */
 static int handle_host_mappings(
     struct control_session *session,
@@ -2149,14 +2259,16 @@ static int handle_host_mappings(
     uint32_t index;
     uint32_t offset = MAPS_HEADER_LEN;
     int read_only;
+    int runtime;
 
     if (mappings->failed || request->payload_len < MAPS_HEADER_LEN) {
         return send_app_error(session, request->request_id, 22, "invalid-request");
     }
     first = read_u32(request->payload);
     count = read_u32(request->payload + 4);
-    if (first != mappings->applied || count == 0 ||
-        count > mappings->expected - mappings->applied) {
+    runtime = mappings->expected != 0 && mappings->applied >= mappings->expected;
+    if (count == 0 || first != (runtime ? mappings->runtime_next : mappings->applied) ||
+        (runtime ? count != 1 : count > mappings->expected - mappings->applied)) {
         return send_app_error(session, request->request_id, 22, "invalid-request");
     }
     for (index = 0; index < count; ++index) {
@@ -2168,6 +2280,11 @@ static int handle_host_mappings(
     }
     if (offset != request->payload_len) {
         return send_app_error(session, request->request_id, 22, "invalid-request");
+    }
+    if (runtime) {
+        /* The one entry that was just decoded. */
+        return mount_runtime_mapping(
+            session, mappings, request->request_id, source, target, read_only);
     }
     offset = MAPS_HEADER_LEN;
     for (index = 0; index < count; ++index) {
@@ -2259,6 +2376,8 @@ static int handle_app_request(
             sizeof(features));
     case APP_MAPS:
         return handle_host_mappings(session, mappings, request);
+    case APP_UNMAP:
+        return handle_unmap(session, mappings, request);
     case APP_STOP:
         if (request->payload_len != 0 ||
             send_app_frame(

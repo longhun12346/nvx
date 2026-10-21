@@ -305,6 +305,35 @@ class UbuntuBuildConstants:
         "libidn2-0": frozenset({"triggers"}),
         "libunistring5": frozenset({"triggers"}),
         "netcat-openbsd": frozenset({"postinst", "prerm"}),
+        # Python 3 and Node.js runtimes. The initramfs build never runs maintainer
+        # scripts; their effects (byte-compiling, update-alternatives, debconf, default
+        # /etc files) are either not needed in a read-only-source, in-memory root or are
+        # replaced by build-time steps.
+        "libada-url0-3": frozenset({"triggers"}),
+        "libbrotli1": frozenset({"triggers"}),
+        "libcares2": frozenset({"triggers"}),
+        "libexpat1": frozenset({"triggers"}),
+        "libffi8": frozenset({"triggers"}),
+        "libicu78": frozenset({"triggers"}),
+        "libllhttp9.3": frozenset({"triggers"}),
+        "libnghttp2-14": frozenset({"triggers"}),
+        "libnode127": frozenset({"triggers"}),
+        "libpython3.14-minimal": frozenset({"postinst", "postrm", "prerm"}),
+        "libpython3.14-stdlib": frozenset({"prerm"}),
+        "libreadline8t64": frozenset({"postrm", "preinst", "triggers"}),
+        "libsimdjson29": frozenset({"triggers"}),
+        "libsimdutf31": frozenset({"triggers"}),
+        "libsqlite3-0": frozenset({"triggers"}),
+        "libuv1t64": frozenset({"triggers"}),
+        "netbase": frozenset({"postinst", "postrm"}),
+        "node-undici": frozenset({"postinst", "postrm", "preinst", "prerm"}),
+        "nodejs": frozenset({"postinst", "prerm"}),
+        "python3": frozenset({"postinst", "postrm", "preinst", "prerm"}),
+        "python3-minimal": frozenset({"postinst", "prerm"}),
+        "python3.14": frozenset({"postinst", "prerm"}),
+        "python3.14-minimal": frozenset({"postinst", "postrm", "preinst", "prerm"}),
+        "readline-common": frozenset({"postinst", "postrm"}),
+        "tzdata": frozenset({"postinst", "postrm"}),
     }
 
 

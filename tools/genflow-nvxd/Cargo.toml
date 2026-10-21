@@ -1,0 +1,15 @@
+[package]
+name = "genflow-nvxd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "PoC sidecar: drives NVX microVM sandboxes for the GenFlow sandboxhost over stdio frames"
+publish = false
+
+[dependencies]
+# Local NVX fork on genflow/productization; P3a will pin a published Git revision.
+aci_edge_sandboxes = { path = "D:/github/nvx/aci_edge_sandboxes", default-features = false, features = ["openvmm"] }
+serde_json = "1.0.120"
+
+[profile.release]
+panic = "abort"

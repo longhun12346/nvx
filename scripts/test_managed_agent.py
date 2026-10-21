@@ -477,6 +477,7 @@ REMOUNT = MS_BIND | MS_REMOUNT | MS_NOSUID | MS_NODEV
 APP_EXEC = 2
 APP_FEATURES = 5
 APP_MAPS = 6
+APP_UNMAP = 7
 APP_READY = 0x81
 APP_ERROR = 0xFF
 
@@ -508,6 +509,14 @@ int __wrap_mount(const char *source, const char *target, const char *type,
     (void)data;
     if (log == NULL) return -1;
     fprintf(log, "%s|%s|%lu\\n", source == NULL ? "-" : source, target, flags);
+    fclose(log);
+    return 0;
+}
+
+int __wrap_umount(const char *target) {
+    FILE *log = fopen(getenv("NVX_TEST_MOUNT_LOG"), "a");
+    if (log == NULL) return -1;
+    fprintf(log, "umount|%s|0\\n", target);
     fclose(log);
     return 0;
 }
@@ -567,6 +576,7 @@ int main(int argc, char **argv) {
                 str(guest),
                 str(harness),
                 "-Wl,--wrap=mount",
+                "-Wl,--wrap=umount",
                 "-o",
                 str(cls.executable),
             ],
@@ -705,6 +715,80 @@ int main(int argc, char **argv) {
         )
         self.assertEqual(len(self.mounts()), 2)
 
+    def test_runtime_mappings_append_after_the_announced_table_and_unmap(self):
+        announced = str(self.case / "guest" / "a")
+        runtime = str(self.case / "guest" / "b")
+        export = self.root / "hostfs" / "root"
+        result, answers = self.run_agent(
+            "nvx_maps=1",
+            [
+                (APP_MAPS, self.maps(0, [("0/src", announced, 1)])),
+                # Runtime requests number themselves from zero, one entry each.
+                (APP_MAPS, self.maps(0, [("1", runtime, 0)])),
+                (APP_MAPS, self.maps(0, [("1", runtime, 0)])),
+                (APP_MAPS, self.maps(1, [("0/src", runtime, 0)])),
+                (APP_UNMAP, announced.encode()),
+                (APP_UNMAP, runtime.encode()),
+                # A refused request did not use up sequence number 1.
+                (APP_MAPS, self.maps(1, [("1", runtime, 0)])),
+            ],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"1 1 0\n")
+        self.assertEqual(
+            [(kind, status, payload) for kind, _, status, payload in answers],
+            [
+                (APP_READY, 0, b""),
+                (APP_READY, 0, b""),
+                (APP_ERROR, 22, b"invalid-request"),
+                (APP_ERROR, 17, b"mapping-failed"),
+                (APP_ERROR, 22, b"invalid-request"),
+                (APP_READY, 0, b""),
+                (APP_READY, 0, b""),
+            ],
+        )
+        self.assertEqual(
+            self.mounts(),
+            [
+                (str(export / "0" / "src"), announced, MS_BIND),
+                ("-", announced, REMOUNT | MS_RDONLY),
+                (str(export / "1"), runtime, MS_BIND),
+                ("-", runtime, REMOUNT),
+                ("umount", runtime, 0),
+                (str(export / "1"), runtime, MS_BIND),
+                ("-", runtime, REMOUNT),
+            ],
+        )
+
+    def test_runtime_mappings_are_limited_in_number_not_in_lifetime(self):
+        limit = 256
+        targets = [str(self.case / "guest" / f"m{index}") for index in range(limit + 1)]
+        requests: list[tuple[int, bytes]] = [
+            (APP_MAPS, self.maps(0, [("0/src", targets[0], 0)]))
+        ]
+        requests += [
+            (APP_MAPS, self.maps(index, [("1", targets[index], 0)]))
+            for index in range(limit)
+        ]
+        requests += [
+            # No free slot: refused, and the sequence number stays unused.
+            (APP_MAPS, self.maps(limit, [("1", targets[limit], 0)])),
+            (APP_UNMAP, targets[1].encode()),
+            (APP_MAPS, self.maps(limit, [("1", targets[limit], 0)])),
+        ]
+        result, answers = self.run_agent("nvx_maps=1", requests)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcomes = [(kind, status, payload) for kind, _, status, payload in answers]
+        self.assertEqual(outcomes[: limit + 1], [(APP_READY, 0, b"")] * (limit + 1))
+        self.assertEqual(
+            outcomes[limit + 1 :],
+            [
+                (APP_ERROR, 28, b"mapping-limit"),
+                (APP_READY, 0, b""),
+                (APP_READY, 0, b""),
+            ],
+        )
+
     def test_malformed_tables_mount_nothing(self):
         target = str(self.case / "guest" / "x")
         good = ("0/src", target, 0)
@@ -788,7 +872,7 @@ int main(int argc, char **argv) {
         kind, _, status, payload = answers[0]
         self.assertEqual((kind, status), (APP_READY, 0))
         (features,) = struct.unpack("<I", payload)
-        self.assertEqual(features, 0b111_1101)
+        self.assertEqual(features, 0b1111_1101)
 
 
 if __name__ == "__main__":

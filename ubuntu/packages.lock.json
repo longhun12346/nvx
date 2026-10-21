@@ -39,6 +39,40 @@
       "suite": "resolute"
     },
     {
+      "name": "libada-url0-3",
+      "source_name": "ada-url",
+      "source_version": "3.4.3-1",
+      "version": "3.4.3-1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/a/ada-url/libada-url0-3_3.4.3-1_amd64.deb",
+      "sha256": "ea96881e73419442e42e1007c6326771df4c20bbf0d87f3d425dd4aa8b77ea6c",
+      "license_path": "/usr/share/doc/libada-url0-3/copyright",
+      "required_by": [
+        "libnode127"
+      ],
+      "depends": "libc6 (>= 2.32), libgcc-s1 (>= 3.3.1), libsimdutf31 (>= 8.0.0), libstdc++6 (>= 13.1)",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "libbrotli1",
+      "source_name": "brotli",
+      "source_version": "1.2.0-3build1",
+      "version": "1.2.0-3build1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/b/brotli/libbrotli1_1.2.0-3build1_amd64.deb",
+      "sha256": "858242571fc2585c1f8eb83ae01d020f0f4a92679d0de8fe31146f6687bdd84a",
+      "license_path": "/usr/share/doc/libbrotli1/copyright",
+      "required_by": [
+        "libnode127"
+      ],
+      "depends": "libc6 (>= 2.29)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
       "name": "libcap2",
       "source_name": "libcap2",
       "source_version": "1:2.75-10ubuntu2",
@@ -51,6 +85,74 @@
         "iputils-ping"
       ],
       "depends": "libc6 (>= 2.38)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "libcares2",
+      "source_name": "c-ares",
+      "source_version": "1.34.6-1ubuntu0.1",
+      "version": "1.34.6-1ubuntu0.1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/c/c-ares/libcares2_1.34.6-1ubuntu0.1_amd64.deb",
+      "sha256": "9c8a576345e6f46a58c5fd2c3335cb728aaed41602ddd3c0734d1800bdcdd15d",
+      "license_path": "/usr/share/doc/libcares2/copyright",
+      "required_by": [
+        "libnode127"
+      ],
+      "depends": "libc6 (>= 2.38)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "libexpat1",
+      "source_name": "expat",
+      "source_version": "2.7.4-1ubuntu0.2",
+      "version": "2.7.4-1ubuntu0.2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/e/expat/libexpat1_2.7.4-1ubuntu0.2_amd64.deb",
+      "sha256": "0063e68d742facfd3c46d7d7df9eb0d85f13e0fc294908a4f138d45557607837",
+      "license_path": "/usr/share/doc/libexpat1/copyright",
+      "required_by": [
+        "python3.14-minimal"
+      ],
+      "depends": "",
+      "pre_depends": "libc6 (>= 2.38)",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "libffi8",
+      "source_name": "libffi",
+      "source_version": "3.5.2-4",
+      "version": "3.5.2-4",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/libf/libffi/libffi8_3.5.2-4_amd64.deb",
+      "sha256": "4a7423124bbd459c0aa38b7389ec7802fa6899654767a95fc27de70967fedd48",
+      "license_path": "/usr/share/doc/libffi8/copyright",
+      "required_by": [
+        "libpython3.14-stdlib"
+      ],
+      "depends": "libc6 (>= 2.38)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "libicu78",
+      "source_name": "icu",
+      "source_version": "78.2-2ubuntu1",
+      "version": "78.2-2ubuntu1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/i/icu/libicu78_78.2-2ubuntu1_amd64.deb",
+      "sha256": "c8b97930f9e365d6d00978144b468ac8397ef07d2fb2c453869f05fc3a98c4ca",
+      "license_path": "/usr/share/doc/libicu78/copyright",
+      "required_by": [
+        "libnode127"
+      ],
+      "depends": "libc6 (>= 2.38), libgcc-s1 (>= 3.3.1), libstdc++6 (>= 14)",
       "pre_depends": "",
       "component": "main",
       "suite": "resolute"
@@ -73,6 +175,176 @@
       "suite": "resolute"
     },
     {
+      "name": "libllhttp9.3",
+      "source_name": "llhttp",
+      "source_version": "9.3.3~really9.3.0+~cs12.11.8-3build1",
+      "version": "9.3.3~really9.3.0+~cs12.11.8-3build1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/l/llhttp/libllhttp9.3_9.3.3~really9.3.0+~cs12.11.8-3build1_amd64.deb",
+      "sha256": "82f2a2a108f9108e793089ccfc17d81065ad0a1add14dcb9fc4a09fd60149dda",
+      "license_path": "/usr/share/doc/libllhttp9.3/copyright",
+      "required_by": [
+        "libnode127"
+      ],
+      "depends": "libc6 (>= 2.3.4)",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "libnghttp2-14",
+      "source_name": "nghttp2",
+      "source_version": "1.68.0-2ubuntu0.2",
+      "version": "1.68.0-2ubuntu0.2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/n/nghttp2/libnghttp2-14_1.68.0-2ubuntu0.2_amd64.deb",
+      "sha256": "9c92ca4435998b7981cf81f957177b71079563b022c282a4b8b7829113a5d08e",
+      "license_path": "/usr/share/doc/libnghttp2-14/copyright",
+      "required_by": [
+        "libnode127"
+      ],
+      "depends": "libc6 (>= 2.17)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "libnode127",
+      "source_name": "nodejs",
+      "source_version": "22.22.1+dfsg+~cs22.19.15-1ubuntu1",
+      "version": "22.22.1+dfsg+~cs22.19.15-1ubuntu1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/nodejs/libnode127_22.22.1+dfsg+~cs22.19.15-1ubuntu1_amd64.deb",
+      "sha256": "2b3f55ee8af05524e4673e782b2e89a1a3f7516742be2937cf5dc79067636a43",
+      "license_path": "/usr/share/doc/libnode127/copyright",
+      "required_by": [
+        "nodejs"
+      ],
+      "depends": "libada-url0-3 (>= 3.3.0), libbrotli1 (>= 1.0.0), libc6 (>= 2.43), libcares2 (>= 1.28.0), libgcc-s1 (>= 3.4), libicu78 (>= 78.1-1~), libllhttp9.3 (>= 9.3.0), libnghttp2-14 (>= 1.57.0), libsimdjson29 (>= 4.2.4), libsimdutf31 (>= 8.0.0), libsqlite3-0 (>= 3.37.0), libssl3t64 (>= 3.4.0), libstdc++6 (>= 13.1), libuv1t64 (>= 1.51.0~), libzstd1 (>= 1.5.5), zlib1g (>= 1:1.1.4), node-acorn (>= 8.16.0~), node-cjs-module-lexer (>= 1.2.2~), node-minimatch (>= 9.0.3-5), node-undici (>= 5.0.0~)",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "libpython3-stdlib",
+      "source_name": "python3-defaults",
+      "source_version": "3.14.3-0ubuntu2",
+      "version": "3.14.3-0ubuntu2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/p/python3-defaults/libpython3-stdlib_3.14.3-0ubuntu2_amd64.deb",
+      "sha256": "75d0c4c28732f8e08d5da25a47676dbe923e4b15a8f7a77110ab370325889df5",
+      "license_path": "/usr/share/doc/libpython3-stdlib/copyright",
+      "required_by": [
+        "python3"
+      ],
+      "depends": "libpython3.14-stdlib (>= 3.14.3)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "libpython3.14-minimal",
+      "source_name": "python3.14",
+      "source_version": "3.14.4-1ubuntu0.2",
+      "version": "3.14.4-1ubuntu0.2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/p/python3.14/libpython3.14-minimal_3.14.4-1ubuntu0.2_amd64.deb",
+      "sha256": "fac6f0728cf9490a7a698e6b343e4140283e92355b060193c04f5770a666df8a",
+      "license_path": "/usr/share/doc/libpython3.14-minimal/copyright",
+      "required_by": [
+        "libpython3.14-stdlib"
+      ],
+      "depends": "libc6 (>= 2.14), libssl3t64 (>= 3.4.0)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "libpython3.14-stdlib",
+      "source_name": "python3.14",
+      "source_version": "3.14.4-1ubuntu0.2",
+      "version": "3.14.4-1ubuntu0.2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/p/python3.14/libpython3.14-stdlib_3.14.4-1ubuntu0.2_amd64.deb",
+      "sha256": "3c267ef0f902f763c3615cbf28dd6fe91d2e4f603075d7f03db99f8d4eb66f46",
+      "license_path": "/usr/share/doc/libpython3.14-stdlib/copyright",
+      "required_by": [
+        "libpython3-stdlib"
+      ],
+      "depends": "libpython3.14-minimal (= 3.14.4-1ubuntu0.2), media-types | mime-support, netbase, tzdata, libbz2-1.0, libc6 (>= 2.42), libdb5.3t64, libffi8 (>= 3.4), liblzma5 (>= 5.1.1alpha+20120614), libncursesw6 (>= 6.1), libreadline8t64 (>= 7.0~beta), libsqlite3-0 (>= 3.36.0), libtinfo6 (>= 6), libuuid1 (>= 2.20.1), libzstd1 (>= 1.5.5)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "libreadline8t64",
+      "source_name": "readline",
+      "source_version": "8.3-4",
+      "version": "8.3-4",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/r/readline/libreadline8t64_8.3-4_amd64.deb",
+      "sha256": "260b3333e9f714252593b83fb31d2571097b64d337d0d7100aae7349029821fc",
+      "license_path": "/usr/share/doc/libreadline8t64/copyright",
+      "required_by": [
+        "libpython3.14-stdlib"
+      ],
+      "depends": "readline-common, libc6 (>= 2.38), libtinfo6 (>= 6)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "libsimdjson29",
+      "source_name": "simdjson",
+      "source_version": "4.2.4-1",
+      "version": "4.2.4-1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/s/simdjson/libsimdjson29_4.2.4-1_amd64.deb",
+      "sha256": "078413df45a416031a64039360f30a77c31b86f5cd6e34f6a89b17940771fda0",
+      "license_path": "/usr/share/doc/libsimdjson29/copyright",
+      "required_by": [
+        "libnode127"
+      ],
+      "depends": "libc6 (>= 2.14), libgcc-s1 (>= 3.0), libstdc++6 (>= 13.1)",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "libsimdutf31",
+      "source_name": "simdutf",
+      "source_version": "8.0.0-1",
+      "version": "8.0.0-1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/s/simdutf/libsimdutf31_8.0.0-1_amd64.deb",
+      "sha256": "fd01a52b2feaaf93839f1ba07bf11131fd377d2aaaef95c3a439a5bd333b459f",
+      "license_path": "/usr/share/doc/libsimdutf31/copyright",
+      "required_by": [
+        "libada-url0-3"
+      ],
+      "depends": "libc6 (>= 2.14), libgcc-s1 (>= 3.0), libstdc++6 (>= 13.1)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "libsqlite3-0",
+      "source_name": "sqlite3",
+      "source_version": "3.46.1-9ubuntu0.3",
+      "version": "3.46.1-9ubuntu0.3",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/s/sqlite3/libsqlite3-0_3.46.1-9ubuntu0.3_amd64.deb",
+      "sha256": "ff4b5a1e7c028a4bcc30076e4d8197aad1a910df44f4dc8dcf253e9ee9a3a367",
+      "license_path": "/usr/share/doc/libsqlite3-0/copyright",
+      "required_by": [
+        "libnode127"
+      ],
+      "depends": "libc6 (>= 2.38)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
       "name": "libunistring5",
       "source_name": "libunistring",
       "source_version": "1.3-2build1",
@@ -85,6 +357,40 @@
         "libidn2-0"
       ],
       "depends": "libc6 (>= 2.34)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "libuv1t64",
+      "source_name": "libuv1",
+      "source_version": "1.51.0-2ubuntu1",
+      "version": "1.51.0-2ubuntu1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/libu/libuv1/libuv1t64_1.51.0-2ubuntu1_amd64.deb",
+      "sha256": "5c9b857d7d6a0c22b30dae45d518b375452cf7c663fc9381e3f0760ba3fb8cce",
+      "license_path": "/usr/share/doc/libuv1t64/copyright",
+      "required_by": [
+        "libnode127"
+      ],
+      "depends": "libc6 (>= 2.38)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "media-types",
+      "source_name": "media-types",
+      "source_version": "14.0.0build1",
+      "version": "14.0.0build1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/m/media-types/media-types_14.0.0build1_all.deb",
+      "sha256": "f3412d08032210541d25c4e00fa492ce527af245ac9bec2e543d81a59b4426aa",
+      "license_path": "/usr/share/doc/media-types/copyright",
+      "required_by": [
+        "libpython3.14-stdlib"
+      ],
+      "depends": "",
       "pre_depends": "",
       "component": "main",
       "suite": "resolute"
@@ -107,6 +413,23 @@
       "suite": "resolute"
     },
     {
+      "name": "netbase",
+      "source_name": "netbase",
+      "source_version": "6.5build1",
+      "version": "6.5build1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/n/netbase/netbase_6.5build1_all.deb",
+      "sha256": "f008e39aada379d64166153d5e37ccc4f18b3e334babb9e32c4da9b4396ee733",
+      "license_path": "/usr/share/doc/netbase/copyright",
+      "required_by": [
+        "libpython3.14-stdlib"
+      ],
+      "depends": "",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
       "name": "netcat-openbsd",
       "source_name": "netcat-openbsd",
       "source_version": "1.234-1",
@@ -122,6 +445,346 @@
       "pre_depends": "",
       "component": "main",
       "suite": "resolute"
+    },
+    {
+      "name": "node-acorn",
+      "source_name": "acorn",
+      "source_version": "8.16.0+ds+~cs25.18.7-4",
+      "version": "8.16.0+ds+~cs25.18.7-4",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/a/acorn/node-acorn_8.16.0+ds+~cs25.18.7-4_all.deb",
+      "sha256": "50fc78f72254f9845331d90725dfea7b8fe88517c99dfb06e0e6bc857bdc832c",
+      "license_path": "/usr/share/doc/node-acorn/copyright",
+      "required_by": [
+        "libnode127"
+      ],
+      "depends": "nodejs:any, node-xtend",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "node-balanced-match",
+      "source_name": "node-balanced-match",
+      "source_version": "2.0.0-1",
+      "version": "2.0.0-1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/node-balanced-match/node-balanced-match_2.0.0-1_all.deb",
+      "sha256": "de44550f6d08b54bda6725a51415b321ba14a04090f82716589df5b628985430",
+      "license_path": "/usr/share/doc/node-balanced-match/copyright",
+      "required_by": [
+        "node-brace-expansion"
+      ],
+      "depends": "",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "node-brace-expansion",
+      "source_name": "node-brace-expansion",
+      "source_version": "2.0.1+~1.1.0-2",
+      "version": "2.0.1+~1.1.0-2",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/node-brace-expansion/node-brace-expansion_2.0.1+~1.1.0-2_all.deb",
+      "sha256": "c82296df059b28553cfa78fda40cc4f3935d100173cfe9ba89c74327388a1f26",
+      "license_path": "/usr/share/doc/node-brace-expansion/copyright",
+      "required_by": [
+        "node-minimatch"
+      ],
+      "depends": "node-balanced-match",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "node-cjs-module-lexer",
+      "source_name": "node-cjs-module-lexer",
+      "source_version": "1.2.3+dfsg-1",
+      "version": "1.2.3+dfsg-1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/node-cjs-module-lexer/node-cjs-module-lexer_1.2.3+dfsg-1_all.deb",
+      "sha256": "ff42550bae93d173607991655268561cf4586e212a70c4f33513e7f9d4da3625",
+      "license_path": "/usr/share/doc/node-cjs-module-lexer/copyright",
+      "required_by": [
+        "libnode127"
+      ],
+      "depends": "",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "node-corepack",
+      "source_name": "node-corepack",
+      "source_version": "0.24.0-5build1",
+      "version": "0.24.0-5build1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/node-corepack/node-corepack_0.24.0-5build1_all.deb",
+      "sha256": "980b2b7283338610d955533f4ab001403bd58579054e35a132a2760c4173a93d",
+      "license_path": "/usr/share/doc/node-corepack/copyright",
+      "required_by": [
+        "nodejs"
+      ],
+      "depends": "nodejs:any",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "node-debug",
+      "source_name": "node-debug",
+      "source_version": "4.4.3+~4.1.13-1",
+      "version": "4.4.3+~4.1.13-1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/node-debug/node-debug_4.4.3+~4.1.13-1_all.deb",
+      "sha256": "6f2dd4e27c3bd82b0cb8be5a4448302a9d204481bbba8b111c1dd8e4eb36ef56",
+      "license_path": "/usr/share/doc/node-debug/copyright",
+      "required_by": [
+        "node-llhttp"
+      ],
+      "depends": "node-ms",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "node-llhttp",
+      "source_name": "llhttp",
+      "source_version": "9.3.3~really9.3.0+~cs12.11.8-3build1",
+      "version": "9.3.3~really9.3.0+~cs12.11.8-3build1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/l/llhttp/node-llhttp_9.3.3~really9.3.0+~cs12.11.8-3build1_all.deb",
+      "sha256": "2e7d4f64c6c6564bc7b6ab367b733fe0ce32cf2cff8c0b985eafaff48edada91",
+      "license_path": "/usr/share/doc/node-llhttp/copyright",
+      "required_by": [
+        "node-undici"
+      ],
+      "depends": "node-debug, node-semver",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "node-lru-cache",
+      "source_name": "node-lru-cache",
+      "source_version": "10.0.1-3",
+      "version": "10.0.1-3",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/node-lru-cache/node-lru-cache_10.0.1-3_all.deb",
+      "sha256": "72bc3f8667a6f6c5a79b1506ef37ebcc778eaf5fc25f1038d52340b39baba65c",
+      "license_path": "/usr/share/doc/node-lru-cache/copyright",
+      "required_by": [
+        "node-semver"
+      ],
+      "depends": "",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "node-minimatch",
+      "source_name": "node-minimatch",
+      "source_version": "9.0.3-6",
+      "version": "9.0.3-6",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/node-minimatch/node-minimatch_9.0.3-6_all.deb",
+      "sha256": "4ac92e0b869ba65aaeada4c84a53cf3534e936bd7bb70ea472c7eb2fae526613",
+      "license_path": "/usr/share/doc/node-minimatch/copyright",
+      "required_by": [
+        "libnode127"
+      ],
+      "depends": "node-brace-expansion",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "node-ms",
+      "source_name": "node-ms",
+      "source_version": "2.1.3+~cs0.7.31-3",
+      "version": "2.1.3+~cs0.7.31-3",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/node-ms/node-ms_2.1.3+~cs0.7.31-3_all.deb",
+      "sha256": "654706711699f08625b0a32d282627785932b65fa0b5528ac8685e113bed47e3",
+      "license_path": "/usr/share/doc/node-ms/copyright",
+      "required_by": [
+        "node-debug"
+      ],
+      "depends": "nodejs:any",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "node-semver",
+      "source_name": "node-semver",
+      "source_version": "7.6.1+~7.5.8-2",
+      "version": "7.6.1+~7.5.8-2",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/node-semver/node-semver_7.6.1+~7.5.8-2_all.deb",
+      "sha256": "20bcc3fa377bc0810f8c98aecb78397e82df8cf6aacfe8c8ebd82714e5acfa38",
+      "license_path": "/usr/share/doc/node-semver/copyright",
+      "required_by": [
+        "node-llhttp"
+      ],
+      "depends": "node-lru-cache, nodejs:any",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "node-undici",
+      "source_name": "node-undici",
+      "source_version": "7.18.2+dfsg+~cs3.2.0-1build1",
+      "version": "7.18.2+dfsg+~cs3.2.0-1build1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/node-undici/node-undici_7.18.2+dfsg+~cs3.2.0-1build1_all.deb",
+      "sha256": "90ae2eb6e287255e411ce7828da187ee2f5d9f47d6caf55c79343c7083f2013a",
+      "license_path": "/usr/share/doc/node-undici/copyright",
+      "required_by": [
+        "libnode127"
+      ],
+      "depends": "node-llhttp (>= 9.3.3~really9.3.0~)",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "node-xtend",
+      "source_name": "node-xtend",
+      "source_version": "4.0.2-3",
+      "version": "4.0.2-3",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/node-xtend/node-xtend_4.0.2-3_all.deb",
+      "sha256": "a7b7837e53fdb68ede3ab11a1efdf4147da55b64b3a780c897082944c3f06b92",
+      "license_path": "/usr/share/doc/node-xtend/copyright",
+      "required_by": [
+        "node-acorn"
+      ],
+      "depends": "",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "nodejs",
+      "source_name": "nodejs",
+      "source_version": "22.22.1+dfsg+~cs22.19.15-1ubuntu1",
+      "version": "22.22.1+dfsg+~cs22.19.15-1ubuntu1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/n/nodejs/nodejs_22.22.1+dfsg+~cs22.19.15-1ubuntu1_amd64.deb",
+      "sha256": "053fe66403367739106c82f88d39632b84c44d526fdeb977ccb76380467b3ac7",
+      "license_path": "/usr/share/doc/nodejs/copyright",
+      "required_by": [
+        "nvx-initramfs"
+      ],
+      "depends": "libc6 (>= 2.34), libnode127 (= 22.22.1+dfsg+~cs22.19.15-1ubuntu1), node-corepack",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "python3",
+      "source_name": "python3-defaults",
+      "source_version": "3.14.3-0ubuntu2",
+      "version": "3.14.3-0ubuntu2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/p/python3-defaults/python3_3.14.3-0ubuntu2_amd64.deb",
+      "sha256": "1ff88ad587f9e52e9f333ab00ae0babea93ac5222fc6909039c4190affe1d574",
+      "license_path": "/usr/share/doc/python3/copyright",
+      "required_by": [
+        "nvx-initramfs"
+      ],
+      "depends": "python3.14 (>= 3.14.3), libpython3-stdlib (= 3.14.3-0ubuntu2)",
+      "pre_depends": "python3-minimal (= 3.14.3-0ubuntu2)",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "python3-minimal",
+      "source_name": "python3-defaults",
+      "source_version": "3.14.3-0ubuntu2",
+      "version": "3.14.3-0ubuntu2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/p/python3-defaults/python3-minimal_3.14.3-0ubuntu2_amd64.deb",
+      "sha256": "d5f37616b30209d8c10c4a705d7bf9558ca21e058fc2b2bd2ffcf37a74a42861",
+      "license_path": "/usr/share/doc/python3-minimal/copyright",
+      "required_by": [
+        "python3"
+      ],
+      "depends": "",
+      "pre_depends": "python3.14-minimal (>= 3.14.3)",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "python3.14",
+      "source_name": "python3.14",
+      "source_version": "3.14.4-1ubuntu0.2",
+      "version": "3.14.4-1ubuntu0.2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/p/python3.14/python3.14_3.14.4-1ubuntu0.2_amd64.deb",
+      "sha256": "780c308c47d8afcbb7d339f0023350e7cf60c1a37e9572a1f88774cc18f60526",
+      "license_path": "/usr/share/doc/python3.14/copyright",
+      "required_by": [
+        "python3"
+      ],
+      "depends": "python3.14-minimal (= 3.14.4-1ubuntu0.2), libpython3.14-stdlib (= 3.14.4-1ubuntu0.2), media-types | mime-support, tzdata",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "python3.14-minimal",
+      "source_name": "python3.14",
+      "source_version": "3.14.4-1ubuntu0.2",
+      "version": "3.14.4-1ubuntu0.2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/p/python3.14/python3.14-minimal_3.14.4-1ubuntu0.2_amd64.deb",
+      "sha256": "0a7ea8a52834f9b3de0f11758924f80f7a6ebcbb4b02a55ba4f457503569f55f",
+      "license_path": "/usr/share/doc/python3.14-minimal/copyright",
+      "required_by": [
+        "python3-minimal"
+      ],
+      "depends": "libpython3.14-minimal (= 3.14.4-1ubuntu0.2), libexpat1 (>= 2.7.2), zlib1g (>= 1:1.2.0)",
+      "pre_depends": "libc6 (>= 2.38)",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "readline-common",
+      "source_name": "readline",
+      "source_version": "8.3-4",
+      "version": "8.3-4",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/r/readline/readline-common_8.3-4_all.deb",
+      "sha256": "53cdc5a963bbdda938f8996496a5e78bcf484e6e41a2ef2c0f8cf566808f71f5",
+      "license_path": "/usr/share/doc/readline-common/copyright",
+      "required_by": [
+        "libreadline8t64"
+      ],
+      "depends": "",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "tzdata",
+      "source_name": "tzdata",
+      "source_version": "2026e-0ubuntu0.26.04.1",
+      "version": "2026e-0ubuntu0.26.04.1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/t/tzdata/tzdata_2026e-0ubuntu0.26.04.1_all.deb",
+      "sha256": "8859c96f6169bd81d6d4ec757929b9f92d56a0a906fde6fbd96f54bee476c742",
+      "license_path": "/usr/share/doc/tzdata/copyright",
+      "required_by": [
+        "libpython3.14-stdlib"
+      ],
+      "depends": "debconf (>= 0.5) | debconf-2.0",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
     }
   ]
 }

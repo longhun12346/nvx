@@ -36,6 +36,10 @@ impl GuestFeatures {
     /// `nvx_maps=` kernel command-line token announces, keeps the shared export root-only, and
     /// refuses workloads until every entry is mounted.
     pub const HOST_MAPPING_TABLE: Self = Self(1 << 6);
+    /// Accepts `APP_MAPS` entries that continue the host mapping table at run time, after the
+    /// table that `nvx_maps=` announced is mounted. Not in [`GuestFeatures::REQUIRED`]: only the
+    /// live-share experiment needs it.
+    pub const RUNTIME_MAPPINGS: Self = Self(1 << 7);
     /// The features that the host depends on.
     pub const REQUIRED: Self = Self(
         Self::CANCEL.0

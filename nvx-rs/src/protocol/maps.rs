@@ -39,7 +39,27 @@ pub struct HostMap {
 /// an absolute target of at most [`MAX_MAP_PATH_BYTES`] without NUL bytes, whose `/`-separated
 /// components are neither empty, `.`, nor `..`.
 pub fn encode_maps_payloads(maps: &[HostMap], limit: usize) -> Result<Vec<Vec<u8>>, ProtocolError> {
-    if maps.is_empty() || maps.len() > MAX_HOST_MAPPINGS {
+    encode_maps_payloads_from(0, maps, limit)
+}
+
+/// Like [`encode_maps_payloads`], for entries that follow `first` others. For the announced table
+/// `first` is the index of the first entry in the table. A guest agent that advertises
+/// [`GuestFeatures::RUNTIME_MAPPINGS`](super::GuestFeatures::RUNTIME_MAPPINGS) also accepts, once
+/// that table is mounted, one entry per request that it mounts at run time; `first` is then the
+/// sequence number of that request, counting every earlier runtime request. Runtime requests
+/// are not bound by [`MAX_HOST_MAPPINGS`]: the agent limits how many runtime mappings are mounted
+/// at once, not how many were ever added.
+pub fn encode_maps_payloads_from(
+    first: usize,
+    maps: &[HostMap],
+    limit: usize,
+) -> Result<Vec<Vec<u8>>, ProtocolError> {
+    if maps.is_empty()
+        || maps.len() > MAX_HOST_MAPPINGS
+        || first
+            .checked_add(maps.len())
+            .is_none_or(|end| u32::try_from(end).is_err())
+    {
         return Err(violation(format!(
             "a host mapping table holds 1 to {MAX_HOST_MAPPINGS} entries"
         )));
@@ -68,7 +88,7 @@ pub fn encode_maps_payloads(maps: &[HostMap], limit: usize) -> Result<Vec<Vec<u8
             count = 0;
         }
         if count == 0 {
-            let first = u32::try_from(index).unwrap_or(u32::MAX);
+            let first = u32::try_from(first + index).unwrap_or(u32::MAX);
             payload.extend_from_slice(&first.to_le_bytes());
             payload.extend_from_slice(&0u32.to_le_bytes());
         }

@@ -978,3 +978,29 @@ fn record_definitions_match_the_guest_agent_source() {
         );
     }
 }
+
+#[test]
+fn maps_continue_a_table_at_the_first_index() {
+    let maps = [HostMap {
+        source: "dyn0".to_owned(),
+        target: "/mnt/dyn0".to_owned(),
+        read_only: true,
+    }];
+    let payloads = encode_maps_payloads_from(3, &maps, 4096).unwrap();
+    assert_eq!(payloads.len(), 1);
+    let decoded = decode_maps_payload(&payloads[0]).unwrap();
+    assert_eq!(decoded.first, 3);
+    assert_eq!(decoded.maps, maps);
+    // The plain encoder still starts a table at entry 0.
+    let plain = encode_maps_payloads(&maps, 4096).unwrap();
+    assert_eq!(decode_maps_payload(&plain[0]).unwrap().first, 0);
+    // A runtime sequence number is not an index into the 4096-entry table, so it may pass the
+    // table's bound; it still has to fit the 32-bit field.
+    let late = encode_maps_payloads_from(MAX_HOST_MAPPINGS + 10, &maps, 4096).unwrap();
+    assert_eq!(
+        decode_maps_payload(&late[0]).unwrap().first,
+        u32::try_from(MAX_HOST_MAPPINGS + 10).unwrap()
+    );
+    assert!(encode_maps_payloads_from(u32::MAX as usize, &maps, 4096).is_err());
+    assert!(encode_maps_payloads_from(u32::MAX as usize - 1, &maps, 4096).is_ok());
+}

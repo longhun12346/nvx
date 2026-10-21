@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::platform::{self, Transport};
 use crate::protocol::{
-    self, APP_CANCEL, APP_ERROR, APP_EXEC, APP_EXIT, APP_FEATURES, APP_HEADER_LEN, APP_MAPS,
+    self, APP_CANCEL, APP_ERROR, APP_EXEC, APP_EXIT, APP_FEATURES, APP_HEADER_LEN, APP_MAPS, APP_UNMAP,
     APP_PING, APP_READY, APP_STDERR, APP_STDOUT, APP_STOP, APP_STOPPED, CAPABILITY_LEN,
     ExitCategory, GuestFeatures, HostMap, OUTER_DATA, OUTER_ERROR, OUTER_HEADER_LEN,
     OUTER_HOST_ATTACH, OUTER_MAX_PAYLOAD, OUTER_READY, OUTER_RESET, OUTER_WAIT, OuterHeader,
@@ -233,7 +233,51 @@ impl ControlSession {
         maps: &[HostMap],
         deadline: Instant,
     ) -> Result<(), SessionError> {
-        let payloads = protocol::encode_maps_payloads(maps, OUTER_MAX_PAYLOAD - APP_HEADER_LEN)?;
+        self.append_host_paths(0, maps, deadline)
+    }
+
+    /// Asks the guest agent to unmount the host mapping that an earlier
+    /// [`Self::append_host_paths`] bound at the absolute guest path `target`, and waits until it
+    /// has. The guest refuses a mapping of the announced table.
+    pub fn unmap_host_path(&mut self, target: &str, deadline: Instant) -> Result<(), SessionError> {
+        let request_id = request_id()?;
+        self.send_app(APP_UNMAP, request_id, target.as_bytes(), Some(deadline))?;
+        let (kind, response_id, status, payload) = self.read_app(Some(deadline))?;
+        if response_id != request_id {
+            return Err(SessionError::Protocol(
+                "the guest agent returned a mismatched request ID".to_owned(),
+            ));
+        }
+        match kind {
+            APP_READY if status == 0 && payload.is_empty() => Ok(()),
+            APP_ERROR => {
+                let category: String =
+                    String::from_utf8_lossy(&payload).chars().take(64).collect();
+                Err(SessionError::Protocol(format!(
+                    "the guest agent did not unmount the host path: {category} (status {status})"
+                )))
+            }
+            _ => Err(SessionError::Protocol(
+                "the guest agent returned an invalid unmap response".to_owned(),
+            )),
+        }
+    }
+
+    /// Hands the guest agent entries that continue its host mapping table at index `first`, and
+    /// waits until it has mounted them. With `first` zero this is [`Self::map_host_paths`]; with
+    /// more it appends to a table that is already mounted, which a guest agent accepts only when
+    /// it advertises [`GuestFeatures::RUNTIME_MAPPINGS`].
+    pub fn append_host_paths(
+        &mut self,
+        first: usize,
+        maps: &[HostMap],
+        deadline: Instant,
+    ) -> Result<(), SessionError> {
+        let payloads = protocol::encode_maps_payloads_from(
+            first,
+            maps,
+            OUTER_MAX_PAYLOAD - APP_HEADER_LEN,
+        )?;
         for payload in payloads {
             let request_id = request_id()?;
             self.send_app(APP_MAPS, request_id, &payload, Some(deadline))?;
@@ -245,6 +289,12 @@ impl ControlSession {
             }
             match kind {
                 APP_READY if status == 0 && payload.is_empty() => {}
+                APP_ERROR if payload == protocol::MAPPING_LIMIT.as_bytes() => {
+                    return Err(SessionError::Protocol(
+                        "the guest agent holds the most runtime host mappings it can unmount; remove one first"
+                            .to_owned(),
+                    ));
+                }
                 APP_ERROR if payload == protocol::MAPPING_FAILED.as_bytes() => {
                     return Err(SessionError::Protocol(format!(
                         "the guest agent could not mount a mapped host path (error {status})"

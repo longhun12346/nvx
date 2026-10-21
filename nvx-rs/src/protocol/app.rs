@@ -28,6 +28,10 @@ pub const APP_FEATURES: u8 = 5;
 /// Request that the guest agent mount entries of the host mapping table; the payload is a `MAPS`
 /// payload.
 pub const APP_MAPS: u8 = 6;
+/// Request that the guest agent unmount a host mapping that an `APP_MAPS` request appended at run
+/// time; the payload is the absolute guest path of the mapping, in UTF-8. Guests that advertise
+/// [`GuestFeatures::RUNTIME_MAPPINGS`](super::GuestFeatures::RUNTIME_MAPPINGS) accept it.
+pub const APP_UNMAP: u8 = 7;
 /// Response that acknowledges a request.
 pub const APP_READY: u8 = 0x81;
 /// Response that carries a chunk of a workload's standard output.
@@ -60,6 +64,9 @@ pub const MAPPINGS_INCOMPLETE: &str = "mappings-incomplete";
 /// Error category with which a guest agent reports a host mapping that it could not apply. The
 /// status is the guest's error number.
 pub const MAPPING_FAILED: &str = "mapping-failed";
+/// Error category of an `APP_MAPS` request that appends a runtime mapping while the guest agent
+/// already lists as many as it can unmount.
+pub const MAPPING_LIMIT: &str = "mapping-limit";
 
 /// Decoded application frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

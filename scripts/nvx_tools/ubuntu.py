@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import compileall
 import gzip
 import hashlib
 import io
@@ -9,10 +10,12 @@ import json
 import lzma
 import os
 import posixpath
+import py_compile
 import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import uuid
 from collections.abc import Iterable, Sequence
@@ -181,7 +184,7 @@ def load_package_lock(
                 "pre_depends": str(package_document.get("pre_depends", "")),
             },
         )
-        if package["architecture"] != UbuntuBuildConstants.ARCHITECTURE:
+        if package["architecture"] not in (UbuntuBuildConstants.ARCHITECTURE, "all"):
             raise ScriptError(
                 f"{path} package {name} has unsupported architecture "
                 f"{package['architecture']}"
@@ -743,6 +746,8 @@ def _customize_root(root: Path) -> None:
     _ensure_symlink(root, "usr/bin/netcat", "nc.openbsd")
     _ensure_symlink(root, "usr/bin/wget", "busybox")
     _ensure_symlink(root, "usr/sbin/mdev", "../bin/busybox")
+    if path_exists(root / "usr" / "bin" / "python3"):
+        _ensure_symlink(root, "usr/bin/python", "python3")
     _validate_accounts(root)
     _validate_usr_merge(root)
 
@@ -766,6 +771,40 @@ def _validate_ubuntu_identity(root: Path) -> None:
         raise ScriptError(
             "Ubuntu Base /etc/os-release does not match the pinned release"
         )
+
+
+def precompile_python(root: Path) -> None:
+    """Byte-compiles the guest's Python standard library.
+
+    Maintainer scripts do not run, so the packages' own byte-compilation never
+    happens. Sandboxed workloads run unprivileged on a root they cannot write
+    to, so without these files every interpreter start recompiles the modules it
+    imports. Unchecked-hash files carry no timestamp, so the output is
+    deterministic. Bytecode is only valid for the interpreter's exact minor
+    version, so this runs only on a matching build interpreter.
+    """
+    libraries = sorted(
+        path
+        for path in (root / "usr" / "lib").glob("python3.[0-9]*")
+        if path.is_dir() and not path.is_symlink()
+    )
+    for library in libraries:
+        minor = tuple(int(part) for part in library.name.removeprefix("python").split("."))
+        if sys.version_info[:2] != minor or sys.version_info.releaselevel != "final":
+            raise ScriptError(
+                f"byte-compiling {library.name} needs a final-release Python "
+                f"{minor[0]}.{minor[1]} build interpreter; this is {sys.version.split()[0]}"
+            )
+        if not compileall.compile_dir(
+            str(library),
+            quiet=1,
+            force=True,
+            workers=1,
+            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        ):
+            raise ScriptError(f"failed to byte-compile {library.name}")
+        for path in (*library.rglob("__pycache__"), *library.rglob("*.pyc")):
+            path.chmod(0o755 if path.is_dir() else 0o644)
 
 
 def prepare_root(work: Path) -> Path:
@@ -810,6 +849,7 @@ def prepare_root(work: Path) -> Path:
         package_path = package_downloads / filename
         download_verified(package["url"], package_path, package["sha256"])
         _install_deb(root, package, package_path)
+    precompile_python(root)
     _customize_root(root)
     return root
 

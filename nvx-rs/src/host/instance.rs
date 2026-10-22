@@ -605,13 +605,6 @@ impl Instance {
         );
         let arguments =
             spec.openvmm_arguments_with_control(&endpoint, &report, Some(&_export_spec))?;
-        // Diagnostic: the guest's mount bookkeeping keys off `nvx_maps=`, so record the
-        // value the VMM actually receives.
-        for window in arguments.windows(2) {
-            if window[0] == "--cmdline" && let Some(text) = window[1].to_str() {
-                eprintln!("nvx-rs: guest cmdline = {text}");
-            }
-        }
         spec.fit_process_command_line(&arguments, 0)?;
 
         self.write_capability(&capability)?;
@@ -705,21 +698,12 @@ impl Instance {
             return Err(self.reject_guest(&runtime, &missing));
         }
         // Workloads run only once the guest has mounted every mapped host path.
-        eprintln!(
-            "nvx-rs: startup map: filesystem={} entries={}",
-            spec.filesystem.is_some(),
-            spec.filesystem
-                .as_ref()
-                .map(|plan| plan.guest_table().len())
-                .unwrap_or(0)
-        );
         if let Some(plan) = &spec.filesystem
             && let Err(error) = session.map_host_paths(&plan.guest_table(), deadline)
         {
             let reason = format!("the host paths were not mapped: {error}");
             return Err(self.abort_start(&runtime, session_kind(&error), &reason));
         }
-        eprintln!("nvx-rs: startup map completed");
         Ok(Started {
             runtime,
             boot: started.elapsed(),

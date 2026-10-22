@@ -214,7 +214,7 @@ impl Context {
             match step {
                 Step::Remove(share) => {
                     self.backend
-                        .remove_share_poc(
+                        .remove_share(
                             &session.sandbox,
                             &share.child,
                             &share.target,
@@ -235,7 +235,7 @@ impl Context {
                         read_only: mount.read_only,
                     };
                     self.backend
-                        .add_share_poc(
+                        .add_share(
                             &session.sandbox,
                             state.next_sequence,
                             &live,

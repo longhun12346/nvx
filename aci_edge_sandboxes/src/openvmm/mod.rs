@@ -253,7 +253,7 @@ impl OpenVmmBackend {
     /// restart; see [`nvx::host::poc_live`]. `added_before` is the number of shares that earlier
     /// calls added, and `request_dir` is the `NVX_POC_LIVE_SHARE_DIR` that the VMM was started
     /// with.
-    pub fn add_share_poc(
+    pub fn add_share(
         &self,
         sandbox_id: &SandboxId,
         added_before: usize,
@@ -299,9 +299,9 @@ impl OpenVmmBackend {
 }
 
 impl OpenVmmBackend {
-    /// **Proof-of-concept.** Removes a share that [`Self::add_share_poc`] added from the running
+    /// **Proof-of-concept.** Removes a share that [`Self::add_share`] added from the running
     /// guest of `sandbox_id`: the guest unmounts `target`, then the VMM stops exporting `child`.
-    pub fn remove_share_poc(
+    pub fn remove_share(
         &self,
         sandbox_id: &SandboxId,
         child: &str,

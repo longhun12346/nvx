@@ -235,8 +235,8 @@ def main():
                 # new identity every round would grow that table instead of exercising churn.
                 mount_id = "churn"
                 payload_path = refs / "churn.txt"
-                if round_number % 2 == 0:
-                    payload_path.write_text(f"round-{round_number}", encoding="utf-8")
+                if round_number == 0:
+                    (refs / "churn.txt").write_text("round-0", encoding="utf-8")
                 out, err, end = run_command(
                     f"cat /workspace/mounts/{mount_id}/churn.txt 2>/dev/null || true",
                     [

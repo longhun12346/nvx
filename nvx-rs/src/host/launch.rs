@@ -304,7 +304,14 @@ impl LaunchSpec {
         arguments.push("--cmdline".into());
         arguments.push(self.checked_kernel_command_line()?.into());
         arguments.push("--virtio-console".into());
-        arguments.push("none".into());
+        // `none` is the product setting: the control console carries the agent channel,
+        // and a second console would change device shape. A diagnostic run may set
+        // NVX_DEBUG_CONSOLE to a serial spec (for example `file=C:\tmp\console.log`) to
+        // read the guest agent's stderr, which is otherwise unreachable from the host.
+        match std::env::var_os("NVX_DEBUG_CONSOLE").filter(|value| !value.is_empty()) {
+            Some(value) => arguments.push(value),
+            None => arguments.push("none".into()),
+        }
         arguments.push("--microvm-control-console".into());
         arguments.push(format!("listen={endpoint}").into());
         arguments.push("--microvm-control-auth-stdin".into());

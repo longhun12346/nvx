@@ -106,6 +106,11 @@ pub struct RuntimeRecord {
     pub start_time: u64,
     /// Control endpoint: a Unix socket path on Linux, and a named pipe on Windows.
     pub endpoint: String,
+    /// Pipe on which the VMM serves virtio-fs export requests, when it was started
+    /// with one. Absent in records written before the channel existed, so a
+    /// half-upgraded state file still loads and simply has no export channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_pipe: Option<String>,
 }
 
 /// Marker written before OpenVMM is launched and replaced by the runtime record afterwards.
@@ -299,6 +304,19 @@ impl Instance {
     /// Returns the instance's directory.
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Returns the pipe on which this instance's VMM serves virtio-fs export requests.
+    ///
+    /// Derived from the directory rather than stored, so it is stable across processes
+    /// and needs no state file field: a share added later by a different `Instance` for
+    /// the same directory reaches the same pipe.
+    pub fn export_pipe(&self) -> String {
+        use std::hash::Hash;
+        use std::hash::Hasher;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.dir.hash(&mut hasher);
+        crate::host::live_control::pipe_name(hasher.finish())
     }
 
     /// Returns the instance's name in messages.
@@ -582,15 +600,9 @@ impl Instance {
         // The export channel's name is derived from the instance directory, so any
         // later `Instance` for the same directory computes the same pipe; nothing has
         // to be persisted for it, and no handle has to outlive the launch.
-        let export_spec = {
-            use std::hash::Hash;
-            use std::hash::Hasher;
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            self.dir.hash(&mut hasher);
-            crate::host::live_control::spec(&crate::host::live_control::Endpoint::Named(
-                crate::host::live_control::pipe_name(hasher.finish()),
-            ))
-        };
+        let export_spec = crate::host::live_control::spec(
+            &crate::host::live_control::Endpoint::Named(self.export_pipe()),
+        );
         let arguments =
             spec.openvmm_arguments_with_control(&endpoint, &report, Some(&export_spec))?;
         spec.fit_process_command_line(&arguments, 0)?;
@@ -648,6 +660,7 @@ impl Instance {
             pid,
             start_time,
             endpoint: endpoint.clone(),
+            export_pipe: Some(self.export_pipe()),
         };
         let identified = LaunchRecord {
             format: STATE_FORMAT,
@@ -1032,6 +1045,7 @@ mod tests {
             pid: 1,
             start_time: 2,
             endpoint: "endpoint".to_owned(),
+            export_pipe: None,
         };
         instance.write_runtime(&runtime).unwrap();
         instance.write_capability(&[9; CAPABILITY_LEN]).unwrap();
@@ -1113,6 +1127,7 @@ mod tests {
             pid: GONE_PID,
             start_time: 0,
             endpoint: "endpoint".to_owned(),
+            export_pipe: None,
         };
         instance.write_runtime(&runtime).unwrap();
         instance.write_capability(&[1; CAPABILITY_LEN]).unwrap();

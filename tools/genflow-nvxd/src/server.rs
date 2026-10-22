@@ -67,7 +67,12 @@ pub struct Context {
     /// that a caller records what actually ran instead of what it meant to run.
     provenance: Value,
     writer: Writer,
-    /// The VMM inherits `NVX_POC_LIVE_SHARE_DIR` when it starts, so starts are serialized.
+    /// How many sessions may hold a VM at once; 0 means no limit.
+    ///
+    /// This is a hard ceiling, not a queue: a caller that opens too many sessions is told
+    /// so rather than parked, because the host budget above this layer is what decides
+    /// how many VMs exist.
+    max_sessions: usize,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     handles: Mutex<HashMap<String, Canceller>>,
     counter: Mutex<u64>,
@@ -77,14 +82,16 @@ impl Context {
     pub fn new(
         backend: Arc<OpenVmmBackend>,
         client: AciEdgeSandbox,
-            provenance: Value,
+        provenance: Value,
         writer: Writer,
+        max_sessions: usize,
     ) -> Self {
         Self {
             backend,
             client,
             provenance,
             writer,
+            max_sessions,
             sessions: Mutex::new(HashMap::new()),
             handles: Mutex::new(HashMap::new()),
             counter: Mutex::new(0),
@@ -155,6 +162,15 @@ impl Context {
         }
         if self.sessions.lock().unwrap().contains_key(name) {
             return Err(fail("E_BACKEND_PROTOCOL", "session already open"));
+        }
+        {
+            let open = self.sessions.lock().unwrap().len();
+            if self.max_sessions > 0 && open >= self.max_sessions {
+                return Err(fail(
+                    protocol::REASON_BACKEND_BUSY,
+                    format!("{open} sessions are already open, the limit is {}", self.max_sessions),
+                ));
+            }
         }
         let request: ProvisionRequest = serde_json::from_value(json!({
             "filesystem": { "readwritePaths": [workspace] },

@@ -51,6 +51,9 @@ struct SessionState {
 
 struct Session {
     sandbox: SandboxId,
+    /// The session's workspace. A mount must live below its parent, which keeps a
+    /// caller from exporting an unrelated host location through the channel.
+    workspace: PathBuf,
     memory: Option<VmmMemory>,
     state: Mutex<SessionState>,
 }
@@ -193,6 +196,7 @@ impl Context {
         };
         let session = Session {
             sandbox,
+            workspace: PathBuf::from(workspace),
             memory,
             state: Mutex::new(state),
         };
@@ -315,6 +319,29 @@ impl Context {
                 "E_BACKEND_PROTOCOL",
                 "a mount needs mountId and hostPath",
             ));
+        }
+        // A mount may only export a location inside the session's own tree. Without this
+        // the channel would let a caller read any host path the sidecar can reach, which
+        // is exactly what P4 forbids.
+        let root = session
+            .workspace
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| session.workspace.clone());
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        for mount in &desired {
+            let candidate = std::fs::canonicalize(&mount.host_path)
+                .unwrap_or_else(|_| PathBuf::from(&mount.host_path));
+            if !candidate.starts_with(&root) {
+                return Err(fail(
+                    "E_WORKSPACE_MOUNT_DENIED",
+                    format!(
+                        "hostPath {} is outside the allowed root {}",
+                        candidate.display(),
+                        root.display()
+                    ),
+                ));
+            }
         }
         let mut state = session.state.lock().unwrap();
         if state.busy {

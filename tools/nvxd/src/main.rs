@@ -139,6 +139,7 @@ fn run() -> Result<(), String> {
     let context = Arc::new(Context::new(
         backend,
         client,
+        request_root,
         provenance,
         Arc::clone(&writer),
     ));

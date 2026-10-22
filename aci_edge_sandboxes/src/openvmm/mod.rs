@@ -256,6 +256,7 @@ impl OpenVmmBackend {
     pub fn add_share_poc(
         &self,
         sandbox_id: &SandboxId,
+        request_dir: &std::path::Path,
         added_before: usize,
         share: &nvx::host::poc_live::LiveShare<'_>,
         timeout: Duration,
@@ -272,28 +273,8 @@ impl OpenVmmBackend {
                 RunState::Running(runtime) => (runtime, instance.read_capability()?),
             }
         };
-        // The control channel needs the pipe the VMM was started with and the VM's
-        // boot generation. `start_time` identifies the boot: it is stable within one
-        // VM and different after a restart, which is exactly what replay protection
-        // binds a request to. No sequence state is kept here: the caller's count of
-        // shares already added increases with every share, so it orders requests.
-        let export_pipe = runtime.export_pipe.clone().ok_or_else(|| {
-            Error::unsupported(format!(
-                "sandbox {sandbox_id} was started without an export channel"
-            ))
-        })?;
-        let mut sequences = nvx::host::live_control::Sequences::new(added_before as u64 + 1);
         instance
-            .add_share_control(
-                &runtime,
-                &capability,
-                &export_pipe,
-                runtime.start_time,
-                &mut sequences,
-                added_before,
-                share,
-                timeout,
-            )
+            .add_share_poc(&runtime, &capability, request_dir, added_before, share, timeout)
             .map_err(exec_error)
     }
 }
@@ -304,6 +285,7 @@ impl OpenVmmBackend {
     pub fn remove_share_poc(
         &self,
         sandbox_id: &SandboxId,
+        request_dir: &std::path::Path,
         child: &str,
         target: &str,
         timeout: Duration,
@@ -320,26 +302,8 @@ impl OpenVmmBackend {
                 RunState::Running(runtime) => (runtime, instance.read_capability()?),
             }
         };
-        let export_pipe = runtime.export_pipe.clone().ok_or_else(|| {
-            Error::unsupported(format!(
-                "sandbox {sandbox_id} was started without an export channel"
-            ))
-        })?;
-        // Removals share the ordering space with additions, so this sequence must exceed
-        // every one used before it in this boot; the caller's count of children bounds
-        // that, and the VMM only requires strict increase.
-        let mut sequences = nvx::host::live_control::Sequences::new(1_000_000);
         instance
-            .remove_share_control(
-                &runtime,
-                &capability,
-                &export_pipe,
-                runtime.start_time,
-                &mut sequences,
-                child,
-                target,
-                timeout,
-            )
+            .remove_share_poc(&runtime, &capability, request_dir, child, target, timeout)
             .map_err(exec_error)
     }
 }

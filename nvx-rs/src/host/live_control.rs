@@ -135,6 +135,106 @@ pub fn export_or_rollback(
     }
 }
 
+/// Where the VMM should serve export requests.
+///
+/// The launcher names the endpoint on OpenVMM's command line: `<digits>` is an
+/// inherited handle, `name=<path>` is a pipe the VMM connects to. The named form
+/// exists because an inherited handle must outlive the whole `Instance`, which its
+/// `Clone`/`PartialEq` derives do not allow; a name is an ordinary string, and the
+/// launcher can open it per request instead of holding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    /// A handle the child receives by inheritance; the value is the descriptor
+    /// number the child sees.
+    Inherited(u32),
+    /// A pipe name the child connects to as a client.
+    Named(String),
+}
+
+/// Windows pipe-path prefix for this channel.
+pub const PIPE_PREFIX: &str = r"\\.\pipe\nvx-live-";
+
+/// Builds the pipe name for one VM from `nonce`, which must be unique per VM.
+///
+/// The name is not a secret: the pipe's DACL limits connects to this user, the VMM
+/// checks the connecting process, and every request carries a generation and a
+/// monotonic sequence number. Uniqueness only keeps concurrent VMs apart.
+pub fn pipe_name(nonce: u64) -> String {
+    format!("{PIPE_PREFIX}{nonce:016x}")
+}
+
+/// Renders the value OpenVMM's `--microvm-virtiofs-control` expects for `endpoint`.
+pub fn spec(endpoint: &Endpoint) -> String {
+    match endpoint {
+        Endpoint::Inherited(handle) => handle.to_string(),
+        Endpoint::Named(name) => format!("name={name}"),
+    }
+}
+
+/// Parses that value back, on either side of the channel.
+pub fn parse_spec(text: &str) -> Result<Endpoint, String> {
+    let text = text.trim();
+    if let Some(name) = text.strip_prefix("name=") {
+        if !name.starts_with(PIPE_PREFIX) {
+            return Err(format!("pipe name must start with {PIPE_PREFIX:?}"));
+        }
+        // The suffix is the VM's nonce; anything else would let two VMs collide.
+        let suffix = &name[PIPE_PREFIX.len()..];
+        if suffix.len() != 16 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("pipe name must end with 16 hexadecimal digits".to_owned());
+        }
+        return Ok(Endpoint::Named(name.to_owned()));
+    }
+    text.parse::<u32>()
+        .map(Endpoint::Inherited)
+        .map_err(|_| format!("endpoint {text:?} is neither a handle number nor name=..."))
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn names_are_unique_per_nonce_and_round_trip() {
+        let first = pipe_name(0x1234_5678_9abc_def0);
+        let second = pipe_name(1);
+        assert_ne!(first, second);
+        assert!(first.starts_with(PIPE_PREFIX));
+
+        let endpoint = Endpoint::Named(first.clone());
+        let spec = spec(&endpoint);
+        assert_eq!(spec, format!("name={first}"));
+        assert_eq!(parse_spec(&spec).unwrap(), endpoint);
+    }
+
+    #[test]
+    fn inherited_handles_round_trip() {
+        let endpoint = Endpoint::Inherited(0x1c);
+        assert_eq!(spec(&endpoint), "28");
+        assert_eq!(parse_spec("28").unwrap(), endpoint);
+        assert_eq!(parse_spec(" 28 ").unwrap(), endpoint);
+    }
+
+    #[test]
+    fn malformed_specs_are_refused() {
+        for text in [
+            "",
+            "handle=28",
+            "name=",
+            "name=\\\\.\\pipe\\other",
+            // Right prefix, wrong nonce shape: two VMs would collide.
+            "name=\\\\.\\pipe\\nvx-live-abc",
+            "name=\\\\.\\pipe\\nvx-live-00000000000000000",
+            "name=\\\\.\\pipe\\nvx-live-zzzzzzzzzzzzzzzz",
+            "-1",
+            "0x1c",
+            "1c",
+        ] {
+            assert!(parse_spec(text).is_err(), "{text:?} must be refused");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

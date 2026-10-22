@@ -182,4 +182,100 @@ impl Instance {
             self.name(),
         )
     }
+
+    /// Adds `share` to the running guest of `runtime` over the authenticated control
+    /// pipe, and binds it in the guest.
+    ///
+    /// `export_pipe` is the pipe the VMM was started with (`name=`), `generation` the
+    /// VM's boot generation, and `sequences` the launcher's ordering state: the VMM
+    /// refuses a request whose generation differs or whose sequence does not increase,
+    /// so a replayed request cannot re-add an export. `first` is the number of runtime
+    /// shares the guest already knows, which numbers this bind.
+    ///
+    /// Unlike [`Self::add_share_poc`] nothing is written to disk and nothing polls:
+    /// the VMM exports the child on demand, and a failed guest bind takes the export
+    /// back so a child slot is never leaked.
+    #[expect(clippy::too_many_arguments)]
+    pub fn add_share_control(
+        &self,
+        runtime: &RuntimeRecord,
+        capability: &[u8; CAPABILITY_LEN],
+        export_pipe: &str,
+        generation: u64,
+        sequences: &mut crate::host::live_control::Sequences,
+        first: usize,
+        share: &LiveShare<'_>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut pipe = crate::host::control_pipe::connect(export_pipe, timeout).map_err(|error| {
+            Error::io(format!(
+                "cannot reach the export channel of sandbox {}",
+                self.name()
+            ))
+            .with_source(error)
+        })?;
+        crate::host::live_control::export_or_rollback(
+            &mut pipe,
+            generation,
+            sequences,
+            self.name(),
+            share,
+            || {
+                let mut guest = self.live_session(runtime, capability, deadline)?;
+                let map = HostMap {
+                    source: share.child.to_owned(),
+                    target: share.target.to_owned(),
+                    read_only: share.read_only,
+                };
+                guest.append_host_paths(first, &[map], deadline).map_err(|error| {
+                    Error::protocol(format!(
+                        "sandbox {}: the guest did not mount the share: {error:?}",
+                        self.name()
+                    ))
+                })
+            },
+        )
+    }
+
+    /// Removes a share that [`Self::add_share_control`] added: the guest unmounts
+    /// `target` first, so nothing uses the export, and then the VMM stops exporting
+    /// `child`.
+    #[expect(clippy::too_many_arguments)]
+    pub fn remove_share_control(
+        &self,
+        runtime: &RuntimeRecord,
+        capability: &[u8; CAPABILITY_LEN],
+        export_pipe: &str,
+        generation: u64,
+        sequences: &mut crate::host::live_control::Sequences,
+        child: &str,
+        target: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut guest = self.live_session(runtime, capability, deadline)?;
+        guest.unmap_host_path(target, deadline).map_err(|error| {
+            Error::protocol(format!(
+                "sandbox {}: the guest did not unmount the share: {error:?}",
+                self.name()
+            ))
+        })?;
+        drop(guest);
+        let mut pipe = crate::host::control_pipe::connect(export_pipe, timeout).map_err(|error| {
+            Error::io(format!(
+                "cannot reach the export channel of sandbox {}",
+                self.name()
+            ))
+            .with_source(error)
+        })?;
+        crate::host::live_control::unexport(
+            &mut pipe,
+            generation,
+            sequences.next(),
+            self.name(),
+            child,
+            target,
+        )
+    }
 }

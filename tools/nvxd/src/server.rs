@@ -62,6 +62,9 @@ pub struct Context {
     backend: Arc<OpenVmmBackend>,
     client: AciEdgeSandbox,
     request_root: PathBuf,
+    /// The assets and CPU profile this sidecar was started with, answered by `probe` so
+    /// that a caller records what actually ran instead of what it meant to run.
+    provenance: Value,
     writer: Writer,
     /// The VMM inherits `NVX_POC_LIVE_SHARE_DIR` when it starts, so starts are serialized.
     start_lock: Mutex<()>,
@@ -75,12 +78,14 @@ impl Context {
         backend: Arc<OpenVmmBackend>,
         client: AciEdgeSandbox,
         request_root: PathBuf,
+        provenance: Value,
         writer: Writer,
     ) -> Self {
         Self {
             backend,
             client,
             request_root,
+            provenance,
             writer,
             start_lock: Mutex::new(()),
             sessions: Mutex::new(HashMap::new()),
@@ -111,7 +116,7 @@ impl Context {
             protocol::OP_PROBE => self
                 .client
                 .probe()
-                .map(|()| json!({"backend": "nvx-whp"}))
+                .map(|()| json!({"backend": "nvx-whp", "provenance": self.provenance}))
                 .map_err(|error| fail(protocol::REASON_BACKEND_UNAVAILABLE, error)),
             protocol::OP_SESSION_OPEN => {
                 let memory = match head.get("memoryMiB") {

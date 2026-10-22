@@ -1,5 +1,10 @@
-//! NVX sidecar (PoC). Frames on stdin are requests, frames on stdout are replies and
+//! NVX sidecar. Frames on stdin are requests, frames on stdout are replies and
 //! events; diagnostics go to stderr. See `sandbox/doc/nvx_sidecar_integration.md`.
+//!
+//! Every runtime input is explicit: the VMM executable, the guest kernel and the guest
+//! initramfs are named on the command line (or come from a checkout's conventional layout via
+//! `--repo`, which is a development convenience), and the CPU profile is a required setting.
+//! Nothing is read from the environment, so what a VM runs with is what the caller configured.
 
 mod frame;
 mod plan;
@@ -11,6 +16,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aci_edge_sandboxes::CpuProfile;
 use aci_edge_sandboxes::AciEdgeSandbox;
 use aci_edge_sandboxes::nvx::Hypervisor;
 use aci_edge_sandboxes::nvx::host::artifacts::Artifacts;
@@ -21,8 +27,14 @@ use frame::{FrameWriter, read_frame};
 use server::Context;
 
 struct Args {
-    repo: String,
+    /// A checkout whose conventional layout names the artifacts; development only.
+    repo: Option<PathBuf>,
+    /// Explicit artifacts, as a product installation carries them.
+    openvmm: Option<PathBuf>,
+    kernel: Option<PathBuf>,
     initrd: Option<PathBuf>,
+    /// Required: the guest CPU profile is a deployment decision, never inferred.
+    cpu_profile: Option<CpuProfile>,
     hypervisor: Option<Hypervisor>,
     state_dir: PathBuf,
     /// Seconds a session may sit idle before its VMM working set is trimmed; 0 turns it off.
@@ -31,8 +43,11 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
-        repo: String::new(),
+        repo: None,
+        openvmm: None,
+        kernel: None,
         initrd: None,
+        cpu_profile: None,
         hypervisor: None,
         state_dir: std::env::temp_dir().join(format!("nvxd-{}", std::process::id())),
         idle_trim_secs: 30,
@@ -41,8 +56,16 @@ fn parse_args() -> Result<Args, String> {
     while let Some(flag) = input.next() {
         let mut value = || input.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
-            "--repo" => args.repo = value()?,
+            "--repo" => args.repo = Some(PathBuf::from(value()?)),
+            "--openvmm" => args.openvmm = Some(PathBuf::from(value()?)),
+            "--kernel" => args.kernel = Some(PathBuf::from(value()?)),
             "--initrd" => args.initrd = Some(PathBuf::from(value()?)),
+            "--cpu-profile" => {
+                let text = value()?;
+                args.cpu_profile = Some(CpuProfile::parse(&text).ok_or_else(|| {
+                    format!("--cpu-profile must be 'auto' or 'host', not '{text}'")
+                })?);
+            }
             "--hypervisor" => args.hypervisor = Some(value()?.parse().map_err(|e| format!("{e}"))?),
             "--state-dir" => args.state_dir = PathBuf::from(value()?),
             "--idle-trim-secs" => {
@@ -51,33 +74,65 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unexpected argument {other}")),
         }
     }
-    if args.repo.is_empty() {
-        return Err("--repo is required".into());
-    }
     Ok(args)
+}
+
+/// Names the three artifacts the VM runs: a checkout's conventional layout, or every artifact
+/// given explicitly, with optional per-artifact overrides on top.
+fn resolve_artifacts(args: &Args) -> Result<Artifacts, String> {
+    let mut artifacts = match &args.repo {
+        Some(repo) => Artifacts::from_dir(repo).map_err(|e| e.to_string())?,
+        None => {
+            let (Some(openvmm), Some(kernel), Some(initrd)) =
+                (&args.openvmm, &args.kernel, &args.initrd)
+            else {
+                return Err(
+                    "name --repo, or --openvmm/--kernel/--initrd together; either way any of \
+                     --openvmm/--kernel/--initrd may override one artifact"
+                        .into(),
+                );
+            };
+            Artifacts::new(openvmm.clone(), kernel.clone(), initrd.clone())
+        }
+    };
+    if let Some(openvmm) = &args.openvmm {
+        artifacts.openvmm = openvmm.clone();
+    }
+    if let Some(kernel) = &args.kernel {
+        artifacts.kernel = kernel.clone();
+    }
+    if let Some(initrd) = &args.initrd {
+        artifacts.initrd = initrd.clone();
+    }
+    Ok(artifacts)
 }
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
+    let cpu_profile = args
+        .cpu_profile
+        .ok_or("--cpu-profile is required (auto or host)")?;
     let hypervisor = match args.hypervisor {
         Some(hypervisor) => hypervisor,
         None => Hypervisor::from_env_or_default().map_err(|e| e.to_string())?,
     };
-    let artifacts = Artifacts::from_repo_layout(&args.repo).map_err(|e| e.to_string())?;
+    let artifacts = resolve_artifacts(&args)?;
+    let provenance = json!({
+        "openvmm": artifacts.openvmm.display().to_string(),
+        "kernel": artifacts.kernel.display().to_string(),
+        "initrd": artifacts.initrd.display().to_string(),
+        "cpuProfile": cpu_profile.as_str(),
+        "idleTrimSecs": args.idle_trim_secs,
+        "protocolVersion": protocol::VERSION,
+    });
+    let _ = writeln!(std::io::stderr(), "nvxd: {provenance}");
     let state_dir = args.state_dir.clone();
     let _ = std::fs::remove_dir_all(&state_dir);
     let request_root = args.state_dir.join("requests");
     std::fs::create_dir_all(&request_root).map_err(|e| e.to_string())?;
-    // PoC hook in the NVX fork; P1 will replace this with explicit CPU profile configuration.
-    if std::env::var_os("NVX_POC_CPU_PROFILE").is_none() {
-        // SAFETY: no other thread exists yet.
-        unsafe { std::env::set_var("NVX_POC_CPU_PROFILE", "host") };
-    }
     let mut config =
         OpenVmmConfig::from_artifacts(artifacts, hypervisor, args.state_dir.join("state"));
-    if let Some(initrd) = args.initrd {
-        config.initrd = initrd;
-    }
+    config.cpu_profile = cpu_profile;
     let backend = Arc::new(OpenVmmBackend::new(config).map_err(|e| e.to_string())?);
     let client = AciEdgeSandbox::from_shared(backend.clone());
     let writer = Arc::new(FrameWriter::new(std::io::stdout()));
@@ -85,6 +140,7 @@ fn run() -> Result<(), String> {
         backend,
         client,
         request_root,
+        provenance,
         Arc::clone(&writer),
     ));
 

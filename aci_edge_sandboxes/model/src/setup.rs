@@ -232,6 +232,25 @@ pub enum CpuProfile {
     Host,
 }
 
+impl CpuProfile {
+    /// The name OpenVMM's `--cpu-profile` accepts for this profile.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Host => "host",
+        }
+    }
+
+    /// Parses the name that [`Self::as_str`] returns; `None` for anything else.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "auto" => Some(Self::Auto),
+            "host" => Some(Self::Host),
+            _ => None,
+        }
+    }
+}
+
 /// Operation deadlines, in milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

@@ -40,6 +40,26 @@ pub const DEFAULT_HOSTNAME: &str = "nvx-sandbox";
 /// Default guest network address.
 pub const DEFAULT_GUEST_NETWORK: &str = "10.0.0.2/24";
 
+/// CPU profile passed to OpenVMM for the guest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CpuProfile {
+    /// OpenVMM's built-in profile of the host's CPU model.
+    #[default]
+    Auto,
+    /// A profile derived from the host CPU, for hosts that no built-in profile serves.
+    Host,
+}
+
+impl CpuProfile {
+    /// The name OpenVMM's `--cpu-profile` accepts.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Host => "host",
+        }
+    }
+}
+
 /// The identity that workloads run as: a non-root user and group ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkloadIdentity {
@@ -116,6 +136,8 @@ pub struct LaunchSpec {
     pub initrd: PathBuf,
     /// Hypervisor used by OpenVMM.
     pub hypervisor: Hypervisor,
+    /// CPU profile of the guest; [`CpuProfile::Auto`] keeps OpenVMM's built-in choice.
+    pub cpu_profile: CpuProfile,
     /// Guest memory in MiB; positive.
     pub memory_mib: u32,
     /// Identity of the workloads; neither ID may be root's.
@@ -150,6 +172,7 @@ impl LaunchSpec {
             kernel: artifacts.kernel,
             initrd: artifacts.initrd,
             hypervisor,
+            cpu_profile: CpuProfile::Auto,
             memory_mib: DEFAULT_MEMORY_MIB,
             identity: WorkloadIdentity::DEFAULT,
             hostname: DEFAULT_HOSTNAME.to_owned(),
@@ -248,11 +271,11 @@ impl LaunchSpec {
         }
         arguments.push("--memory".into());
         arguments.push(format!("{}M", self.memory_mib).into());
-        // PoC only: lets an experiment on a host whose hypervisor lacks the built-in CPU profile
-        // (`E_PROFILE_UNSUPPORTED`) select `host`. Not a supported setting.
-        if let Some(profile) = std::env::var_os("NVX_POC_CPU_PROFILE").filter(|p| !p.is_empty()) {
+        // An explicit profile only: the PoC read `NVX_POC_CPU_PROFILE` here, which let the
+        // caller's environment silently change the guest CPU model.
+        if self.cpu_profile != CpuProfile::Auto {
             arguments.push("--cpu-profile".into());
-            arguments.push(profile);
+            arguments.push(self.cpu_profile.as_str().into());
         }
         arguments.push("--kernel".into());
         arguments.push(self.kernel.clone().into());
@@ -470,6 +493,33 @@ mod tests {
             ]
         );
         assert!(!arguments.contains(&"--microvm-sandbox-block"));
+    }
+
+    #[test]
+    fn only_an_explicit_cpu_profile_reaches_the_command_line() {
+        // Auto is OpenVMM's own choice, so the argument is absent and the command line stays
+        // identical to a build without this setting.
+        let automatic = spec()
+            .openvmm_arguments("/e", Path::new("/r"))
+            .unwrap()
+            .iter()
+            .map(|argument| argument.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(!automatic.iter().any(|argument| argument == "--cpu-profile"));
+
+        let mut explicit = spec();
+        explicit.cpu_profile = CpuProfile::Host;
+        let arguments = explicit
+            .openvmm_arguments("/e", Path::new("/r"))
+            .unwrap()
+            .iter()
+            .map(|argument| argument.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let position = arguments
+            .iter()
+            .position(|argument| argument == "--cpu-profile")
+            .expect("an explicit profile names the argument");
+        assert_eq!(arguments[position + 1], "host");
     }
 
     #[test]

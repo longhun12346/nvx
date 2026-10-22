@@ -12,6 +12,9 @@ pub const OP_SESSION_CLOSE: &str = "session.close";
 pub const OP_MEMORY_STATS: &str = "memory.stats";
 pub const OP_MEMORY_TRIM: &str = "memory.trim";
 pub const OP_SHUTDOWN: &str = "shutdown";
+/// Returns this sidecar's own counters and session summary. Read-only, so a diagnostic
+/// run never changes what it is measuring.
+pub const OP_DIAGNOSTICS: &str = "diagnostics";
 
 pub const EVENT_READY: &str = "ready";
 pub const EVENT_EXEC_STDOUT: &str = "exec.stdout";

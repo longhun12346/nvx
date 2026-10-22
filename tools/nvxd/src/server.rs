@@ -51,11 +51,30 @@ struct SessionState {
 
 struct Session {
     sandbox: SandboxId,
+    /// Opaque identity of this session's VM, reported to the caller and repeated in
+    /// `diagnostics` so a log line can be tied back to the session that produced it.
+    runtime_id: String,
     /// The session's workspace. A mount must live below its parent, which keeps a
     /// caller from exporting an unrelated host location through the channel.
     workspace: PathBuf,
     memory: Option<VmmMemory>,
     state: Mutex<SessionState>,
+}
+
+/// Counters of what this sidecar has done since it started.
+///
+/// Reported by `diagnostics` and repeated in the log line of every failed request, so a
+/// support case can tell "never started" from "started and then failed" without replaying
+/// the session.
+#[derive(Debug, Default)]
+struct Stats {
+    requests: u64,
+    failures: u64,
+    execs: u64,
+    shares_added: u64,
+    shares_removed: u64,
+    /// The most recent failure's reason code and message.
+    last_failure: Option<(String, String)>,
 }
 
 pub type Writer = Arc<FrameWriter<Stdout>>;
@@ -79,6 +98,7 @@ pub struct Context {
     /// Per-process prefix of every runtime id, so an id cannot be guessed from the
     /// session's position and does not collide with another sidecar's ids.
     runtime_prefix: String,
+    stats: Mutex<Stats>,
 }
 
 impl Context {
@@ -109,6 +129,7 @@ impl Context {
                 std::time::SystemTime::now().hash(&mut hasher);
                 format!("{:016x}", hasher.finish())
             },
+            stats: Mutex::new(Stats::default()),
         }
     }
 
@@ -160,11 +181,93 @@ impl Context {
             protocol::OP_SESSION_CLOSE => self.close(text("session")),
             protocol::OP_MEMORY_STATS => self.memory_stats(text("session")),
             protocol::OP_MEMORY_TRIM => self.memory_trim(text("session")),
+            protocol::OP_DIAGNOSTICS => Ok(self.diagnostics()),
             other => Err(fail(
                 protocol::REASON_PROTOCOL,
                 format!("unknown op {other:?}"),
             )),
         }
+    }
+
+    /// Times, counts and logs one request, then returns whatever [`Self::handle`] decided.
+    ///
+    /// Every request passes through here, so the counters cover the whole sidecar and the
+    /// log line is the one place to look when a caller reports "it failed". Successful
+    /// requests are only logged when they were slow: a normal run must not flood the log.
+    pub fn handle_logged(self: &Arc<Self>, head: &Value) -> Result<Value, Failure> {
+        let started = std::time::Instant::now();
+        let op = head.get("op").and_then(Value::as_str).unwrap_or("");
+        let session = head.get("session").and_then(Value::as_str).unwrap_or("");
+        let outcome = self.handle(head);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let slow = elapsed_ms >= 1000;
+        {
+            let mut stats = self.stats.lock().unwrap();
+            stats.requests += 1;
+            if op == protocol::OP_EXEC {
+                stats.execs += 1;
+            }
+            match &outcome {
+                Ok(_) => {}
+                Err(failure) => {
+                    stats.failures += 1;
+                    stats.last_failure = Some((failure.code.to_owned(), failure.message.clone()));
+                }
+            }
+        }
+        let verbose = std::env::var_os("NVXD_LOG_REQUESTS").is_some();
+        match &outcome {
+            Ok(_) if !slow && !verbose => {}
+            Ok(_) => eprintln!(
+                "nvxd: request op={op} session={session} result=ok durationMs={elapsed_ms}"
+            ),
+            Err(failure) => eprintln!(
+                "nvxd: request op={op} session={session} result=error \
+                 reasonCode={} durationMs={elapsed_ms} message={}",
+                failure.code, failure.message
+            ),
+        }
+        outcome
+    }
+
+    /// Reports what this sidecar has done and what it currently holds.
+    fn diagnostics(&self) -> Value {
+        let stats = self.stats.lock().unwrap();
+        let sessions: Vec<Value> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, session)| {
+                let state = session.state.lock().unwrap();
+                json!({
+                    "session": name,
+                    "runtimeId": session.runtime_id,
+                    "workspace": session.workspace.display().to_string(),
+                    "busy": state.busy,
+                    "shares": state.shares.len(),
+                    "mountedOnce": state.next_child,
+                    "idleMs": state.last_activity.elapsed().as_millis() as u64,
+                })
+            })
+            .collect();
+        json!({
+            "runtimePrefix": self.runtime_prefix,
+            "maxSessions": self.max_sessions,
+            "sessions": sessions,
+            "handles": self.handles.lock().unwrap().len(),
+            "stats": {
+                "requests": stats.requests,
+                "failures": stats.failures,
+                "execs": stats.execs,
+                "sharesAdded": stats.shares_added,
+                "sharesRemoved": stats.shares_removed,
+                "lastFailure": stats.last_failure.as_ref().map(|(code, message)| json!({
+                    "reasonCode": code,
+                    "message": message,
+                })),
+            },
+        })
     }
 
     fn open(&self, name: &str, workspace: &str, memory_mib: u32) -> Result<Value, Failure> {
@@ -224,8 +327,13 @@ impl Context {
             trimmed: false,
             trims: 0,
         };
+        // An opaque identity for this session's VM, so a caller can record which runtime a
+        // business session was bound to without depending on the session name's shape or
+        // assuming it maps to a VM one-to-one (P5 shares one VM across sessions).
+        let runtime = format!("rt-{}-{:08x}", self.runtime_prefix, self.next_id());
         let session = Session {
             sandbox,
+            runtime_id: runtime.clone(),
             workspace: PathBuf::from(workspace),
             memory,
             state: Mutex::new(state),
@@ -235,10 +343,6 @@ impl Context {
             .unwrap()
             .insert(name.to_owned(), Arc::new(session));
         let guest = resolve_guest_path(std::path::Path::new(workspace)).unwrap_or_default();
-        // An opaque identity for this session's VM, so a caller can record which runtime a
-        // business session was bound to without depending on the session name's shape or
-        // assuming it maps to a VM one-to-one (P5 shares one VM across sessions).
-        let runtime = format!("rt-{}-{:08x}", self.runtime_prefix, self.next_id());
         Ok(json!({"workspaceGuestPath": guest, "runtimeId": runtime}))
     }
 
@@ -260,6 +364,7 @@ impl Context {
                         )
                         .map_err(|error| fail("E_WORKSPACE_MOUNT_REMOVE_FAILED", error))?;
                     state.shares.retain(|other| other.child != share.child);
+                    self.stats.lock().unwrap().shares_removed += 1;
                 }
                 Step::Add(mount) => {
                     let child = format!("mount{}", state.next_child);
@@ -293,6 +398,7 @@ impl Context {
                             )
                         })?;
                     state.next_sequence += 1;
+                    self.stats.lock().unwrap().shares_added += 1;
                     state.shares.push(Share {
                         mount,
                         child,

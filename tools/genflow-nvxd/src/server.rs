@@ -51,7 +51,6 @@ struct SessionState {
 
 struct Session {
     sandbox: SandboxId,
-    request_dir: PathBuf,
     memory: Option<VmmMemory>,
     state: Mutex<SessionState>,
 }
@@ -61,13 +60,11 @@ pub type Writer = Arc<FrameWriter<Stdout>>;
 pub struct Context {
     backend: Arc<OpenVmmBackend>,
     client: AciEdgeSandbox,
-    request_root: PathBuf,
     /// The assets and CPU profile this sidecar was started with, answered by `probe` so
     /// that a caller records what actually ran instead of what it meant to run.
     provenance: Value,
     writer: Writer,
     /// The VMM inherits `NVX_POC_LIVE_SHARE_DIR` when it starts, so starts are serialized.
-    start_lock: Mutex<()>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     handles: Mutex<HashMap<String, Canceller>>,
     counter: Mutex<u64>,
@@ -77,17 +74,14 @@ impl Context {
     pub fn new(
         backend: Arc<OpenVmmBackend>,
         client: AciEdgeSandbox,
-        request_root: PathBuf,
-        provenance: Value,
+            provenance: Value,
         writer: Writer,
     ) -> Self {
         Self {
             backend,
             client,
-            request_root,
             provenance,
             writer,
-            start_lock: Mutex::new(()),
             sessions: Mutex::new(HashMap::new()),
             handles: Mutex::new(HashMap::new()),
             counter: Mutex::new(0),
@@ -164,17 +158,15 @@ impl Context {
             "microvm": { "provision": { "memoryMib": memory_mib } }
         }))
         .map_err(|error| fail("E_BACKEND_PROTOCOL", error))?;
-        let request_dir = self.request_root.join(format!("s{}", self.next_id()));
-        std::fs::create_dir_all(&request_dir).map_err(|error| fail("E_BACKEND_START", error))?;
         let sandbox = {
-            let _serialized = self.start_lock.lock().unwrap();
+            // No serialization and no environment variable: exports travel over the
+            // sandbox's own control pipe, so two VMs can start at the same time and no
+            // process-wide state decides where a VMM looks for requests.
             let sandbox = self
                 .client
                 .provision(&request)
                 .map_err(|error| fail("E_BACKEND_START", error))?
                 .sandbox_id;
-            // SAFETY: starts are serialized by `start_lock`; nothing else reads the variable.
-            unsafe { std::env::set_var("NVX_POC_LIVE_SHARE_DIR", &request_dir) };
             if let Err(error) = self.client.start(&sandbox) {
                 let _ = self.client.deprovision(&sandbox);
                 return Err(fail("E_BACKEND_START", error));
@@ -201,7 +193,6 @@ impl Context {
         };
         let session = Session {
             sandbox,
-            request_dir,
             memory,
             state: Mutex::new(state),
         };
@@ -225,7 +216,6 @@ impl Context {
                     self.backend
                         .remove_share_poc(
                             &session.sandbox,
-                            &session.request_dir,
                             &share.child,
                             &share.target,
                             SHARE_TIMEOUT,
@@ -247,7 +237,6 @@ impl Context {
                     self.backend
                         .add_share_poc(
                             &session.sandbox,
-                            &session.request_dir,
                             state.next_sequence,
                             &live,
                             SHARE_TIMEOUT,
@@ -518,7 +507,6 @@ impl Context {
         })?;
         let _ = self.client.stop(&session.sandbox);
         let result = self.client.deprovision(&session.sandbox);
-        let _ = std::fs::remove_dir_all(&session.request_dir);
         result
             .map(|_| json!({}))
             .map_err(|error| fail("E_BACKEND_CLOSE", error))

@@ -283,6 +283,7 @@ mod tests {
             pid: 1,
             start_time: 2,
             endpoint: "endpoint".to_owned(),
+            export_pipe: None,
         };
         instance.write_runtime(&runtime).unwrap();
         instance.write_capability(&[9; CAPABILITY_LEN]).unwrap();

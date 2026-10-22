@@ -263,6 +263,36 @@ def main():
                     raise RuntimeError(f"round {round_number}: unexpected stdout {out!r}")
             print(f"stress: {rounds} live exports added over one VM")
 
+            # The sidecar's own counters must agree with what this test just did: that is
+            # what makes `diagnostics` usable in support, where there is no test to compare
+            # against. A counter that never moves would be worse than none.
+            stage = "diagnostics"
+            diag_head, _ = request(
+                process.stdin, process.stdout, {"id": 900, "op": "diagnostics"}
+            )
+            stats = diag_head.get("stats") or {}
+            if not stats:
+                raise RuntimeError(f"diagnostics returned no stats: {diag_head}")
+            if stats.get("failures") != 1:
+                # The refusals this run expects is exactly one: the mount outside the tree.
+                raise RuntimeError(f"unexpected failure count: {stats}")
+            last = stats.get("lastFailure") or {}
+            if last.get("reasonCode") != "E_WORKSPACE_MOUNT_DENIED":
+                raise RuntimeError(f"the refusal was not recorded as expected: {last}")
+            if stats.get("requests", 0) < rounds:
+                raise RuntimeError(f"requests counter is behind: {stats}")
+            if stats.get("sharesAdded", 0) < rounds:
+                raise RuntimeError(f"sharesAdded counter is behind: {stats}")
+            sessions = diag_head.get("sessions") or []
+            if len(sessions) != 1 or not sessions[0].get("runtimeId"):
+                raise RuntimeError(f"diagnostics did not describe the session: {diag_head}")
+            if sessions[0].get("busy"):
+                raise RuntimeError(f"session is still busy after the stress: {sessions[0]}")
+            print(
+                f"diagnostics: requests={stats['requests']} "
+                f"sharesAdded={stats['sharesAdded']} failures={stats['failures']}"
+            )
+
             stage = "session.close"
             request(
                 process.stdin,

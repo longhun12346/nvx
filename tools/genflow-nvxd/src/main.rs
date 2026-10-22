@@ -195,7 +195,7 @@ fn run() -> Result<(), String> {
         let (context, writer) = (Arc::clone(&context), Arc::clone(&writer));
         std::thread::spawn(move || {
             let id = head.get("id").cloned().unwrap_or(Value::Null);
-            let reply = match context.handle(&head) {
+            let reply = match context.handle_logged(&head) {
                 Ok(mut body) => {
                     body["id"] = id;
                     body["ok"] = json!(true);

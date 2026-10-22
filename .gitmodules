@@ -1,4 +1,4 @@
 [submodule "openvmm"]
 	path = openvmm
-	url = https://github.com/microsoft/openvmm.git
-	branch = feature/microvm/dev
+	url = https://github.com/longhun12346/openvmm.git
+	branch = feature/win10-compat

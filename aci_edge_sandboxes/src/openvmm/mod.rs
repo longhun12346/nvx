@@ -248,11 +248,21 @@ fn cpu_profile(profile: aci_edge_sandboxes_model::setup::CpuProfile) -> nvx::hos
     }
 }
 
+/// Sequence numbers shared by every export request of this process.
+///
+/// The VMM refuses a request whose sequence does not strictly increase within a boot,
+/// so additions and removals must draw from one monotonic source: a per-call constant
+/// made a second removal repeat a number and be refused as a replay.
+static EXPORT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_export_sequence() -> u64 {
+    EXPORT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl OpenVmmBackend {
-    /// **Proof-of-concept.** Adds one host path to the running guest of `sandbox_id` without a
-    /// restart; see [`nvx::host::poc_live`]. `added_before` is the number of shares that earlier
-    /// calls added, and `request_dir` is the `NVX_POC_LIVE_SHARE_DIR` that the VMM was started
-    /// with.
+    /// Adds one host path to the running guest of `sandbox_id` without a restart; the
+    /// export travels over the sandbox's control channel. `added_before` is the number of
+    /// shares that earlier calls added, which orders the guest's runtime mappings.
     pub fn add_share(
         &self,
         sandbox_id: &SandboxId,
@@ -282,7 +292,7 @@ impl OpenVmmBackend {
                 "sandbox {sandbox_id} was started without an export channel"
             ))
         })?;
-        let mut sequences = nvx::host::live_control::Sequences::new(added_before as u64 + 1);
+        let mut sequences = nvx::host::live_control::Sequences::new(next_export_sequence());
         instance
             .add_share_control(
                 &runtime,
@@ -328,7 +338,7 @@ impl OpenVmmBackend {
         // Removals share the ordering space with additions, so this sequence must exceed
         // every one used before it in this boot; the caller's count of children bounds
         // that, and the VMM only requires strict increase.
-        let mut sequences = nvx::host::live_control::Sequences::new(1_000_000);
+        let mut sequences = nvx::host::live_control::Sequences::new(next_export_sequence());
         instance
             .remove_share_control(
                 &runtime,

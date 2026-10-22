@@ -35,7 +35,69 @@ use windows_sys::Win32::System::Pipes::PIPE_REJECT_REMOTE_CLIENTS;
 use windows_sys::Win32::System::Pipes::PIPE_TYPE_BYTE;
 use windows_sys::Win32::System::Pipes::PIPE_WAIT;
 
-/// A listening pipe that has accepted exactly one client.
+/// A pipe server running on its own thread, serving `handle` for each client.
+///
+/// The launcher needs the name *before* it starts the VMM (the name goes on the
+/// command line) but must not block on the client, which is the VMM and has not
+/// started yet. So the accept loop runs here, and the caller is handed only the
+/// name plus a handle it can wait on or abandon.
+pub struct Server {
+    name: String,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Server {
+    /// The pipe name to put on the VMM's command line.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Waits for the accept loop to finish, which happens when it stops accepting.
+    pub fn join(mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Creates the pipe for `nonce` and serves one connection per request until the
+/// VMM stops connecting.
+///
+/// `handle` receives the connected pipe; it must not block for long, because the
+/// next client cannot connect until it returns.
+#[cfg(windows)]
+pub fn serve<F>(nonce: u64, mut handle: F) -> std::io::Result<Server>
+where
+    F: FnMut(&mut std::fs::File) + Send + 'static,
+{
+    let name = crate::host::live_control::pipe_name(nonce);
+    // Create the pipe on this thread first, so a creation failure is reported to the
+    // caller instead of being lost inside the thread.
+    let first = accept_one(&name)?;
+    let served_name = name.clone();
+    let thread = std::thread::Builder::new()
+        .name("nvx-control-pipe".into())
+        .spawn(move || {
+            let mut connected = Some(first);
+            loop {
+                let Some(mut current) = connected.take() else {
+                    break;
+                };
+                handle(&mut current.pipe);
+                // A fresh instance serves the next client; the previous one is closed
+                // when `current` is dropped.
+                match accept_next(&served_name) {
+                    Ok(next) => connected = Some(next),
+                    Err(_) => break,
+                }
+            }
+        })?;
+    let server_name = name;
+    Ok(Server {
+        name: server_name,
+        thread: Some(thread),
+    })
+}
 pub struct Connected {
     /// The connected server end, used to exchange frames.
     pub pipe: std::fs::File,
@@ -55,13 +117,29 @@ fn wide(name: &str) -> Vec<u16> {
 /// silently attaching to another VM's pipe, and the one-instance limit means a
 /// second client cannot interleave frames with the first.
 pub fn accept_one(name: &str) -> io::Result<Connected> {
+    accept(name, true)
+}
+
+/// Accepts another client on a pipe whose first instance already exists.
+///
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE` is only legal on the first instance, so a server
+/// that keeps serving has to drop it; the name is already known to be ours.
+fn accept_next(name: &str) -> io::Result<Connected> {
+    accept(name, false)
+}
+
+fn accept(name: &str, first_instance: bool) -> io::Result<Connected> {
     let wide_name = wide(name);
+    let mut open_mode = PIPE_ACCESS_DUPLEX;
+    if first_instance {
+        open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+    }
     // SAFETY: the name is NUL-terminated, and a null security descriptor asks for
     // the process default, which admits this user and administrators only.
     let handle = unsafe {
         CreateNamedPipeW(
             wide_name.as_ptr(),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            open_mode,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,
             65_536,

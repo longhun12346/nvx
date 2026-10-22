@@ -204,6 +204,7 @@ def main():
             outside = root.parent / "outside-e2e"
             outside.mkdir(exist_ok=True)
             (outside / "secret.txt").write_text("must-not-be-readable", encoding="utf-8")
+            accepted = False
             try:
                 request(
                     process.stdin,
@@ -219,38 +220,48 @@ def main():
                         ],
                     },
                 )
+                accepted = True
+            except RuntimeError:
+                # The refusal itself is the expected outcome; the frame carries the reason.
+                pass
+            if accepted:
                 raise RuntimeError("a mount outside the allowed paths was accepted")
-            except RuntimeError as error:
-                if "outside the allowed paths was accepted" in str(error):
-                    raise
+
                 # Any refusal is the expected outcome; the frame carries the reason.
 
-            # Read-write, removal, and many rounds of churn over one VM: the channel
-            # must keep adding and removing aggregate children without leaking slots.
+            # Many rounds of churn over one VM. v1 cannot unmount a runtime export (the
+            # guest only records them in direct-rootfs mode), so each round adds one new
+            # export instead of replacing a previous one. That still exercises the path
+            # that matters here: repeated live adds must keep succeeding, and the
+            # aggregate's child slots must not leak, because the kernel refuses beyond
+            # the documented limit.
             stage = "stress"
             rounds = args.stress
             for round_number in range(rounds):
-                # One mount identity, so each round re-establishes the same export and the
-                # guest's runtime mapping table stays in step with the snapshot. Rebinding a
-                # new identity every round would grow that table instead of exercising churn.
-                mount_id = "churn"
-                payload_path = refs / "churn.txt"
-                if round_number == 0:
-                    (refs / "churn.txt").write_text("round-0", encoding="utf-8")
+                mount_id = f"churn{round_number}"
+                host_dir = root / mount_id
+                host_dir.mkdir(exist_ok=True)
+                (host_dir / "mark.txt").write_text(f"round-{round_number}", encoding="utf-8")
                 out, err, end = run_command(
-                    f"cat /workspace/mounts/{mount_id}/churn.txt 2>/dev/null || true",
+                    f"cat /workspace/mounts/{mount_id}/mark.txt",
                     [
+                        # The earlier `refs` export stays in every snapshot: v1 cannot
+                        # unmount a runtime export, so a snapshot that dropped it would
+                        # plan a removal and fail for a reason unrelated to this test.
+                        {"mountId": "refs", "hostPath": str(refs), "mode": "ro"},
                         {
                             "mountId": mount_id,
-                            "hostPath": str(refs),
-                            "mode": "rw",
+                            "hostPath": str(host_dir),
+                            "mode": "ro",
                         }
                     ],
                     100 + round_number,
                 )
-                if end.get("outcome") != "exited":
+                if end.get("outcome") != "exited" or end.get("code") != 0:
                     raise RuntimeError(f"round {round_number}: unexpected exit {end}")
-            print(f"stress: {rounds} mount rounds over one VM")
+                if out != f"round-{round_number}".encode():
+                    raise RuntimeError(f"round {round_number}: unexpected stdout {out!r}")
+            print(f"stress: {rounds} live exports added over one VM")
 
             stage = "session.close"
             request(

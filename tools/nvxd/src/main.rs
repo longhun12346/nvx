@@ -44,6 +44,8 @@ struct Args {
     /// This is the TTL the product configures: a session the caller abandoned must not hold
     /// a VM (and the host budget that came with it) indefinitely.
     session_ttl_secs: u64,
+    /// How many sessions may hold a VM at once; 0 means no limit.
+    max_sessions: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -57,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
         state_dir: std::env::temp_dir().join(format!("nvxd-{}", std::process::id())),
         idle_trim_secs: 30,
         session_ttl_secs: 0,
+        max_sessions: 0,
     };
     let mut input = std::env::args().skip(1);
     while let Some(flag) = input.next() {
@@ -74,6 +77,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--hypervisor" => args.hypervisor = Some(value()?.parse().map_err(|e| format!("{e}"))?),
             "--state-dir" => args.state_dir = PathBuf::from(value()?),
+            "--max-sessions" => {
+                args.max_sessions = value()?.parse().map_err(|e| format!("{e}"))?
+            }
             "--session-ttl-secs" => {
                 args.session_ttl_secs = value()?.parse().map_err(|e| format!("{e}"))?
             }
@@ -133,6 +139,7 @@ fn run() -> Result<(), String> {
         "cpuProfile": cpu_profile.as_str(),
         "idleTrimSecs": args.idle_trim_secs,
         "sessionTtlSecs": args.session_ttl_secs,
+        "maxSessions": args.max_sessions,
         "protocolVersion": protocol::VERSION,
     });
     let _ = writeln!(std::io::stderr(), "nvxd: {provenance}");
@@ -151,6 +158,7 @@ fn run() -> Result<(), String> {
         client,
         provenance,
         Arc::clone(&writer),
+        args.max_sessions,
     ));
 
     if args.idle_trim_secs > 0 || args.session_ttl_secs > 0 {

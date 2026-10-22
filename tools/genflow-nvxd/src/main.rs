@@ -39,6 +39,11 @@ struct Args {
     state_dir: PathBuf,
     /// Seconds a session may sit idle before its VMM working set is trimmed; 0 turns it off.
     idle_trim_secs: u64,
+    /// Seconds an idle session may live before it is closed; 0 keeps sessions open.
+    ///
+    /// This is the TTL the product configures: a session the caller abandoned must not hold
+    /// a VM (and the host budget that came with it) indefinitely.
+    session_ttl_secs: u64,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -51,6 +56,7 @@ fn parse_args() -> Result<Args, String> {
         hypervisor: None,
         state_dir: std::env::temp_dir().join(format!("genflow-nvxd-{}", std::process::id())),
         idle_trim_secs: 30,
+        session_ttl_secs: 0,
     };
     let mut input = std::env::args().skip(1);
     while let Some(flag) = input.next() {
@@ -68,6 +74,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--hypervisor" => args.hypervisor = Some(value()?.parse().map_err(|e| format!("{e}"))?),
             "--state-dir" => args.state_dir = PathBuf::from(value()?),
+            "--session-ttl-secs" => {
+                args.session_ttl_secs = value()?.parse().map_err(|e| format!("{e}"))?
+            }
             "--idle-trim-secs" => {
                 args.idle_trim_secs = value()?.parse().map_err(|e| format!("{e}"))?
             }
@@ -123,6 +132,7 @@ fn run() -> Result<(), String> {
         "initrd": artifacts.initrd.display().to_string(),
         "cpuProfile": cpu_profile.as_str(),
         "idleTrimSecs": args.idle_trim_secs,
+        "sessionTtlSecs": args.session_ttl_secs,
         "protocolVersion": protocol::VERSION,
     });
     let _ = writeln!(std::io::stderr(), "genflow-nvxd: {provenance}");
@@ -143,15 +153,23 @@ fn run() -> Result<(), String> {
         Arc::clone(&writer),
     ));
 
-    if args.idle_trim_secs > 0 {
-        let (context, idle) = (
+    if args.idle_trim_secs > 0 || args.session_ttl_secs > 0 {
+        let (context, idle, ttl) = (
             Arc::clone(&context),
             std::time::Duration::from_secs(args.idle_trim_secs),
+            std::time::Duration::from_secs(args.session_ttl_secs),
         );
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                context.idle_trim_pass(idle);
+                // Expiry first: a session past its TTL is closed, so trimming it would be
+                // wasted work on a VM that is about to stop.
+                if !ttl.is_zero() {
+                    context.expire_idle_pass(ttl);
+                }
+                if !idle.is_zero() {
+                    context.idle_trim_pass(idle);
+                }
             }
         });
     }

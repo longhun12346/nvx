@@ -477,6 +477,37 @@ impl Context {
     /// Backstop for the missing balloon device: a session that has been idle for `idle` gets its
     /// VMM's working set trimmed once, so that its guest RAM becomes reclaimable by the host.
     /// Sessions that are busy, or whose lock is taken, are skipped and retried on the next pass.
+    /// Closes every session that has been idle for at least `ttl`, returning their names.
+    ///
+    /// A session that is running a command is never closed: the caller asked for that work
+    /// to finish, and reclaiming it is the caller's decision, not a timer's. Closing here
+    /// goes through the same path as an explicit `session.close`, so the VM is stopped and
+    /// deprovisioned rather than leaked.
+    pub fn expire_idle_pass(&self, ttl: Duration) -> Vec<String> {
+        let sessions: Vec<(String, Arc<Session>)> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, session)| (name.clone(), session.clone()))
+            .collect();
+        let mut expired = Vec::new();
+        for (name, session) in sessions {
+            let Ok(state) = session.state.try_lock() else {
+                continue;
+            };
+            if state.busy || state.last_activity.elapsed() < ttl {
+                continue;
+            }
+            drop(state);
+            if self.close(&name).is_ok() {
+                eprintln!("genflow-nvxd: closed session {name}: idle past its TTL");
+                expired.push(name);
+            }
+        }
+        expired
+    }
+
     pub fn idle_trim_pass(&self, idle: Duration) {
         let sessions: Vec<(String, Arc<Session>)> = self
             .sessions

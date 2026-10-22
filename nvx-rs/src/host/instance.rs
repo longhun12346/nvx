@@ -302,8 +302,7 @@ impl Instance {
     }
 
     /// Returns the instance's name in messages.
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn name(&self) -> &str {        &self.name
     }
 
     /// Returns the path of the OpenVMM log of the latest start.
@@ -580,7 +579,20 @@ impl Instance {
         let endpoint = self.endpoint()?;
         let report = self.report_path();
         remove_if_present(&report)?;
-        let arguments = spec.openvmm_arguments(&endpoint, &report)?;
+        // The export channel's name is derived from the instance directory, so any
+        // later `Instance` for the same directory computes the same pipe; nothing has
+        // to be persisted for it, and no handle has to outlive the launch.
+        let export_spec = {
+            use std::hash::Hash;
+            use std::hash::Hasher;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.dir.hash(&mut hasher);
+            crate::host::live_control::spec(&crate::host::live_control::Endpoint::Named(
+                crate::host::live_control::pipe_name(hasher.finish()),
+            ))
+        };
+        let arguments =
+            spec.openvmm_arguments_with_control(&endpoint, &report, Some(&export_spec))?;
         spec.fit_process_command_line(&arguments, 0)?;
 
         self.write_capability(&capability)?;

@@ -263,14 +263,18 @@ impl LaunchSpec {
     /// handle on which the VMM serves virtio-fs export requests.
     ///
     /// The handle must already belong to this process and be inheritable: OpenVMM
-    /// receives it by inheritance, so the value is the descriptor number the child
-    /// sees. `None` leaves the channel off, keeping the request-file trigger as the
-    /// only path until the launcher passes a handle.
+    /// Like [`Self::openvmm_arguments`], and additionally names the endpoint on which
+    /// the VMM serves virtio-fs export requests.
+    ///
+    /// `virtiofs_control` is the value of `--microvm-virtiofs-control`, passed through
+    /// unchanged: `<digits>` names an inherited handle and `name=<pipe>` a pipe the VMM
+    /// creates and serves. `None` leaves the channel off, keeping the request-file
+    /// trigger as the only path.
     pub fn openvmm_arguments_with_control(
         &self,
         endpoint: &str,
         report: &Path,
-        virtiofs_control: Option<u32>,
+        virtiofs_control: Option<&str>,
     ) -> Result<Vec<OsString>> {
         self.check()?;
         let mut arguments: Vec<OsString> = vec!["--machine".into(), "microvm".into()];
@@ -304,11 +308,11 @@ impl LaunchSpec {
         arguments.push("--microvm-control-console".into());
         arguments.push(format!("listen={endpoint}").into());
         arguments.push("--microvm-control-auth-stdin".into());
-        if let Some(handle) = virtiofs_control {
+        if let Some(spec) = virtiofs_control {
             // Only microVM aggregates serve runtime exports, and the entry point
             // refuses this flag when the machine has none.
             arguments.push("--microvm-virtiofs-control".into());
-            arguments.push(handle.to_string().into());
+            arguments.push(spec.into());
         }
         arguments.push("--microvm-report".into());
         arguments.push(report.into());

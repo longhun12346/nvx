@@ -93,4 +93,5 @@ pub use model::{
     NetworkPeer, NetworkPolicy, NetworkPort, NetworkRule, ProcessSpec, Protocol, ProvisionRequest,
     ProvisionResult, RuntimeConfig, StartResult, StdinMode, StopResult,
 };
+pub use aci_edge_sandboxes_model::setup::CpuProfile;
 pub use spec::{ImageSource, Resources, SandboxSpec};

@@ -216,6 +216,7 @@ impl OpenVmmBackend {
             kernel: self.config.kernel.clone(),
             initrd: self.config.initrd.clone(),
             hypervisor: self.config.hypervisor,
+            cpu_profile: cpu_profile(self.config.cpu_profile),
             memory_mib: record.memory_mib,
             identity: WorkloadIdentity {
                 uid: record.workload_uid,
@@ -231,6 +232,18 @@ impl OpenVmmBackend {
                 .map(|policy| network_policy(policy, &record.host_loopback_forwards)),
             filesystem: record.filesystem.clone(),
             breakaway_from_job: self.config.breakaway_from_job,
+        }
+    }
+}
+
+/// Maps the configuration's CPU profile onto the launch specification's.
+fn cpu_profile(profile: aci_edge_sandboxes_model::setup::CpuProfile) -> nvx::host::launch::CpuProfile {
+    match profile {
+        aci_edge_sandboxes_model::setup::CpuProfile::Auto => {
+            nvx::host::launch::CpuProfile::Auto
+        }
+        aci_edge_sandboxes_model::setup::CpuProfile::Host => {
+            nvx::host::launch::CpuProfile::Host
         }
     }
 }

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use aci_edge_sandboxes_model::setup::CpuProfile;
 use aci_edge_sandboxes_model::spec::{is_valid_guest_network, is_valid_hostname};
 use nvx::Hypervisor;
 use nvx::host::artifacts::{Artifacts, absolute};
@@ -26,6 +27,9 @@ pub struct OpenVmmConfig {
     pub initrd: PathBuf,
     /// Hypervisor used by OpenVMM.
     pub hypervisor: Hypervisor,
+    /// CPU profile of the guests. Explicit configuration, never derived from the environment:
+    /// a VM that needs a profile the host's built-in set lacks is a deployment decision.
+    pub cpu_profile: CpuProfile,
     /// Directory that holds per-sandbox state. Choose a directory private to the current user.
     pub state_root: PathBuf,
     /// Default guest memory in MiB. Provision requests may override it.
@@ -104,6 +108,7 @@ impl OpenVmmConfig {
             kernel: kernel.into(),
             initrd: initrd.into(),
             hypervisor,
+            cpu_profile: CpuProfile::Auto,
             state_root: state_root.into(),
             memory_mib: Self::DEFAULT_MEMORY_MIB,
             workload_uid: Self::DEFAULT_WORKLOAD_ID,

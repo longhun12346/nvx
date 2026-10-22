@@ -76,6 +76,8 @@ def main():
                 str(args.repo),
                 "--initrd",
                 str(args.initrd),
+                "--cpu-profile",
+                "host",
                 "--state-dir",
                 str(state),
             ],
@@ -88,7 +90,16 @@ def main():
             ready, _ = read_frame(process.stdout)
             if ready.get("event") != "ready" or ready.get("protocol") != 1:
                 raise RuntimeError(f"unexpected ready frame: {ready}")
-            request(process.stdin, process.stdout, {"id": 1, "op": "probe"})
+            head, _ = request(process.stdin, process.stdout, {"id": 1, "op": "probe"})
+            provenance = head.get("provenance") or {}
+            if provenance.get("cpuProfile") != "host":
+                raise RuntimeError(
+                    f"probe did not report the configured CPU profile: {provenance}"
+                )
+            if provenance.get("initrd") != str(args.initrd):
+                raise RuntimeError(
+                    f"probe did not report the override initramfs: {provenance}"
+                )
             stage = "session.open"
             opened, _ = request(
                 process.stdin,

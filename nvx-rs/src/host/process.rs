@@ -3,6 +3,8 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Write};
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 #[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
@@ -57,6 +59,31 @@ pub fn spawn(
     log: File,
     working_dir: &Path,
 ) -> io::Result<Launched> {
+    spawn_with_control(
+        openvmm,
+        breakaway_from_job,
+        arguments,
+        capability,
+        log,
+        working_dir,
+        None,
+    )
+}
+
+/// Like [`spawn`], and additionally passes `control` into OpenVMM's inherited handle
+/// list, so the VMM serves virtio-fs export requests on it.
+///
+/// `control` must already be inheritable; it stays owned by the caller, which keeps
+/// the other end of the pipe. Passing `None` reproduces [`spawn`] exactly.
+pub fn spawn_with_control(
+    openvmm: &Path,
+    breakaway_from_job: bool,
+    arguments: &[OsString],
+    capability: &[u8; CAPABILITY_LEN],
+    log: File,
+    working_dir: &Path,
+    control: Option<OwnedHandle>,
+) -> io::Result<Launched> {
     let (stdin, mut writer) = io::pipe()?;
     writer.write_all(capability)?;
     drop(writer);
@@ -68,6 +95,7 @@ pub fn spawn(
             arguments,
             working_dir,
             [stdin.into(), log.into(), stderr.into()],
+            control,
             breakaway_from_job,
         )
         .map(|process| Launched { process })

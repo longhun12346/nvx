@@ -240,15 +240,22 @@ pub(crate) fn spawn_detached(
     arguments: &[OsString],
     working_dir: &Path,
     stdio: [OwnedHandle; 3],
+    control: Option<OwnedHandle>,
     breakaway_from_job: bool,
 ) -> io::Result<LaunchedProcess> {
     let application = wide(program);
     let mut command_line = command_line(program.as_os_str(), arguments)?;
     let directory = wide(working_dir);
-    let handles = stdio.each_ref().map(raw);
-    for handle in handles {
-        // SAFETY: the handle is open and owned by `stdio`.
-        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
+    let stdio_handles = stdio.each_ref().map(raw);
+    // The export control pipe, when the launcher created one, travels in the same
+    // handle list so CreateProcessW passes exactly these and nothing else.
+    let mut handles: Vec<RawHandle> = stdio_handles.to_vec();
+    if let Some(control) = control.as_ref() {
+        handles.push(raw(control));
+    }
+    for handle in &handles {
+        // SAFETY: every handle is open and owned by this function's arguments.
+        if unsafe { SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
             return Err(io::Error::last_os_error());
         }
     }
@@ -272,11 +279,9 @@ pub(crate) fn spawn_detached(
     let mut startup: STARTUPINFOEXW = unsafe { mem::zeroed() };
     startup.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    [
-        startup.StartupInfo.hStdInput,
-        startup.StartupInfo.hStdOutput,
-        startup.StartupInfo.hStdError,
-    ] = handles;
+    startup.StartupInfo.hStdInput = stdio_handles[0];
+    startup.StartupInfo.hStdOutput = stdio_handles[1];
+    startup.StartupInfo.hStdError = stdio_handles[2];
     startup.lpAttributeList = attributes.as_ptr();
     let mut flags = CREATE_UNICODE_ENVIRONMENT
         | EXTENDED_STARTUPINFO_PRESENT
@@ -697,6 +702,7 @@ mod tests {
             &[OsString::from("/c"), OsString::from("ping -n 30 127.0.0.1")],
             &std::env::temp_dir(),
             [stdin.into(), stdout.into(), stderr.into()],
+            None,
             false,
         )
         .unwrap();

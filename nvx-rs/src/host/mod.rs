@@ -15,6 +15,7 @@
 
 pub mod artifacts;
 pub mod control;
+pub mod control_pipe;
 pub mod filesystem;
 pub mod instance;
 pub mod launch;

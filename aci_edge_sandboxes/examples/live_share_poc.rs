@@ -147,7 +147,7 @@ fn run() -> Result<bool, String> {
             read_only: true,
         };
         backend
-            .add_share_poc(&sandbox, &request_dir, 0, &share, Duration::from_secs(30))
+            .add_share_poc(&sandbox, 0, &share, Duration::from_secs(30))
             .map_err(describe)?;
         println!("add_share_poc: ok");
 
@@ -163,14 +163,14 @@ fn run() -> Result<bool, String> {
 
         // The guest refuses to unmount a mapping of the announced table.
         let refused = backend
-            .remove_share_poc(&sandbox, &request_dir, "base", &base_target, Duration::from_secs(30))
+            .remove_share_poc(&sandbox, "base", &base_target, Duration::from_secs(30))
             .is_err();
         println!("unmount of an announced mapping refused => {refused}");
         let (base_kept, _) = sh(&format!("cat '{base_target}/hello.txt'"))?;
 
         // Remove the runtime share: the guest unmounts it, then the VMM stops exporting it.
         backend
-            .remove_share_poc(&sandbox, &request_dir, "live0", &extra_target, Duration::from_secs(30))
+            .remove_share_poc(&sandbox, "live0", &extra_target, Duration::from_secs(30))
             .map_err(describe)?;
         let (_, gone) = sh(&format!("test -e '{extra_target}/live.txt'"))?;
         println!("after remove: test -e extra => {gone} (must not exit 0)");
@@ -183,20 +183,20 @@ fn run() -> Result<bool, String> {
             ..share
         };
         backend
-            .add_share_poc(&sandbox, &request_dir, 1, &share_again, Duration::from_secs(30))
+            .add_share_poc(&sandbox, 1, &share_again, Duration::from_secs(30))
             .map_err(describe)?;
         let (again, again_outcome) = sh(&format!("cat '{extra_target}/live.txt'"))?;
         println!("after re-add as live1: cat => {again:?} {again_outcome}");
 
         // Informational only: reuse the name of a removed child.
         let reuse = backend
-            .remove_share_poc(&sandbox, &request_dir, "live1", &extra_target, Duration::from_secs(30))
+            .remove_share_poc(&sandbox, "live1", &extra_target, Duration::from_secs(30))
             .and_then(|()| {
                 let same = LiveShare {
                     child: "live0",
                     ..share
                 };
-                backend.add_share_poc(&sandbox, &request_dir, 2, &same, Duration::from_secs(30))
+                backend.add_share_poc(&sandbox, 2, &same, Duration::from_secs(30))
             });
         let (reuse_content, reuse_outcome) = sh(&format!("cat '{extra_target}/live.txt'"))?;
         println!("INFO reuse of removed name live0 => {reuse:?}: {reuse_content:?} {reuse_outcome}");
@@ -213,7 +213,7 @@ fn run() -> Result<bool, String> {
             read_only: true,
         };
         let clash_refused = backend
-            .add_share_poc(&sandbox, &request_dir, 3, &clash, Duration::from_secs(30))
+            .add_share_poc(&sandbox, 3, &clash, Duration::from_secs(30))
             .is_err();
         let retry = LiveShare {
             child: "dup0",
@@ -221,7 +221,7 @@ fn run() -> Result<bool, String> {
             ..clash
         };
         let retry_ok = backend
-            .add_share_poc(&sandbox, &request_dir, 3, &retry, Duration::from_secs(30))
+            .add_share_poc(&sandbox, 3, &retry, Duration::from_secs(30))
             .is_ok();
         let (dup_content, _) = sh("cat /mnt/dup/ok/d.txt")?;
         println!(
@@ -281,7 +281,7 @@ fn run_stress(
             read_only: true,
         };
         backend
-            .add_share_poc(sandbox, request_dir, next_sequence, &share, timeout)
+            .add_share_poc(sandbox, next_sequence, &share, timeout)
             .map_err(|error| format!("churn round {round}: add: {error}"))?;
         next_sequence += 1;
         if round % 50 == 0 {
@@ -292,7 +292,7 @@ fn run_stress(
             }
         }
         backend
-            .remove_share_poc(sandbox, request_dir, &child, "/mnt/stress/ch", timeout)
+            .remove_share_poc(sandbox, &child, "/mnt/stress/ch", timeout)
             .map_err(|error| format!("churn round {round}: remove: {error}"))?;
     }
     println!(
@@ -316,7 +316,7 @@ fn run_stress(
             target: &target,
             read_only: true,
         };
-        match backend.add_share_poc(sandbox, request_dir, next_sequence, &share, timeout) {
+        match backend.add_share_poc(sandbox, next_sequence, &share, timeout) {
             Ok(()) => {
                 next_sequence += 1;
                 mounted.push((child, target));
@@ -341,7 +341,7 @@ fn run_stress(
     // Removing shares makes room again, and the refusal leaked no export slot.
     for (child, target) in mounted.drain(..) {
         backend
-            .remove_share_poc(sandbox, request_dir, &child, &target, timeout)
+            .remove_share_poc(sandbox, &child, &target, timeout)
             .map_err(|error| format!("fill cleanup of {child}: {error}"))?;
     }
     let host = fixtures.join("after");
@@ -354,7 +354,7 @@ fn run_stress(
         read_only: true,
     };
     backend
-        .add_share_poc(sandbox, request_dir, next_sequence, &share, timeout)
+        .add_share_poc(sandbox, next_sequence, &share, timeout)
         .map_err(|error| format!("add after cleanup: {error}"))?;
     let (after, _) = sh("cat /mnt/fill/after/v.txt")?;
     println!("fill: add after removing every fill share => {after:?}");

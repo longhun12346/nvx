@@ -18,6 +18,7 @@ pub mod control;
 pub mod filesystem;
 pub mod instance;
 pub mod launch;
+pub mod live_control;
 pub mod network;
 pub mod platform;
 pub mod poc_live;

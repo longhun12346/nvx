@@ -9,6 +9,7 @@
 /.nvx-hosts.json
 /aci_edge_sandboxes/target/
 /nvx-rs/target/
+/tools/genflow-nvxd/target/
 __pycache__/
 *.py[cod]
 *.log

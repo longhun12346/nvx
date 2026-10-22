@@ -76,6 +76,9 @@ pub struct Context {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     handles: Mutex<HashMap<String, Canceller>>,
     counter: Mutex<u64>,
+    /// Per-process prefix of every runtime id, so an id cannot be guessed from the
+    /// session's position and does not collide with another sidecar's ids.
+    runtime_prefix: String,
 }
 
 impl Context {
@@ -95,6 +98,17 @@ impl Context {
             sessions: Mutex::new(HashMap::new()),
             handles: Mutex::new(HashMap::new()),
             counter: Mutex::new(0),
+            runtime_prefix: {
+                // Derived from this process's identity and start time: ids differ between
+                // sidecars and are not guessable from a session's position, without pulling
+                // in a random-number dependency just for a label.
+                use std::hash::Hash;
+                use std::hash::Hasher;
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::process::id().hash(&mut hasher);
+                std::time::SystemTime::now().hash(&mut hasher);
+                format!("{:016x}", hasher.finish())
+            },
         }
     }
 
@@ -221,7 +235,11 @@ impl Context {
             .unwrap()
             .insert(name.to_owned(), Arc::new(session));
         let guest = resolve_guest_path(std::path::Path::new(workspace)).unwrap_or_default();
-        Ok(json!({"workspaceGuestPath": guest}))
+        // An opaque identity for this session's VM, so a caller can record which runtime a
+        // business session was bound to without depending on the session name's shape or
+        // assuming it maps to a VM one-to-one (P5 shares one VM across sessions).
+        let runtime = format!("rt-{}-{:08x}", self.runtime_prefix, self.next_id());
+        Ok(json!({"workspaceGuestPath": guest, "runtimeId": runtime}))
     }
 
     fn reconcile(

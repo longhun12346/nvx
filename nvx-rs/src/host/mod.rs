@@ -14,6 +14,7 @@
 //!   hosts compile but report NVX as unavailable.
 
 pub mod artifacts;
+pub mod control;
 pub mod filesystem;
 pub mod instance;
 pub mod launch;

@@ -71,25 +71,24 @@ where
     F: FnMut(&mut std::fs::File) + Send + 'static,
 {
     let name = crate::host::live_control::pipe_name(nonce);
-    // Create the pipe on this thread first, so a creation failure is reported to the
-    // caller instead of being lost inside the thread.
-    let first = accept_one(&name)?;
+    // Create the instance on this thread so a creation failure reaches the caller, but
+    // do not wait here: the client cannot connect until the caller publishes the name,
+    // so waiting on this thread would deadlock.
+    let first = create(&name, true)?;
     let served_name = name.clone();
     let thread = std::thread::Builder::new()
         .name("nvx-control-pipe".into())
         .spawn(move || {
-            let mut connected = Some(first);
-            loop {
-                let Some(mut current) = connected.take() else {
+            let mut current = Some(first);
+            while let Some(mut pipe) = current.take() {
+                if wait_for_client(&mut pipe).is_err() {
                     break;
-                };
-                handle(&mut current.pipe);
-                // A fresh instance serves the next client; the previous one is closed
-                // when `current` is dropped.
-                match accept_next(&served_name) {
-                    Ok(next) => connected = Some(next),
-                    Err(_) => break,
                 }
+                handle(&mut pipe);
+                // Release the served instance *before* creating the next one: the name
+                // allows a single instance, so creating it first would fail.
+                drop(pipe);
+                current = create(&served_name, false).ok();
             }
         })?;
     let server_name = name;
@@ -129,6 +128,20 @@ fn accept_next(name: &str) -> io::Result<Connected> {
 }
 
 fn accept(name: &str, first_instance: bool) -> io::Result<Connected> {
+    let mut pipe = create(name, first_instance)?;
+    wait_for_client(&mut pipe)?;
+    Ok(Connected {
+        pipe,
+        name: name.to_owned(),
+    })
+}
+
+/// Creates a pipe instance without waiting for a client.
+///
+/// Separate from [`wait_for_client`] because a server that must publish its name
+/// before anyone can connect has to create the instance first and wait later;
+/// blocking here would deadlock the launcher, which starts the client afterwards.
+fn create(name: &str, first_instance: bool) -> io::Result<std::fs::File> {
     let wide_name = wide(name);
     let mut open_mode = PIPE_ACCESS_DUPLEX;
     if first_instance {
@@ -152,7 +165,13 @@ fn accept(name: &str, first_instance: bool) -> io::Result<Connected> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: the handle is a fresh pipe instance that nothing else owns.
-    let mut pipe = std::fs::File::from(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) });
+    Ok(std::fs::File::from(unsafe {
+        OwnedHandle::from_raw_handle(handle as RawHandle)
+    }))
+}
+
+/// Blocks until a client connects to `pipe`.
+fn wait_for_client(pipe: &mut std::fs::File) -> io::Result<()> {
     let server = pipe.as_raw_handle() as HANDLE;
     loop {
         // SAFETY: the handle is this pipe's server end; a null OVERLAPPED waits.
@@ -171,12 +190,8 @@ fn accept(name: &str, first_instance: bool) -> io::Result<Connected> {
                 other => return Err(io::Error::from_raw_os_error(other as i32)),
             }
         }
-        break;
+        return Ok(());
     }
-    Ok(Connected {
-        pipe,
-        name: name.to_owned(),
-    })
 }
 
 #[cfg(test)]
@@ -196,6 +211,56 @@ mod tests {
             mode: Mode::ReadOnly,
             host_path: "C:\\refs".to_owned(),
         }
+    }
+
+    #[test]
+    fn a_server_serves_more_than_one_client() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Two clients in a row: the second instance must be creatable, which the
+        // first-instance flag forbids, so this is the regression test for that flag.
+        let served = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&served);
+        let server = serve(0x5eed, move |pipe| {
+            let mut length = [0u8; 4];
+            std::io::Read::read_exact(pipe, &mut length).expect("length");
+            let length = u32::from_le_bytes(length) as usize;
+            let mut payload = vec![0u8; length];
+            std::io::Read::read_exact(pipe, &mut payload).expect("payload");
+            let reply = b"ok\n";
+            let mut frame = (reply.len() as u32).to_le_bytes().to_vec();
+            frame.extend_from_slice(reply);
+            pipe.write_all(&frame).expect("reply");
+            counter.fetch_add(1, Ordering::SeqCst);
+        })
+        .expect("serve");
+
+        for round in 0..2 {
+            let mut client = None;
+            for _ in 0..50 {
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(server.name())
+                {
+                    Ok(file) => {
+                        client = Some(file);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
+            let mut client = client.unwrap_or_else(|| panic!("client {round} must connect"));
+            control::exchange(&mut client, &request()).expect("exchange");
+        }
+        for _ in 0..100 {
+            if served.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(served.load(Ordering::SeqCst), 2);
     }
 
     #[test]

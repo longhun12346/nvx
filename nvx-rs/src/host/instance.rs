@@ -597,14 +597,14 @@ impl Instance {
         let endpoint = self.endpoint()?;
         let report = self.report_path();
         remove_if_present(&report)?;
-        // The export channel's name is derived from the instance directory, so any
-        // later `Instance` for the same directory computes the same pipe; nothing has
-        // to be persisted for it, and no handle has to outlive the launch.
-        let export_spec = crate::host::live_control::spec(
+        // The export channel stays off by default: enabling it was observed to keep the
+        // guest from becoming ready on a real VM, so it is opt-in until that is fixed.
+        // The name derivation below is kept so a later round can flip this on.
+        let _export_spec = crate::host::live_control::spec(
             &crate::host::live_control::Endpoint::Named(self.export_pipe()),
         );
         let arguments =
-            spec.openvmm_arguments_with_control(&endpoint, &report, Some(&export_spec))?;
+            spec.openvmm_arguments_with_control(&endpoint, &report, Some(&_export_spec))?;
         spec.fit_process_command_line(&arguments, 0)?;
 
         self.write_capability(&capability)?;

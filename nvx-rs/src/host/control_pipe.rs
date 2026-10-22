@@ -115,6 +115,32 @@ fn wide(name: &str) -> Vec<u16> {
 /// `FILE_FLAG_FIRST_PIPE_INSTANCE` makes a name collision fail loudly instead of
 /// silently attaching to another VM's pipe, and the one-instance limit means a
 /// second client cannot interleave frames with the first.
+/// Connects to the pipe OpenVMM serves, as the client.
+///
+/// The VMM reads requests and writes replies, so it owns the listening end; the
+/// launcher only connects, sends one frame, and reads the answer. That is why there
+/// is no server here any more: a launcher-side server would invert the direction and
+/// deadlock both sides.
+///
+/// OpenVMM creates the pipe while it starts, which can be after the launcher is ready
+/// to send, so this retries until `deadline`.
+#[cfg(windows)]
+pub fn connect(name: &str, deadline: std::time::Duration) -> io::Result<std::fs::File> {
+    let until = std::time::Instant::now() + deadline;
+    loop {
+        match std::fs::OpenOptions::new().read(true).write(true).open(name) {
+            Ok(pipe) => return Ok(pipe),
+            Err(error) => {
+                if std::time::Instant::now() >= until {
+                    return Err(error);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// Accepts one client, for tests and for a future server-mode launcher.
 pub fn accept_one(name: &str) -> io::Result<Connected> {
     accept(name, true)
 }
@@ -211,6 +237,37 @@ mod tests {
             mode: Mode::ReadOnly,
             host_path: "C:\\refs".to_owned(),
         }
+    }
+
+    #[test]
+    fn a_launcher_client_talks_to_a_serving_vmm() {
+        // The real pairing: the VMM serves (accept), the launcher connects and sends.
+        // This is the direction the two crates must agree on, so it is asserted here
+        // as well as in the receiver's own tests.
+        let name = crate::host::live_control::pipe_name(0xabcd_0000_0000_0001);
+        let server = std::thread::spawn({
+            let name = name.clone();
+            move || {
+                let mut connected = accept_one(&name).expect("accept");
+                let mut length = [0u8; 4];
+                std::io::Read::read_exact(&mut connected.pipe, &mut length).expect("length");
+                let length = u32::from_le_bytes(length) as usize;
+                let mut payload = vec![0u8; length];
+                std::io::Read::read_exact(&mut connected.pipe, &mut payload).expect("payload");
+                let reply = b"ok\n";
+                let mut frame = (reply.len() as u32).to_le_bytes().to_vec();
+                frame.extend_from_slice(reply);
+                connected.pipe.write_all(&frame).expect("reply");
+                String::from_utf8(payload).expect("utf-8")
+            }
+        });
+
+        let mut client = connect(&name, std::time::Duration::from_secs(5)).expect("connect");
+        control::exchange(&mut client, &request()).expect("exchange");
+        assert_eq!(
+            server.join().expect("server thread"),
+            control::encode_request(&request())
+        );
     }
 
     #[test]

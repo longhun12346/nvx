@@ -409,11 +409,19 @@ def main() -> int:
         }
         if args.report:
             args.report.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        # Ask the sidecar to stop before killing it: killing it outright leaves the VMM child
+        # running, and one orphan per run accumulates into the memory and WHP contention that
+        # makes the next suite's timings meaningless.
         try:
-            process.kill()
-            process.wait(timeout=60)
+            send_frame(process.stdin, {"op": "shutdown"})
+            process.stdin.close()
         except Exception:
             pass
+        try:
+            process.wait(timeout=90)
+        except Exception:
+            process.kill()
+            process.wait(timeout=60)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,17 @@ pub struct Mount {
     pub id: String,
     pub host_path: String,
     pub read_only: bool,
+    /// The guest path the caller asked for, when it named one. The caller may only get it if
+    /// no other session in the shared VM already owns that path.
+    pub guest_path: Option<String>,
+}
+
+/// Where a mount should appear in the guest: what the caller asked for, or the default rule.
+pub fn guest_target_for(mount: &Mount) -> String {
+    mount
+        .guest_path
+        .clone()
+        .unwrap_or_else(|| guest_target(&mount.id))
 }
 
 /// A share that is live in the guest.
@@ -53,7 +64,7 @@ fn normalize(path: &str) -> String {
 }
 
 /// Returns the part of `path` below `root`, or `None` if `path` is not inside `root`.
-fn relative_to<'a>(path: &'a str, root: &str) -> Option<&'a str> {
+pub fn relative_to<'a>(path: &'a str, root: &str) -> Option<&'a str> {
     let (norm_path, norm_root) = (normalize(path), normalize(root));
     if norm_path == norm_root {
         return Some("");
@@ -67,27 +78,29 @@ fn relative_to<'a>(path: &'a str, root: &str) -> Option<&'a str> {
     None
 }
 
-/// Places a host working directory in the guest: inside a live mount it becomes the mount's
-/// guest path plus the remainder; anything else goes through `main`, the translation of the
-/// primary workspace.
-pub fn translate_cwd(
-    host_cwd: &str,
-    mounts: &[Mount],
-    main: impl Fn(&str) -> Option<String>,
-) -> Option<String> {
-    let best = mounts
+/// Places a host working directory under a live share, using the path that share was actually
+/// exported at.
+///
+/// A shared VM serves several sessions: a mount belongs to the session that declared it, so a
+/// working directory outside every share is not "the workspace" — it may be another session's.
+pub fn translate_cwd_shares(host_cwd: &str, shares: &[Share]) -> Option<String> {
+    let best = shares
         .iter()
-        .filter_map(|mount| relative_to(host_cwd, &mount.host_path).map(|tail| (mount, tail)))
-        .max_by_key(|(mount, _)| mount.host_path.len());
-    if let Some((mount, tail)) = best {
-        let base = guest_target(&mount.id);
-        return Some(if tail.is_empty() {
-            base
-        } else {
-            format!("{base}/{}", tail.replace('\\', "/"))
-        });
+        .filter_map(|share| {
+            relative_to(host_cwd, &share.mount.host_path).map(|tail| (share, tail))
+        })
+        .max_by_key(|(share, _)| share.mount.host_path.len());
+    best.map(|(share, tail)| join_guest(&share.target, tail))
+}
+
+/// Appends a relative path to a guest path, keeping exactly one separator.
+pub fn join_guest(base: &str, tail: &str) -> String {
+    let tail = tail.trim_start_matches(['/', '\\']).replace('\\', "/");
+    if tail.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}/{tail}")
     }
-    main(host_cwd)
 }
 
 #[cfg(test)]
@@ -99,6 +112,7 @@ mod tests {
             id: id.into(),
             host_path: path.into(),
             read_only,
+            guest_path: None,
         }
     }
 
@@ -143,32 +157,58 @@ mod tests {
     }
 
     #[test]
-    fn working_directories_inside_a_mount_use_its_guest_path() {
-        let mounts = [mount("refs", "C:\\Users\\me\\refs", true)];
-        let main = |path: &str| Some(format!("main:{path}"));
+    fn working_directories_inside_a_share_use_its_guest_path() {
+        let shares = [share(mount("refs", "C:\\Users\\me\\refs", true), "c0")];
         assert_eq!(
-            translate_cwd("c:\\users\\ME\\refs", &mounts, main).as_deref(),
+            translate_cwd_shares("c:\\users\\ME\\refs", &shares).as_deref(),
             Some("/workspace/mounts/refs")
         );
         assert_eq!(
-            translate_cwd("C:\\Users\\me\\refs\\sub\\dir", &mounts, main).as_deref(),
+            translate_cwd_shares("C:\\Users\\me\\refs\\sub\\dir", &shares).as_deref(),
             Some("/workspace/mounts/refs/sub/dir")
         );
-        assert_eq!(
-            translate_cwd("C:\\Users\\me\\refs2", &mounts, main).as_deref(),
-            Some("main:C:\\Users\\me\\refs2")
+        // Outside every share the caller decides, because on a shared VM "outside" may be
+        // another session's tree rather than this session's workspace.
+        assert_eq!(translate_cwd_shares("C:\\Users\\me\\refs2", &shares), None);
+    }
+
+    /// A share exported at a session-scoped path must be used at that path, not at the
+    /// default one: otherwise a colliding mount id would send the command into the other
+    /// session's directory.
+    #[test]
+    fn a_session_scoped_share_is_used_at_its_own_path() {
+        let shares = [Share {
+            mount: mount("same", "C:\\m", true),
+            child: "B-m0".into(),
+            target: "/sessions/B/mounts/same".into(),
+        }];        assert_eq!(
+            translate_cwd_shares("C:\\m\\sub", &shares).as_deref(),
+            Some("/sessions/B/mounts/same/sub")
         );
     }
 
     #[test]
-    fn the_deepest_mount_wins() {
-        let mounts = [
-            mount("outer", "C:\\x", true),
-            mount("inner", "C:\\x\\y", true),
+    fn the_deepest_share_wins() {
+        let shares = [
+            share(mount("outer", "C:\\x", true), "c0"),
+            share(mount("inner", "C:\\x\\y", true), "c1"),
         ];
         assert_eq!(
-            translate_cwd("C:\\x\\y\\z", &mounts, |_| None).as_deref(),
+            translate_cwd_shares("C:\\x\\y\\z", &shares).as_deref(),
             Some("/workspace/mounts/inner/z")
+        );
+    }
+
+    #[test]
+    fn joining_a_guest_path_keeps_one_separator() {
+        assert_eq!(join_guest("/sessions/A/workspace", ""), "/sessions/A/workspace");
+        assert_eq!(
+            join_guest("/sessions/A/workspace", "sub\\dir"),
+            "/sessions/A/workspace/sub/dir"
+        );
+        assert_eq!(
+            join_guest("/sessions/A/workspace", "sub/dir"),
+            "/sessions/A/workspace/sub/dir"
         );
     }
 }

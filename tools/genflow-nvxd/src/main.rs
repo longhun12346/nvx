@@ -6,9 +6,12 @@
 //! `--repo`, which is a development convenience), and the CPU profile is a required setting.
 //! Nothing is read from the environment, so what a VM runs with is what the caller configured.
 
+mod control;
 mod frame;
+mod outbound;
 mod plan;
 mod protocol;
+mod registry;
 mod server;
 mod winmem;
 
@@ -23,8 +26,19 @@ use aci_edge_sandboxes::nvx::host::artifacts::Artifacts;
 use aci_edge_sandboxes::openvmm::{OpenVmmBackend, OpenVmmConfig};
 use serde_json::{Value, json};
 
-use frame::{FrameWriter, read_frame};
+use control::Queue;
+use frame::read_frame;
 use server::Context;
+
+/// Requests that may wait for a worker. Bounded: a caller that exceeds it is refused, which is
+/// visible, instead of the sidecar spawning a thread per message.
+const DEFAULT_MAX_PENDING: usize = 32;
+/// Control requests wait in their own, smaller queue so they are never behind a work burst.
+const CONTROL_CAPACITY: usize = 16;
+/// Two control workers keep a close and an unrelated status query from serialising behind
+/// each other; work is queued per VM anyway, so a third worker would add nothing.
+const CONTROL_WORKERS: usize = 2;
+const DEFAULT_WORK_WORKERS: usize = 2;
 
 struct Args {
     /// A checkout whose conventional layout names the artifacts; development only.
@@ -42,10 +56,22 @@ struct Args {
     /// Seconds an idle session may live before it is closed; 0 keeps sessions open.
     ///
     /// This is the TTL the product configures: a session the caller abandoned must not hold
-    /// a VM (and the host budget that came with it) indefinitely.
+    /// the shared VM (and the host budget that came with it) indefinitely.
     session_ttl_secs: u64,
-    /// How many sessions may hold a VM at once; 0 means no limit.
+    /// How many logical sessions may share the VM; 0 means no limit.
+    ///
+    /// A session is a routing unit inside one VM (P5), not a VM of its own, so this bounds
+    /// callers rather than memory: the VM's guest RAM is set at `session.open`.
     max_sessions: usize,
+    /// How many executions may wait for the VM's single run slot.
+    max_queue: usize,
+    /// Requests that may wait for a worker before the caller is refused.
+    max_pending: usize,
+    /// Workers that run the slow requests (open a session, start an execution).
+    work_workers: usize,
+    /// Frames that may wait for the caller to read them. Bounded on purpose: a caller that
+    /// stops reading must cost a fixed amount of memory, not an unbounded backlog.
+    outbound_capacity: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -60,6 +86,10 @@ fn parse_args() -> Result<Args, String> {
         idle_trim_secs: 30,
         session_ttl_secs: 0,
         max_sessions: 0,
+        max_queue: crate::registry::DEFAULT_QUEUE_DEPTH,
+        max_pending: DEFAULT_MAX_PENDING,
+        work_workers: DEFAULT_WORK_WORKERS,
+        outbound_capacity: outbound::DEFAULT_CAPACITY,
     };
     let mut input = std::env::args().skip(1);
     while let Some(flag) = input.next() {
@@ -79,6 +109,18 @@ fn parse_args() -> Result<Args, String> {
             "--state-dir" => args.state_dir = PathBuf::from(value()?),
             "--max-sessions" => {
                 args.max_sessions = value()?.parse().map_err(|e| format!("{e}"))?
+            }
+            "--max-queue" => {
+                args.max_queue = value()?.parse().map_err(|e| format!("{e}"))?
+            }
+            "--max-pending" => {
+                args.max_pending = value()?.parse().map_err(|e| format!("{e}"))?
+            }
+            "--work-workers" => {
+                args.work_workers = value()?.parse().map_err(|e| format!("{e}"))?
+            }
+            "--outbound-capacity" => {
+                args.outbound_capacity = value()?.parse().map_err(|e| format!("{e}"))?
             }
             "--session-ttl-secs" => {
                 args.session_ttl_secs = value()?.parse().map_err(|e| format!("{e}"))?
@@ -140,6 +182,10 @@ fn run() -> Result<(), String> {
         "idleTrimSecs": args.idle_trim_secs,
         "sessionTtlSecs": args.session_ttl_secs,
         "maxSessions": args.max_sessions,
+        "maxQueue": args.max_queue,
+        "maxPending": args.max_pending,
+        "workWorkers": args.work_workers,
+        "outboundCapacity": args.outbound_capacity,
         "protocolVersion": protocol::VERSION,
     });
     let _ = writeln!(std::io::stderr(), "genflow-nvxd: {provenance}");
@@ -152,24 +198,38 @@ fn run() -> Result<(), String> {
     config.cpu_profile = cpu_profile;
     let backend = Arc::new(OpenVmmBackend::new(config).map_err(|e| e.to_string())?);
     let client = AciEdgeSandbox::from_shared(backend.clone());
-    let writer = Arc::new(FrameWriter::new(std::io::stdout()));
+    // One bounded outbound path for every reply, event and chunk of output.
+    let (writer, writer_thread) = outbound::spawn(
+        Box::new(std::io::stdout()),
+        args.outbound_capacity,
+    );
+    let writer = Arc::new(writer);
     let context = Arc::new(Context::new(
         backend,
         client,
         provenance,
         Arc::clone(&writer),
+        args.max_queue,
         args.max_sessions,
+        state_dir.join("export-anchor"),
     ));
 
-    if args.idle_trim_secs > 0 || args.session_ttl_secs > 0 {
+    // One maintenance tick for everything time-based. It runs even with trimming and TTL off,
+    // because a queued execution past its own deadline has to be reported either way; the
+    // worker cannot do it while it is blocked waiting for a running command.
+    let maintenance = {
         let (context, idle, ttl) = (
             Arc::clone(&context),
             std::time::Duration::from_secs(args.idle_trim_secs),
             std::time::Duration::from_secs(args.session_ttl_secs),
         );
         std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(1));
+            while !context.is_stopping() {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if context.is_stopping() {
+                    break;
+                }
+                context.expire_queued_pass();
                 // Expiry first: a session past its TTL is closed, so trimming it would be
                 // wasted work on a VM that is about to stop.
                 if !ttl.is_zero() {
@@ -179,23 +239,134 @@ fn run() -> Result<(), String> {
                     context.idle_trim_pass(idle);
                 }
             }
-        });
-    }
+        })
+    };
     writer
         .send(
             &json!({"event": protocol::EVENT_READY, "protocol": protocol::VERSION}),
             &[],
         )
         .map_err(|e| e.to_string())?;
+
+    // A fixed set of workers instead of a thread per request: the caller's concurrent request
+    // count is bounded here, and a burst is answered with an overload error rather than by
+    // growing the process. Control requests get their own queue and worker so that a cancel or
+    // a close is still served while the work queue is saturated — which is exactly when the
+    // caller needs it.
+    let work: Arc<Queue<Request>> = Arc::new(Queue::new(args.max_pending));
+    let control: Arc<Queue<Request>> = Arc::new(Queue::new(CONTROL_CAPACITY));
+    let mut workers = Vec::new();
+    for _ in 0..args.work_workers {
+        workers.push(spawn_worker(
+            Arc::clone(&context),
+            Arc::clone(&writer),
+            Arc::clone(&work),
+        ));
+    }
+    for _ in 0..CONTROL_WORKERS {
+        workers.push(spawn_worker(
+            Arc::clone(&context),
+            Arc::clone(&writer),
+            Arc::clone(&control),
+        ));
+    }
+
     let mut stdin = std::io::stdin().lock();
-    while let Some((head, _payload)) = read_frame(&mut stdin).map_err(|e| e.to_string())? {
-        if head.get("op").and_then(Value::as_str) == Some(protocol::OP_SHUTDOWN) {
+    while let Some((head, payload)) = read_frame(&mut stdin).map_err(|e| e.to_string())? {
+        let op = head
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if op == protocol::OP_SHUTDOWN {
             break;
         }
-        let (context, writer) = (Arc::clone(&context), Arc::clone(&writer));
-        std::thread::spawn(move || {
-            let id = head.get("id").cloned().unwrap_or(Value::Null);
-            let reply = match context.handle_logged(&head) {
+        let is_control = is_control_op(&op);
+        let request = Request { head, payload };
+        let queue = if is_control { &control } else { &work };
+        match queue.try_push(request) {
+            Ok(()) => {}
+            Err(request) => {
+                // Refused before anything was registered: no handle exists, so the caller can
+                // retry once the backlog drains.
+                let id = request.head.get("id").cloned().unwrap_or(Value::Null);
+                eprintln!(
+                    "genflow-nvxd: refusing {op}: the {} queue holds {} of {} requests",
+                    if is_control { "control" } else { "work" },
+                    queue.depth(),
+                    queue.capacity()
+                );
+                let _ = writer.send(
+                    &json!({
+                        "id": id, "ok": false,
+                        "reasonCode": protocol::REASON_OVERLOAD,
+                        "message": "the sidecar's request queue is full",
+                    }),
+                    &[],
+                );
+            }
+        }
+    }
+    // Close in this order: stop accepting, give up on work whose output nobody can receive
+    // (which is also what unblocks any in-flight VM call), then let the workers finish.
+    work.close();
+    control.close();
+    context.shutdown_now();
+    for worker in workers {
+        let _ = worker.join();
+    }
+    // The maintenance thread holds a context of its own; it has to stop before the context can
+    // be released, or the output thread would wait forever for a sender that is still alive.
+    context.stop_maintenance();
+    let _ = maintenance.join();
+    // The context holds a writer handle of its own: releasing it before the join is what lets
+    // the output thread see the channel close.
+    drop(context);
+    drop(writer);
+    // Bounded wait: the output thread exits as soon as every sender is gone, but a stray
+    // handle must not be able to keep the process alive after shutdown was requested.
+    let finished = std::sync::mpsc::sync_channel::<()>(1);
+    let waiter = std::thread::spawn(move || {
+        let _ = writer_thread.join();
+        let _ = finished.0.send(());
+    });
+    if finished.1.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+        eprintln!("genflow-nvxd: the outbound writer did not stop; leaving it behind");
+    }
+    drop(waiter);
+    let _ = std::fs::remove_dir_all(&state_dir);
+    Ok(())
+}
+
+/// Requests that must be served while the work queue is saturated.
+fn is_control_op(op: &str) -> bool {
+    matches!(
+        op,
+        protocol::OP_SIGNAL
+            | protocol::OP_SESSION_CLOSE
+            | protocol::OP_EXEC_STATUS
+            | protocol::OP_DIAGNOSTICS
+            | protocol::OP_MEMORY_STATS
+            | protocol::OP_MEMORY_TRIM
+            | protocol::OP_PROBE
+    )
+}
+
+/// One decoded request, moved to a worker as-is.
+struct Request {
+    head: Value,
+    payload: Vec<u8>,
+}
+
+fn spawn_worker(
+    context: Arc<Context>,
+    writer: Arc<crate::outbound::Writer>,
+    queue: Arc<Queue<Request>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while let Some(request) = queue.pop() {
+            let id = request.head.get("id").cloned().unwrap_or(Value::Null);
+            let reply = match context.handle_logged(&request.head) {
                 Ok(mut body) => {
                     body["id"] = id;
                     body["ok"] = json!(true);
@@ -207,11 +378,13 @@ fn run() -> Result<(), String> {
                 }),
             };
             let _ = writer.send(&reply, &[]);
-        });
-    }
-    context.close_all();
-    let _ = std::fs::remove_dir_all(&state_dir);
-    Ok(())
+            // The start reply must reach the caller before any event for that execution.
+            if let Some(exec_id) = reply.get("execId").and_then(Value::as_str) {
+                context.release(exec_id);
+            }
+            let _ = request.payload;
+        }
+    })
 }
 
 fn main() {

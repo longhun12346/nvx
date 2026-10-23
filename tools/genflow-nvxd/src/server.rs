@@ -108,6 +108,15 @@ struct SessionInfo {
     shares: Vec<Share>,
     next_child: u64,
     last_activity: Instant,
+    /// Digest of the mount set currently applied in the guest, so an execution that asks for the
+    /// same set does not reconcile (and re-mount) everything again.
+    applied_mounts: Option<u64>,
+    /// Serialises "is this set already applied?" with the reconcile that applies it.
+    ///
+    /// The session lock cannot do this: reconciling talks to the export channel and to the guest,
+    /// which must not happen under the lock that every request needs. Without it two executions
+    /// that start together both find the set unapplied and both reconcile it.
+    mount_lock: Arc<Mutex<()>>,
 }
 
 struct WorkspaceExport {
@@ -175,10 +184,22 @@ struct Stats {
     /// holds the path. Watching this instead of designing for it is the cheap way to find out
     /// whether that assumption holds in the field.
     shares_remove_failed: u64,
+    /// Mount sets actually reconciled in the guest, and executions that reused the applied set.
+    ///
+    /// The pair is the evidence for "the same mount revision does not re-mount": a parallel run
+    /// should show one apply and several skips, not one apply per execution.
+    mounts_applied: u64,
+    mounts_skipped: u64,
     last_failure: Option<(String, String)>,
 }
 
 pub type Writer = Arc<crate::outbound::Writer>;
+
+/// Metadata key under which the backend reports the guest's control features.
+const GUEST_FEATURES_KEY: &str = "guestFeatures";
+/// Guest feature bit `EXEC_SLOTS`: the agent serves several executions at once
+/// (`guest/common/nvx-managed-agent.c`, `FEATURE_EXEC_SLOTS`).
+const GUEST_FEATURE_EXEC_SLOTS: u64 = 1 << 8;
 
 pub struct Context {
     backend: Arc<OpenVmmBackend>,
@@ -187,6 +208,10 @@ pub struct Context {
     writer: Writer,
     max_queue: usize,
     max_sessions: usize,
+    /// How many executions the VM may run at once. One keeps the serial behaviour; more is only
+    /// announced to callers through `probe`, and only works with a guest image that advertises
+    /// concurrent executions.
+    max_running: usize,
     /// Empty directory provisioned with every VM so the virtio-fs device (and therefore the
     /// export channel) exists before the first session's workspace is exported.
     export_anchor: PathBuf,
@@ -217,6 +242,7 @@ impl Context {
         writer: Writer,
         max_queue: usize,
         max_sessions: usize,
+        max_running: usize,
         export_anchor: PathBuf,
     ) -> Self {
         Self {
@@ -226,11 +252,12 @@ impl Context {
             writer,
             max_queue: max_queue.max(1),
             max_sessions,
+            max_running: max_running.max(1),
             export_anchor,
             lifecycle: Mutex::new(()),
             vm: Mutex::new(None),
             inner: Mutex::new(Inner {
-                registry: Registry::new(max_queue.max(1), 0),
+                registry: Registry::new(max_queue.max(1), max_running.max(1), 0),
                 sessions: HashMap::new(),
                 guest_targets: std::collections::HashSet::new(),
                 next_sequence: 0,
@@ -286,7 +313,11 @@ impl Context {
                            "vmGeneration": generation,
                            "capabilities": {
                                "sharedVm": true,
-                               "parallelExec": false,
+                               // Concurrent executions are claimed only when this sidecar was
+                               // configured for them and the guest advertises them; the caller
+                               // reads maxRunningPerVm for the real limit.
+                               "parallelExec": self.max_running > 1,
+                               "maxRunningPerVm": self.max_running,
                                "sessionIsolation": false,
                            }})
                 })
@@ -423,7 +454,8 @@ impl Context {
             })),
             "sessions": sessions,
             "execs": execs,
-            "running": inner.registry.running_id(),
+            "running": inner.registry.running_ids(),
+            "maxRunning": inner.registry.max_running(),
             "queued": inner.registry.queued_len(),
             "cleanupPending": inner.removals.len(),
             // How long the oldest unremoved export has been waiting. A number that keeps
@@ -447,6 +479,8 @@ impl Context {
                 "sharesAdded": stats.shares_added,
                 "sharesRemoved": stats.shares_removed,
                 "sharesRemoveFailed": stats.shares_remove_failed,
+                "mountsApplied": stats.mounts_applied,
+                "mountsSkipped": stats.mounts_skipped,
                 "lastFailure": stats.last_failure.as_ref().map(|(code, message)| json!({
                     "reasonCode": code,
                     "message": message,
@@ -480,41 +514,63 @@ impl Context {
                 ));
             }
         }
-        let vm = match self.vm_now() {
-            Some(vm) => vm,
-            None => self.boot_vm(name, workspace, memory_mib)?,
-        };
         let target = guest_workspace(name);
         let workspace_path = PathBuf::from(workspace);
-        {
-            let mut inner = self.inner.lock().unwrap();
-            if !inner.registry.open_session(name) {
-                return Err(fail(protocol::REASON_PROTOCOL, "session already open"));
+        // A VM that goes away while its first session opens is replaced once: the workspace
+        // export then fails against a machine that no longer answers, and making the caller
+        // retry the boot would report a dead VM as an unusable workspace.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let vm = match self.vm_now() {
+                Some(vm) => vm,
+                None => self.boot_vm(name, workspace, memory_mib)?,
+            };
+            {
+                let mut inner = self.inner.lock().unwrap();
+                if !inner.registry.open_session(name) {
+                    return Err(fail(protocol::REASON_PROTOCOL, "session already open"));
+                }
+                inner.sessions.insert(
+                    name.to_owned(),
+                    SessionInfo {
+                        workspace: workspace_path.clone(),
+                        prefix: safe_name(name),
+                        workspace_guest: target.clone(),
+                        workspace_export: None,
+                        shares: Vec::new(),
+                        next_child: 0,
+                        last_activity: Instant::now(),
+                        applied_mounts: None,
+                        mount_lock: Arc::new(Mutex::new(())),
+                    },
+                );
             }
-            inner.sessions.insert(
-                name.to_owned(),
-                SessionInfo {
-                    workspace: workspace_path,
-                    prefix: safe_name(name),
-                    workspace_guest: target.clone(),
-                    workspace_export: None,
-                    shares: Vec::new(),
-                    next_child: 0,
-                    last_activity: Instant::now(),
-                },
-            );
+            self.spawn_worker();
+            // The session's own workspace is registered now: it is part of what opening a
+            // session means, and a session whose files are not reachable cannot be used at all.
+            // Mounts are added later, in an idle gap, because those are changes to a live
+            // directory tree.
+            match self.ensure_workspace_export(&vm, name) {
+                Ok(()) => {
+                    return Ok(json!({
+                        "workspaceGuestPath": target,
+                        "runtimeId": vm.runtime_id,
+                        "vmGeneration": vm.generation,
+                        "sharedVm": true,
+                    }));
+                }
+                Err(failure)
+                    if attempt == 1
+                        && failure.code == protocol::REASON_BACKEND_UNAVAILABLE =>
+                {
+                    // ensure_workspace_export already retired the VM and dropped the session, so
+                    // the next round boots a new instance and registers the session again.
+                    continue;
+                }
+                Err(failure) => return Err(failure),
+            }
         }
-        self.spawn_worker();
-        // The session's own workspace is registered now: it is part of what opening a session
-        // means, and a session whose files are not reachable cannot be used at all. Mounts are
-        // added later, in an idle gap, because those are changes to a live directory tree.
-        self.ensure_workspace_export(&vm, name)?;
-        Ok(json!({
-            "workspaceGuestPath": target,
-            "runtimeId": vm.runtime_id,
-            "vmGeneration": vm.generation,
-            "sharedVm": true,
-        }))
     }
 
     /// Exports the session's workspace at its own guest path, once.
@@ -627,6 +683,11 @@ impl Context {
                 message.contains("control session ended")
                     || message.contains("is not running")
                     || message.contains("VMM process is gone")
+                    // The VMM's own export pipe is gone or stopped answering: nothing but a VM
+                    // that went away produces that, and exporting into it only burns the
+                    // timeout and reports a mount failure.
+                    || message.contains("cannot reach the export channel")
+                    || message.contains("the VMM refused to export")
             }
             _ => false,
         }
@@ -702,9 +763,33 @@ impl Context {
             .provision(&request)
             .map_err(|error| fail("E_BACKEND_START", error))?
             .sandbox_id;
-        if let Err(error) = self.client.start(&sandbox) {
-            let _ = self.client.deprovision(&sandbox);
-            return Err(fail("E_BACKEND_START", error));
+        let started = match self.client.start(&sandbox) {
+            Ok(started) => started,
+            Err(error) => {
+                let _ = self.client.deprovision(&sandbox);
+                return Err(fail("E_BACKEND_START", error));
+            }
+        };
+        // Concurrent executions need a guest that serves them; an image without the feature
+        // would queue every execution behind one anyway, so claiming parallelism would be a lie.
+        if self.max_running > 1 {
+            let features = started
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(GUEST_FEATURES_KEY))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if features & GUEST_FEATURE_EXEC_SLOTS == 0 {
+                let _ = self.client.deprovision(&sandbox);
+                return Err(fail(
+                    "E_NVX_GUEST_NO_SLOTS",
+                    format!(
+                        "the guest image does not advertise concurrent executions, but \\
+                         --max-running is {}; install the matching runtime or lower the limit",
+                        self.max_running
+                    ),
+                ));
+            }
         }
         let memory = match self.backend.vmm_process(&sandbox) {
             Ok((pid, start_time)) => Some(VmmMemory::new(pid, start_time)),
@@ -748,21 +833,23 @@ impl Context {
         std::thread::spawn(move || this.worker_loop());
     }
 
-    /// The VM's single run slot: hand out one execution, run it, then hand out the next.
+    /// Fills the VM's free run slots, and runs each execution it hands out in its own thread.
+    ///
+    /// `run_one` waits for its execution to end, so a single blocking loop could not keep more
+    /// than one execution alive; the loop therefore only dispatches, and each execution gets a
+    /// thread. Mount changes stay a per-session decision: the session that owns the work refuses
+    /// them itself while it has unfinished executions.
     fn worker_loop(self: Arc<Self>) {
         loop {
-            let next = {
+            let started = {
                 let mut inner = self.inner.lock().unwrap();
                 if !inner.vm_present {
                     self.worker_running.store(false, Ordering::SeqCst);
                     return;
                 }
-                match inner.registry.dispatch() {
-                    Some(id) => Some(id),
-                    None => None,
-                }
+                inner.registry.dispatch()
             };
-            let Some(id) = next else {
+            if started.is_empty() {
                 self.expire_queued();
                 self.try_removals(true);
                 // With nothing left to run, a VM that no session refers to any more is
@@ -779,24 +866,32 @@ impl Context {
                     .wait_timeout(inner, Duration::from_millis(200))
                     .unwrap();
                 continue;
-            };
-            self.await_release(&id);
-            let spec = {
-                let inner = self.inner.lock().unwrap();
-                inner.specs.get(&id).cloned()
-            };
-            let Some(spec) = spec else {
-                // Cancelled between dispatch and run: the cancel path already emitted the
-                // terminal state, so there is nothing left to report.
-                continue;
-            };
-            match self.vm_now() {
-                Some(vm) => self.run_one(&vm, &id, spec),
-                None => self.finish_and_emit(
-                    &id,
-                    Terminal::new("failed", None, "the VM was replaced before the run started"),
-                ),
             }
+            for id in started {
+                let this = Arc::clone(&self);
+                std::thread::spawn(move || this.run_dispatched(id));
+            }
+        }
+    }
+
+    /// Runs one execution that already holds a run slot.
+    fn run_dispatched(self: Arc<Self>, id: String) {
+        self.await_release(&id);
+        let spec = {
+            let inner = self.inner.lock().unwrap();
+            inner.specs.get(&id).cloned()
+        };
+        let Some(spec) = spec else {
+            // Cancelled between dispatch and run: the cancel path already emitted the
+            // terminal state, so there is nothing left to report.
+            return;
+        };
+        match self.vm_now() {
+            Some(vm) => self.run_one(&vm, &id, spec),
+            None => self.finish_and_emit(
+                &id,
+                Terminal::new("failed", None, "the VM was replaced before the run started"),
+            ),
         }
     }
 
@@ -826,16 +921,56 @@ impl Context {
             let inner = self.inner.lock().unwrap();
             session_of(&inner, id)
         };
-        if let Err(failure) = self.apply_mounts(vm, &session, &spec.mounts) {
+        // Mounts are per-request snapshots, and reconciling one rewrites the guest's bind mounts.
+        // Executions that ask for the same set as the one already applied skip that work, which
+        // is what lets several of them run without re-mounting each other's paths. The session's
+        // mount lock covers the check, the reconcile and the record together: without it two
+        // executions starting together both find the set unapplied and both reconcile it.
+        let mount_lock = {
+            let inner = self.inner.lock().unwrap();
+            inner.sessions.get(&session).map(|info| Arc::clone(&info.mount_lock))
+        };
+        let Some(mount_lock) = mount_lock else {
             self.finish_and_emit(
                 id,
-                Terminal::new(
-                    "failed",
-                    None,
-                    format!("{}: {}", failure.code, failure.message),
-                ),
+                Terminal::new("failed", None, "the session was closed before the run started"),
             );
             return;
+        };
+        let digest = mounts_digest(&spec.mounts);
+        {
+            let _applying = mount_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let already_applied = {
+                let inner = self.inner.lock().unwrap();
+                inner
+                    .sessions
+                    .get(&session)
+                    .is_some_and(|info| info.applied_mounts == Some(digest))
+            };
+            if already_applied {
+                self.stats.lock().unwrap().mounts_skipped += 1;
+            } else {
+                if let Err(failure) = self.apply_mounts(vm, &session, &spec.mounts) {
+                    self.finish_and_emit(
+                        id,
+                        Terminal::new(
+                            "failed",
+                            None,
+                            format!("{}: {}", failure.code, failure.message),
+                        ),
+                    );
+                    return;
+                }
+                {
+                    let mut inner = self.inner.lock().unwrap();
+                    if let Some(info) = inner.sessions.get_mut(&session) {
+                        info.applied_mounts = Some(digest);
+                    }
+                }
+                self.stats.lock().unwrap().mounts_applied += 1;
+            }
         }
         let cwd = match spec.cwd_host {
             None => None,
@@ -1027,7 +1162,7 @@ impl Context {
         if slot_is_free {
             let ready = {
                 let inner = self.inner.lock().unwrap();
-                inner.registry.running_id().is_none() && inner.registry.queued_len() == 0
+                inner.registry.running_ids().is_empty() && inner.registry.queued_len() == 0
             };
             if !ready {
                 return;
@@ -1242,6 +1377,11 @@ impl Context {
                 "a mount needs mountId and hostPath",
             ));
         }
+        // A mount change rewrites the guest's bind mounts, which cannot happen under a task that
+        // is already running. The parallel-mode barrier below is checked in the same critical
+        // section as admission: checking it here, in an earlier one, would let two concurrent
+        // requests both find the session idle, both be admitted, and both reconcile.
+
         let timeout = match head.get("timeoutMs") {
             None => None,
             Some(value) => {
@@ -1324,6 +1464,24 @@ impl Context {
         let generation = head.get("generation").and_then(|value| number(Some(value))).unwrap_or(0);
         let accepted = {
             let mut inner = self.inner.lock().unwrap();
+            // Parallel-mode barrier, decided together with admission so that two requests cannot
+            // both see the session idle and then both change its mounts.
+            if self.max_running > 1 {
+                let Some(info) = inner.sessions.get(name) else {
+                    return Err(fail(
+                        protocol::REASON_SESSION_UNKNOWN,
+                        format!("unknown session {name}"),
+                    ));
+                };
+                let changed = info.applied_mounts != Some(mounts_digest(&desired));
+                if changed && inner.registry.session_has_unfinished(name) {
+                    return Err(fail(
+                        protocol::REASON_BACKEND_BUSY,
+                        "the session still has unfinished executions; a mount change applies \
+                         once they finish",
+                    ));
+                }
+            }
             inner
                 .registry
                 .accept(name, &exec_id, digest, generation, queue_deadline)
@@ -1565,24 +1723,29 @@ impl Context {
             );
             let _ = self.writer.send(&event, &[]);
         }
-        // The running execution is stopped and waited for, but a close never blocks forever:
-        // past the deadline it reports `closing` and keeps the responsibility.
+        // Every running execution of the session is stopped and waited for, but a close never
+        // blocks forever: past the deadline it reports `closing` and keeps the responsibility.
         let mut cleanup_pending = false;
-        if let Some(id) = running {
-            let canceller = {
-                let inner = self.inner.lock().unwrap();
-                inner.cancels.get(&id).cloned()
-            };
-            if let Some(canceller) = canceller {
-                let _ = canceller.cancel();
-            } else {
-                // Dispatched but not started yet; the worker will see the cancel request.
+        if !running.is_empty() {
+            for id in &running {
+                let canceller = {
+                    let inner = self.inner.lock().unwrap();
+                    inner.cancels.get(id).cloned()
+                };
+                if let Some(canceller) = canceller {
+                    let _ = canceller.cancel();
+                }
+                // Dispatched but not started yet: the worker sees the cancel request instead.
             }
             let deadline = Instant::now() + CLOSE_WAIT;
             loop {
                 let still_running = {
                     let inner = self.inner.lock().unwrap();
-                    inner.registry.running_id() == Some(id.as_str())
+                    inner
+                        .registry
+                        .running_ids()
+                        .iter()
+                        .any(|active| running.contains(active))
                 };
                 if !still_running {
                     break;
@@ -1669,7 +1832,7 @@ impl Context {
             "workingSetMiB": working_set / (1 << 20),
             "trims": state.trims,
             "idleMs": state.last_activity.elapsed().as_millis() as u64,
-            "busy": inner.registry.running_id().is_some(),
+            "busy": !inner.registry.running_ids().is_empty(),
             "queued": inner.registry.queued_len(),
         }))
     }
@@ -1684,7 +1847,7 @@ impl Context {
             .ok_or_else(|| fail("E_BACKEND_MEMORY", "no VMM process is known"))?;
         {
             let inner = self.inner.lock().unwrap();
-            if inner.registry.running_id().is_some() {
+            if !inner.registry.running_ids().is_empty() {
                 return Err(fail("E_BACKEND_BUSY", "the VM is running a command"));
             }
         }
@@ -1731,7 +1894,7 @@ impl Context {
         };
         {
             let inner = self.inner.lock().unwrap();
-            if inner.registry.running_id().is_some() || inner.registry.queued_len() > 0 {
+            if !inner.registry.running_ids().is_empty() || inner.registry.queued_len() > 0 {
                 return;
             }
         }
@@ -1867,6 +2030,23 @@ fn strings(value: Option<&Value>) -> Vec<String> {
         .iter()
         .filter_map(|item| item.as_str().map(str::to_owned))
         .collect()
+}
+
+/// Identifies a mount snapshot: the same set in the same order has the same digest.
+///
+/// Order matters because the guest's runtime mapping table is indexed: a reordered set is a
+/// different table even when it names the same directories.
+fn mounts_digest(mounts: &[Mount]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    mounts.len().hash(&mut hasher);
+    for mount in mounts {
+        mount.id.hash(&mut hasher);
+        mount.host_path.hash(&mut hasher);
+        mount.read_only.hash(&mut hasher);
+        mount.guest_path.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn mounts(value: Option<&Value>) -> Vec<Mount> {

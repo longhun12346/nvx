@@ -28,14 +28,21 @@
 //!   start whose caller died before recording OpenVMM's identity is recovered through its launch
 //!   marker.
 //!
-//! Callers serialize the lifecycle transitions of one instance, for example with [`lock`]. The
-//! guest serializes executions: a second execution waits until the first finishes. Messages call
-//! the instance `sandbox NAME`, after the name that [`Instance::new`] gives it.
+//! Callers serialize the lifecycle transitions of one instance, for example with [`lock`]. A
+//! control session carries one execution at a time as far as [`Instance::exec`] is concerned: it
+//! opens a session per execution. [`Instance::exec_shared`] instead shares one session between
+//! several executions ([`SharedSession`]), which a guest that advertises concurrent executions
+//! can serve; every other control operation of the instance still opens its own session, so a
+//! caller that adopts the shared session must route them through it too.
+//! Messages call the instance `sandbox NAME`, after the name that [`Instance::new`] gives it.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
@@ -44,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use super::artifacts::Artifacts;
 use super::launch::{LaunchSpec, timeout_problem};
 use super::report::{self, Report};
-use super::session::{self, ControlSession, ExecEvent, SessionError};
+use super::session::{self, ControlSession, Delivery, ExecEvent, SessionError, SharedSession};
 use super::{platform, process};
 use crate::error::{Error, ErrorKind, Result};
 use crate::protocol::{
@@ -272,6 +279,9 @@ pub struct Started {
     pub runtime: RuntimeRecord,
     /// Time from launch to guest readiness.
     pub boot: Duration,
+    /// Control features the guest advertised. A caller that needs more than the required set,
+    /// such as concurrent executions, reads them here instead of assuming a build.
+    pub features: GuestFeatures,
 }
 
 /// A VM that [`Instance::stop`] stopped.
@@ -290,6 +300,99 @@ pub struct Instance {
     dir: PathBuf,
     /// Sandbox name used in diagnostics.
     name: String,
+}
+
+/// The control session of each running VM, keyed by control endpoint and boot time.
+///
+/// A VM serves one control session, and the guest demultiplexes requests over it by request id:
+/// executions, host path mappings, feature queries, and the stop request all travel over the
+/// session registered here. The boot time is part of the key, so a restarted VM is never reached
+/// through the session of the boot it replaced; an entry whose reader has stopped is dropped when
+/// it is next looked up.
+fn sessions() -> &'static Mutex<HashMap<(String, u64), Arc<SharedSession>>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<(String, u64), Arc<SharedSession>>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One lock per VM, held while its session is being attached.
+///
+/// Attaching means connecting to the endpoint (with retries) and a handshake, which can take the
+/// whole control timeout. That must not happen under the map's lock: it would stall every other
+/// VM's control path, including their stops. Two callers of the same VM still serialise here, so
+/// only one of them opens the session the broker serves.
+fn opening_locks() -> &'static Mutex<HashMap<(String, u64), Arc<Mutex<()>>>> {
+    static OPENING: OnceLock<Mutex<HashMap<(String, u64), Arc<Mutex<()>>>>> = OnceLock::new();
+    OPENING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl Instance {
+    /// Returns the control session of `runtime`, attaching it on first use.
+    ///
+    /// Every control operation of a running VM must go through the session this returns: opening
+    /// a second one would wait for the first to finish and then fail, because the broker issues a
+    /// single host slot per VM.
+    pub fn control_session(
+        &self,
+        runtime: &RuntimeRecord,
+        capability: &[u8; CAPABILITY_LEN],
+        control_timeout: Duration,
+    ) -> Result<Arc<SharedSession>> {
+        check_timeout("control timeout", control_timeout, true)?;
+        let key = (runtime.endpoint.clone(), runtime.start_time);
+        {
+            let mut sessions = sessions().lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(session) = sessions.get(&key) {
+                if session.is_running() {
+                    return Ok(Arc::clone(session));
+                }
+                sessions.remove(&key);
+            }
+        }
+        // Only this VM's callers serialise below; every other VM keeps using its own session.
+        let opening = {
+            let mut locks = opening_locks().lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(
+                locks
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let _opening = opening.lock().unwrap_or_else(PoisonError::into_inner);
+        // Another caller may have attached it while this one waited for the lock.
+        {
+            let mut sessions = sessions().lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(session) = sessions.get(&key) {
+                if session.is_running() {
+                    return Ok(Arc::clone(session));
+                }
+                sessions.remove(&key);
+            }
+        }
+        let deadline = Instant::now() + control_timeout;
+        let transport =
+            session::connect(&runtime.endpoint, runtime.pid, runtime.start_time, deadline)
+                .map_err(|error| self.session_error(error, control_timeout))?;
+        let opened = SharedSession::open(transport, capability, deadline)
+            .map_err(|error| self.session_error(error, control_timeout))?;
+        sessions()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, Arc::clone(&opened));
+        Ok(opened)
+    }
+
+    /// Forgets the control session of `runtime`, so a later call attaches a new one.
+    pub fn forget_control_session(&self, runtime: &RuntimeRecord) {
+        let key = (runtime.endpoint.clone(), runtime.start_time);
+        sessions()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+        opening_locks()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+    }
 }
 
 impl Instance {
@@ -707,6 +810,7 @@ impl Instance {
         Ok(Started {
             runtime,
             boot: started.elapsed(),
+            features,
         })
     }
 
@@ -750,22 +854,34 @@ impl Instance {
         control_timeout: Duration,
         response_grace: Duration,
     ) -> Result<Execution> {
+        // One path for every caller: the session this VM serves, shared with its other
+        // executions. A caller that had its own session per execution would wait for the first
+        // one to finish, because the broker issues a single host slot per VM.
+        let shared = self.control_session(runtime, capability, control_timeout)?;
+        self.exec_shared(&shared, workload, control_timeout, response_grace)
+    }
+
+    /// Starts one workload on a shared session and returns the handle that pumps its events.
+    pub fn exec_shared(
+        &self,
+        shared: &Arc<SharedSession>,
+        workload: &Workload<'_>,
+        control_timeout: Duration,
+        response_grace: Duration,
+    ) -> Result<SharedExecution> {
         check_timeout("control timeout", control_timeout, true)?;
         check_timeout("response grace", response_grace, false)?;
         let deadline = Instant::now() + control_timeout;
-        let mut session =
-            session::connect(&runtime.endpoint, runtime.pid, runtime.start_time, deadline)
-                .and_then(|transport| ControlSession::attach(transport, capability, deadline))
-                .map_err(|error| self.session_error(error, control_timeout))?;
-        let request_id = session
+        let (request_id, events) = shared
             .start_exec(workload, deadline)
             .map_err(|error| self.session_error(error, control_timeout))?;
         let timeout_ms = workload.timeout_ms;
         let response_deadline = (timeout_ms > 0)
             .then(|| Instant::now() + Duration::from_millis(timeout_ms.into()) + response_grace);
-        Ok(Execution {
-            session,
+        Ok(SharedExecution {
+            shared: Arc::clone(shared),
             request_id,
+            events,
             deadline: response_deadline,
             control_timeout,
         })
@@ -781,21 +897,38 @@ impl Instance {
     pub fn stop(&self, runtime: &RuntimeRecord, timeout: Duration) -> Result<Stopped> {
         check_timeout("stop timeout", timeout, true)?;
         let deadline = Instant::now() + timeout;
+        // The stop must travel over the VM's one control session: opening its own would wait for
+        // that session to end instead of reaching the guest.
         let graceful = (|| -> std::result::Result<(), SessionError> {
             let capability = self
                 .read_capability()
                 .map_err(|error| SessionError::Protocol(error.to_string()))?;
-            let transport =
-                session::connect(&runtime.endpoint, runtime.pid, runtime.start_time, deadline)?;
-            let mut session = ControlSession::attach(transport, &capability, deadline)?;
-            session.stop(deadline)?;
-            drop(session);
+            let shared = match self.control_session(runtime, &capability, timeout) {
+                Ok(shared) => shared,
+                // A VM that has already exited must stay distinguishable here: `finish_stop`
+                // reports `forced` only for a stop that had to terminate it.
+                Err(error) if error.kind() == ErrorKind::Exited => {
+                    return Err(SessionError::ProcessExited);
+                }
+                Err(error) => return Err(SessionError::Protocol(error.to_string())),
+            };
+            shared.stop(deadline)?;
             if process::wait_for_exit(runtime.pid, runtime.start_time, deadline) {
                 Ok(())
             } else {
                 Err(SessionError::TimedOut)
             }
         })();
+        self.forget_control_session(runtime);
+        self.finish_stop(runtime, graceful)
+    }
+
+    /// Terminates OpenVMM when the guest did not shut down, then clears the runtime record.
+    fn finish_stop(
+        &self,
+        runtime: &RuntimeRecord,
+        graceful: std::result::Result<(), SessionError>,
+    ) -> Result<Stopped> {
         let forced = !matches!(graceful, Ok(()) | Err(SessionError::ProcessExited));
         if forced {
             let exited = process::kill(runtime.pid, runtime.start_time).map_err(|error| {
@@ -860,30 +993,61 @@ pub enum WorkloadOutcome {
     WorkingDirectory,
 }
 
-/// A workload that [`Instance::exec`] started.
-pub struct Execution {
-    /// Exclusive control session that carries this workload's traffic.
-    session: ControlSession,
+/// The outcome the guest reported for an execution.
+fn workload_outcome(category: ExitCategory, status: i32) -> WorkloadOutcome {
+    match category {
+        ExitCategory::Exit => WorkloadOutcome::Exited(status),
+        ExitCategory::Signal => WorkloadOutcome::Signaled(if status > 128 {
+            status - 128
+        } else {
+            status
+        }),
+        ExitCategory::Timeout => WorkloadOutcome::TimedOut,
+        ExitCategory::OutputLimit => WorkloadOutcome::OutputLimitExceeded,
+        ExitCategory::Failed => WorkloadOutcome::Failed,
+        ExitCategory::Cancelled => WorkloadOutcome::Cancelled,
+    }
+}
+
+/// The outcome of a workload that the guest refused before it ran.
+fn rejected_outcome(category: &str, status: i32) -> Result<WorkloadOutcome> {
+    match category {
+        LAUNCH_FAILED => Ok(WorkloadOutcome::LaunchFailed),
+        // The guest already wrote a diagnostic that names the directory to stderr.
+        CWD_FAILED => Ok(WorkloadOutcome::WorkingDirectory),
+        // Only a start that was interrupted leaves a guest without its mappings.
+        MAPPINGS_INCOMPLETE => Err(Error::protocol(
+            "the guest has not mounted every mapped host path, because its start did not \
+             complete; stop the sandbox and start it again",
+        )),
+        _ => Err(Error::protocol(format!(
+            "the guest agent rejected the workload: {category} (status {status})"
+        ))),
+    }
+}
+
+/// A workload that [`Instance::exec_shared`] started on a [`SharedSession`].
+pub struct SharedExecution {
+    /// The session the workload runs on, which other executions also use.
+    shared: Arc<SharedSession>,
     /// Identifier correlating requests, output, cancellation, and the final outcome.
     request_id: u64,
+    /// Events of this execution, in the order the guest sent them.
+    events: Receiver<Delivery>,
     /// Workload response deadline, absent for a workload without a timeout.
     deadline: Option<Instant>,
     /// Maximum time allowed for control traffic after cancellation or failure.
     control_timeout: Duration,
 }
 
-impl Execution {
+impl SharedExecution {
     /// Relays the workload's output to `stdout` and `stderr` and returns its outcome.
     ///
-    /// Events are read in short slices, so that setting `cancel` reaches the guest within 20 ms.
-    /// The guest then terminates the workload and reports the cancelled outcome as usual. Once
-    /// cancellation is sent, a missing response fails within the control timeout of
-    /// [`Instance::exec`], or the earlier workload-response deadline, even when the workload has
-    /// no timeout. The guest agent limits the combined output to [`MAX_OUTPUT_BYTES`], and a
-    /// guest that sends more fails the execution. If the process that pumps an execution dies,
-    /// the guest kills the workload as soon as it notices that the control session is gone.
+    /// Behaves like [`Execution::pump`], except that the events arrive from a session that other
+    /// executions share: the reader thread of that session hands over the frames whose request id
+    /// is this execution's, and a cancellation names only this execution.
     pub fn pump(
-        mut self,
+        self,
         stdout: &mut dyn OutputSink,
         stderr: &mut dyn OutputSink,
         cancel: &AtomicBool,
@@ -896,7 +1060,7 @@ impl Execution {
         loop {
             if !cancel_sent && cancel.load(Ordering::Acquire) {
                 let cancellation_deadline = Instant::now() + self.control_timeout;
-                self.session
+                self.shared
                     .cancel_exec(self.request_id, cancellation_deadline)
                     .map_err(|error| {
                         Error::new(
@@ -910,66 +1074,53 @@ impl Execution {
                 }));
                 cancel_sent = true;
             }
+            if let Some(deadline) = deadline
+                && Instant::now() >= deadline
+            {
+                return Err(Error::timed_out(
+                    "timed out waiting for the workload outcome",
+                ));
+            }
             let slice = Instant::now() + CANCEL_POLL_INTERVAL;
-            let poll_deadline = if cancel_sent {
-                deadline
-            } else {
-                Some(deadline.map_or(slice, |deadline| deadline.min(slice)))
-            };
-            let event = match self.session.next_exec_event(self.request_id, poll_deadline) {
-                Err(SessionError::TimedOut)
-                    if poll_deadline != deadline
-                        && deadline.is_none_or(|deadline| Instant::now() < deadline) =>
-                {
-                    continue;
+            let until = deadline.map_or(slice, |deadline| deadline.min(slice));
+            let delivery = match self
+                .events
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+            {
+                Ok(delivery) => delivery,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(Error::protocol(
+                        "the control session ended before the workload finished; the sandbox VM \
+                         may have stopped",
+                    ));
                 }
-                event => event,
             };
-            let event = event.map_err(|error| match error {
-                SessionError::TimedOut => {
-                    Error::timed_out("timed out waiting for the workload outcome")
+            let event = match delivery {
+                Delivery::Event(event) => event,
+                Delivery::Rejected { status, category } => {
+                    return rejected_outcome(&category, status);
                 }
-                SessionError::Closed | SessionError::Reset => Error::protocol(
-                    "the control session ended before the workload finished; the sandbox VM may \
-                     have stopped",
-                ),
-                other => Error::new(
-                    session_kind(&other),
-                    format!("the control session failed: {other}"),
-                )
-                .with_source(other),
-            })?;
+                Delivery::Failed(message) => return Err(Error::protocol(message)),
+                Delivery::Stopped => {
+                    return Err(Error::protocol(
+                        "the guest stopped before the workload finished",
+                    ));
+                }
+                Delivery::Reply { .. } => {
+                    return Err(Error::protocol(
+                        "the guest acknowledged a request this execution did not send",
+                    ));
+                }
+            };
             let (chunk, sink, open): (Vec<u8>, &mut dyn OutputSink, &mut bool) = match event {
                 ExecEvent::Stdout(chunk) => (chunk, &mut *stdout, &mut stdout_open),
                 ExecEvent::Stderr(chunk) => (chunk, &mut *stderr, &mut stderr_open),
                 ExecEvent::Exit { category, status } => {
-                    return Ok(match category {
-                        ExitCategory::Exit => WorkloadOutcome::Exited(status),
-                        ExitCategory::Signal => WorkloadOutcome::Signaled(if status > 128 {
-                            status - 128
-                        } else {
-                            status
-                        }),
-                        ExitCategory::Timeout => WorkloadOutcome::TimedOut,
-                        ExitCategory::OutputLimit => WorkloadOutcome::OutputLimitExceeded,
-                        ExitCategory::Failed => WorkloadOutcome::Failed,
-                        ExitCategory::Cancelled => WorkloadOutcome::Cancelled,
-                    });
+                    return Ok(workload_outcome(category, status));
                 }
                 ExecEvent::Rejected { status, category } => {
-                    return match category.as_str() {
-                        LAUNCH_FAILED => Ok(WorkloadOutcome::LaunchFailed),
-                        // The guest already wrote a diagnostic that names the directory to stderr.
-                        CWD_FAILED => Ok(WorkloadOutcome::WorkingDirectory),
-                        // Only a start that was interrupted leaves a guest without its mappings.
-                        MAPPINGS_INCOMPLETE => Err(Error::protocol(
-                            "the guest has not mounted every mapped host path, because its start \
-                             did not complete; stop the sandbox and start it again",
-                        )),
-                        _ => Err(Error::protocol(format!(
-                            "the guest agent rejected the workload: {category} (status {status})"
-                        ))),
-                    };
+                    return rejected_outcome(&category, status);
                 }
             };
             forwarded = forwarded.saturating_add(chunk.len());
@@ -984,6 +1135,12 @@ impl Execution {
         }
     }
 }
+
+/// The handle of one execution, as earlier callers named it.
+///
+/// Executions share the VM's one control session now, so every caller receives a
+/// [`SharedExecution`]; the name stays so existing code compiles unchanged.
+pub type Execution = SharedExecution;
 
 #[cfg(test)]
 mod tests {

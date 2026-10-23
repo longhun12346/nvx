@@ -1,7 +1,11 @@
 //! Host side of an authenticated control session with a sandbox's guest agent.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -248,19 +252,7 @@ impl ControlSession {
                 "the guest agent returned a mismatched request ID".to_owned(),
             ));
         }
-        match kind {
-            APP_READY if status == 0 && payload.is_empty() => Ok(()),
-            APP_ERROR => {
-                let category: String =
-                    String::from_utf8_lossy(&payload).chars().take(64).collect();
-                Err(SessionError::Protocol(format!(
-                    "the guest agent did not unmount the host path: {category} (status {status})"
-                )))
-            }
-            _ => Err(SessionError::Protocol(
-                "the guest agent returned an invalid unmap response".to_owned(),
-            )),
-        }
+        check_unmap_reply(kind, status, &payload)
     }
 
     /// Hands the guest agent entries that continue its host mapping table at index `first`, and
@@ -287,33 +279,7 @@ impl ControlSession {
                     "the guest agent returned a mismatched request ID".to_owned(),
                 ));
             }
-            match kind {
-                APP_READY if status == 0 && payload.is_empty() => {}
-                APP_ERROR if payload == protocol::MAPPING_LIMIT.as_bytes() => {
-                    return Err(SessionError::Protocol(
-                        "the guest agent holds the most runtime host mappings it can unmount; remove one first"
-                            .to_owned(),
-                    ));
-                }
-                APP_ERROR if payload == protocol::MAPPING_FAILED.as_bytes() => {
-                    return Err(SessionError::Protocol(format!(
-                        "the guest agent could not mount a mapped host path (error {status})"
-                    )));
-                }
-                APP_ERROR => {
-                    let category: String =
-                        String::from_utf8_lossy(&payload).chars().take(64).collect();
-                    return Err(SessionError::Protocol(format!(
-                        "the guest agent did not mount the host paths: {category} (status \
-                         {status})"
-                    )));
-                }
-                _ => {
-                    return Err(SessionError::Protocol(
-                        "the guest agent returned an invalid host mapping response".to_owned(),
-                    ));
-                }
-            }
+            check_maps_reply(kind, status, &payload)?;
         }
         Ok(())
     }
@@ -494,6 +460,423 @@ fn request_id() -> Result<u64, SessionError> {
     }
 }
 
+/// Refuses what the guest answered to a host mapping request.
+fn check_maps_reply(kind: u8, status: i32, payload: &[u8]) -> Result<(), SessionError> {
+    match kind {
+        APP_READY if status == 0 && payload.is_empty() => Ok(()),
+        APP_ERROR if payload == protocol::MAPPING_LIMIT.as_bytes() => Err(SessionError::Protocol(
+            "the guest agent holds the most runtime host mappings it can unmount; remove one first"
+                .to_owned(),
+        )),
+        APP_ERROR if payload == protocol::MAPPING_FAILED.as_bytes() => {
+            Err(SessionError::Protocol(format!(
+                "the guest agent could not mount a mapped host path (error {status})"
+            )))
+        }
+        APP_ERROR => {
+            let category: String = String::from_utf8_lossy(payload).chars().take(64).collect();
+            Err(SessionError::Protocol(format!(
+                "the guest agent did not mount the host paths: {category} (status {status})"
+            )))
+        }
+        _ => Err(SessionError::Protocol(
+            "the guest agent returned an invalid host mapping response".to_owned(),
+        )),
+    }
+}
+
+/// Refuses what the guest answered to an unmap request.
+fn check_unmap_reply(kind: u8, status: i32, payload: &[u8]) -> Result<(), SessionError> {
+    match kind {
+        APP_READY if status == 0 && payload.is_empty() => Ok(()),
+        APP_ERROR => {
+            let category: String = String::from_utf8_lossy(payload).chars().take(64).collect();
+            Err(SessionError::Protocol(format!(
+                "the guest agent did not unmount the host path: {category} (status {status})"
+            )))
+        }
+        _ => Err(SessionError::Protocol(
+            "the guest agent returned an invalid unmap response".to_owned(),
+        )),
+    }
+}
+
+/// How long one read waits before the reader re-checks whether it should stop.
+///
+/// A write takes the session lock, so this is also the longest a cancellation waits behind a
+/// read; the guest's own cancel poll interval is the same order of magnitude.
+const SHARED_READ_SLICE: Duration = Duration::from_millis(20);
+
+/// What one request receives from a [`SharedSession`].
+pub enum Delivery {
+    /// An event of the execution whose request id the frame repeats.
+    Event(ExecEvent),
+    /// The acknowledgement of a request: its frame kind, status, and payload.
+    Reply {
+        /// Frame kind of the acknowledgement, such as `APP_READY`.
+        kind: u8,
+        /// Status the guest reported; zero on success.
+        status: i32,
+        /// Payload the guest attached, empty for an acknowledgement without one.
+        payload: Vec<u8>,
+    },
+    /// The guest rejected a request.
+    Rejected {
+        /// The guest's error number.
+        status: i32,
+        /// The error category, such as `mapping-failed`, truncated to 64 characters.
+        category: String,
+    },
+    /// The guest acknowledged a stop request.
+    Stopped,
+    /// The session ended, so nothing more arrives for any request.
+    Failed(String),
+}
+
+/// Eight MiB of headroom for the events of executions whose pump has not caught up yet.
+///
+/// The guest caps the combined output of one execution at
+/// [`MAX_OUTPUT_BYTES`](crate::protocol::MAX_OUTPUT_BYTES), so the queue a single execution can
+/// accumulate is bounded by its own output, not by how fast its consumer reads.
+pub struct SharedSession {
+    /// The session itself: reads and writes both advance per-direction sequence numbers.
+    session: Mutex<ControlSession>,
+    /// Channel of every request that has not reached its terminal frame yet.
+    waiters: Mutex<HashMap<u64, Sender<Delivery>>>,
+    /// Whether the reader thread is still serving this session.
+    running: AtomicBool,
+}
+
+impl SharedSession {
+    /// Attaches one control session and starts the reader that demultiplexes it.
+    ///
+    /// A guest serves several executions per session only when it advertises
+    /// [`GuestFeatures::EXEC_SLOTS`](crate::protocol::GuestFeatures::EXEC_SLOTS); the caller
+    /// checks that before it starts more than one.
+    pub fn open(
+        transport: Box<dyn Transport>,
+        capability: &[u8; CAPABILITY_LEN],
+        deadline: Instant,
+    ) -> Result<Arc<Self>, SessionError> {
+        let session = ControlSession::attach(transport, capability, deadline)?;
+        let shared = Arc::new(Self {
+            session: Mutex::new(session),
+            waiters: Mutex::new(HashMap::new()),
+            running: AtomicBool::new(true),
+        });
+        let reader = Arc::clone(&shared);
+        thread::Builder::new()
+            .name("nvx-control-reader".to_owned())
+            .spawn(move || reader.read_forever())
+            .map_err(|error| SessionError::Io(io::Error::other(error)))?;
+        Ok(shared)
+    }
+
+    /// Whether the reader thread still serves this session.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    /// Sends one request, reporting a dead connection as the VM having exited.
+    ///
+    /// A write on the shared session fails only when the connection is gone (the VMM died, or the
+    /// broker closed it), so this stops the reader, fails everything still waiting, and reports
+    /// [`SessionError::ProcessExited`]: the host then retires the VM instead of retrying a pipe
+    /// nothing serves.
+    fn send_or_gone(
+        &self,
+        kind: u8,
+        request_id: u64,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> Result<(), SessionError> {
+        let sent = {
+            let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+            session.send_app(kind, request_id, payload, Some(deadline))
+        };
+        match sent {
+            Ok(()) => Ok(()),
+            // The write ran out of its own deadline: the peer is slow, not gone. Retiring the VM
+            // here would turn a busy guest into a dead one.
+            Err(SessionError::TimedOut) => Err(SessionError::TimedOut),
+            Err(SessionError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Err(SessionError::TimedOut)
+            }
+            Err(error) => {
+                self.running.store(false, Ordering::Release);
+                self.fail_all(format!("the control session ended: {error}"));
+                Err(SessionError::ProcessExited)
+            }
+        }
+    }
+
+    /// Starts one execution and returns the id its events repeat with the channel carrying them.
+    pub fn start_exec(
+        &self,
+        workload: &Workload<'_>,
+        deadline: Instant,
+    ) -> Result<(u64, Receiver<Delivery>), SessionError> {
+        // A session whose reader has stopped cannot deliver anything. Failing here keeps a dead
+        // VM from looking like a slow one: a request registered after the reader drained its
+        // waiters would otherwise wait for its whole deadline.
+        if !self.is_running() {
+            return Err(SessionError::Closed);
+        }
+        let payload = protocol::encode_exec_payload(workload)?;
+        let id = request_id()?;
+        let (sender, receiver) = mpsc::channel();
+        self.waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, sender);
+        let sent = self.send_or_gone(APP_EXEC, id, &payload, deadline);
+        if let Err(error) = sent {
+            self.waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id);
+            return Err(error);
+        }
+        Ok((id, receiver))
+    }
+
+    /// Asks the guest to terminate the execution identified by `request_id`.
+    ///
+    /// Other executions of the same session keep running: the guest matches the id against its
+    /// own table of executions.
+    pub fn cancel_exec(&self, request_id: u64, deadline: Instant) -> Result<(), SessionError> {
+        self.send_or_gone(APP_CANCEL, request_id, &[], deadline)
+    }
+
+    /// Asks the guest to shut down and waits for its acknowledgement.
+    pub fn stop(&self, deadline: Instant) -> Result<(), SessionError> {
+        if !self.is_running() {
+            return Err(SessionError::Closed);
+        }
+        let id = request_id()?;
+        let (sender, receiver) = mpsc::channel();
+        self.waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, sender);
+        {
+            let sent = self.send_or_gone(APP_STOP, id, &[], deadline);
+            if let Err(error) = sent {
+                self.waiters
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&id);
+                return Err(error);
+            }
+        }
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.waiters
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&id);
+                return Err(SessionError::TimedOut);
+            }
+            match receiver.recv_timeout(remaining.min(SHARED_READ_SLICE)) {
+                Ok(Delivery::Stopped) => return Ok(()),
+                Ok(Delivery::Failed(message)) => return Err(SessionError::Protocol(message)),
+                Ok(Delivery::Rejected { status, category }) => {
+                    return Err(SessionError::Protocol(format!(
+                        "the guest agent rejected the stop request: {category} (status {status})"
+                    )));
+                }
+                Ok(Delivery::Reply { .. })
+                | Ok(Delivery::Event(_)) => continue,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return Err(SessionError::Closed),
+            }
+        }
+    }
+
+    /// Sends one request and waits for the acknowledgement that repeats its id.
+    ///
+    /// Every control operation of a running VM travels over the one shared session, so this is
+    /// the primitive that host path mappings, feature queries, and stops use. A rejected request
+    /// comes back as [`Delivery::Rejected`] and is turned into an error here.
+    pub fn call(
+        &self,
+        kind: u8,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> Result<(u8, i32, Vec<u8>), SessionError> {
+        if !self.is_running() {
+            return Err(SessionError::Closed);
+        }
+        let id = request_id()?;
+        let (sender, receiver) = mpsc::channel();
+        self.waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, sender);
+        let sent = self.send_or_gone(kind, id, payload, deadline);
+        if let Err(error) = sent {
+            self.waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id);
+            return Err(error);
+        }
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.waiters
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&id);
+                return Err(SessionError::TimedOut);
+            }
+            match receiver.recv_timeout(remaining.min(SHARED_READ_SLICE)) {
+                Ok(Delivery::Reply {
+                    kind,
+                    status,
+                    payload,
+                }) => return Ok((kind, status, payload)),
+                Ok(Delivery::Rejected { status, category }) => {
+                    return Err(SessionError::Protocol(format!(
+                        "the guest agent rejected the request: {category} (status {status})"
+                    )));
+                }
+                Ok(Delivery::Failed(message)) => return Err(SessionError::Protocol(message)),
+                Ok(Delivery::Event(_)) | Ok(Delivery::Stopped) => continue,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return Err(SessionError::Closed),
+            }
+        }
+    }
+
+    /// Reads the control features of the guest.
+    pub fn features(&self, deadline: Instant) -> Result<GuestFeatures, SessionError> {
+        let (kind, status, payload) = self.call(APP_FEATURES, &[], deadline)?;
+        if kind != APP_READY || status != 0 {
+            return Err(SessionError::Protocol(
+                "the guest agent returned an invalid features response".to_owned(),
+            ));
+        }
+        GuestFeatures::decode(&payload).map_err(|error| SessionError::Protocol(error.to_string()))
+    }
+
+    /// Hands the guest agent entries that continue its host mapping table at index `first`, and
+    /// waits until it has mounted them.
+    pub fn append_host_paths(
+        &self,
+        first: usize,
+        maps: &[HostMap],
+        deadline: Instant,
+    ) -> Result<(), SessionError> {
+        let payloads =
+            protocol::encode_maps_payloads_from(first, maps, OUTER_MAX_PAYLOAD - APP_HEADER_LEN)?;
+        for payload in payloads {
+            let (kind, status, reply) = self.call(APP_MAPS, &payload, deadline)?;
+            check_maps_reply(kind, status, &reply)?;
+        }
+        Ok(())
+    }
+
+    /// Asks the guest agent to unmount the host mapping at the absolute guest path `target`.
+    pub fn unmap_host_path(&self, target: &str, deadline: Instant) -> Result<(), SessionError> {
+        let (kind, status, reply) = self.call(APP_UNMAP, target.as_bytes(), deadline)?;
+        check_unmap_reply(kind, status, &reply)
+    }
+
+    /// Reads frames until the session ends, handing each to the execution that asked for it.
+    fn read_forever(self: Arc<Self>) {
+        loop {
+            let read = {
+                let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+                session.read_app(Some(Instant::now() + SHARED_READ_SLICE))
+            };
+            match read {
+                Ok((kind, request_id, status, payload)) => {
+                    if !self.deliver(kind, request_id, status, &payload) {
+                        break;
+                    }
+                }
+                Err(SessionError::TimedOut) => continue,
+                Err(error) => {
+                    // "the control session ended" is the phrase the sidecar recognises as a VM
+                    // that went away; keep it when the reader stops for any other reason.
+                    self.fail_all(format!("the control session ended: {error}"));
+                    break;
+                }
+            }
+        }
+        self.running.store(false, Ordering::Release);
+        self.fail_all("the control session ended".to_owned());
+    }
+
+    /// Hands one frame to the execution whose request id it repeats.
+    ///
+    /// Returns false when the frame makes the stream unusable, which ends every execution.
+    fn deliver(&self, kind: u8, request_id: u64, status: i32, payload: &[u8]) -> bool {
+        let delivery = match kind {
+            APP_STDOUT => Delivery::Event(ExecEvent::Stdout(payload.to_vec())),
+            APP_STDERR => Delivery::Event(ExecEvent::Stderr(payload.to_vec())),
+            APP_EXIT => match ExitCategory::parse(payload) {
+                Ok(category) => Delivery::Event(ExecEvent::Exit { category, status }),
+                Err(error) => {
+                    self.fail_all(format!("the guest returned an invalid exit category: {error}"));
+                    return false;
+                }
+            },
+            APP_ERROR => Delivery::Rejected {
+                status,
+                category: String::from_utf8_lossy(payload).chars().take(64).collect(),
+            },
+            APP_READY => Delivery::Reply {
+                kind,
+                status,
+                payload: payload.to_vec(),
+            },
+            APP_STOPPED => Delivery::Stopped,
+            _ => {
+                self.fail_all("the guest returned an invalid exec response".to_owned());
+                return false;
+            }
+        };
+        let completes = matches!(
+            delivery,
+            Delivery::Stopped
+                | Delivery::Reply { .. }
+                | Delivery::Rejected { .. }
+                | Delivery::Event(ExecEvent::Exit { .. } | ExecEvent::Rejected { .. })
+        );
+        let sender = {
+            let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+            if completes {
+                waiters.remove(&request_id)
+            } else {
+                waiters.get(&request_id).cloned()
+            }
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(delivery);
+        }
+        true
+    }
+
+    /// Ends every waiting execution with the same reason.
+    fn fail_all(&self, message: String) {
+        let waiters: Vec<Sender<Delivery>> = {
+            let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+            waiters.drain().map(|(_, sender)| sender).collect()
+        };
+        for sender in waiters {
+            let _ = sender.send(Delivery::Failed(message.clone()));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -658,6 +1041,7 @@ mod tests {
             timeout_ms: 1000,
             cwd: None,
             environment: WorkloadEnvironment::Default,
+            limits: crate::protocol::ExecLimits::default(),
         };
         let request_id = session.start_exec(&workload, deadline()).unwrap();
         let records = host_records(&output.lock().unwrap());
@@ -717,6 +1101,7 @@ mod tests {
             timeout_ms: 0,
             cwd: Some("/work"),
             environment: WorkloadEnvironment::Default,
+            limits: crate::protocol::ExecLimits::default(),
         };
         let request_id = session.start_exec(&workload, deadline()).unwrap();
         let records = host_records(&output.lock().unwrap());
@@ -910,5 +1295,115 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(error, SessionError::TimedOut));
+    }
+
+    /// Builds a shared session over a scripted transport, without its reader thread, so a test can
+    /// hand frames to it in a known order.
+    fn shared_over_ready(records: &[Vec<u8>]) -> (SharedSession, Arc<Mutex<Vec<u8>>>) {
+        let (transport, written) = scripted(records);
+        let session = ControlSession::attach(transport, &[1; CAPABILITY_LEN], deadline()).unwrap();
+        (
+            SharedSession {
+                session: Mutex::new(session),
+                waiters: Mutex::new(HashMap::new()),
+                running: AtomicBool::new(true),
+            },
+            written,
+        )
+    }
+
+    fn true_workload() -> Workload<'static> {
+        Workload {
+            argv: vec!["/bin/true".to_owned()],
+            timeout_ms: 0,
+            cwd: None,
+            environment: crate::protocol::WorkloadEnvironment::Default,
+            limits: crate::protocol::ExecLimits::default(),
+        }
+    }
+
+    /// One session carries several executions: each frame reaches the execution whose request id
+    /// it repeats, and a terminal frame stops that execution from receiving anything else.
+    #[test]
+    fn a_shared_session_routes_events_by_request_id() {
+        let (shared, _written) = shared_over_ready(&[outer(OUTER_READY, 1, 0, &[])]);
+        let (first, first_events) = shared.start_exec(&true_workload(), deadline()).unwrap();
+        let (second, second_events) = shared.start_exec(&true_workload(), deadline()).unwrap();
+        assert_ne!(first, second);
+
+        // Interleaved output, then the two executions end in the opposite order.
+        assert!(shared.deliver(APP_STDOUT, second, 0, b"two"));
+        assert!(shared.deliver(APP_STDOUT, first, 0, b"one"));
+        assert!(shared.deliver(APP_EXIT, second, 0, b"exit"));
+        assert!(shared.deliver(APP_EXIT, first, 0, b"exit"));
+        // A frame for an execution that has ended is dropped, not delivered twice.
+        assert!(shared.deliver(APP_STDOUT, first, 0, b"late"));
+
+        let collected = |events: Receiver<Delivery>| -> Vec<ExecEvent> {
+            events
+                .into_iter()
+                .map(|delivery| match delivery {
+                    Delivery::Event(event) => event,
+                    other => panic!("unexpected delivery: {}", matches!(other, Delivery::Stopped)),
+                })
+                .collect()
+        };
+        assert_eq!(
+            collected(first_events),
+            vec![
+                ExecEvent::Stdout(b"one".to_vec()),
+                ExecEvent::Exit {
+                    category: ExitCategory::Exit,
+                    status: 0
+                },
+            ]
+        );
+        assert_eq!(
+            collected(second_events),
+            vec![
+                ExecEvent::Stdout(b"two".to_vec()),
+                ExecEvent::Exit {
+                    category: ExitCategory::Exit,
+                    status: 0
+                },
+            ]
+        );
+    }
+
+    /// A session whose reader has stopped must refuse a request at once: a request registered
+    /// after the reader drained its waiters would otherwise wait for its whole deadline and be
+    /// reported as a slow VM rather than a dead one.
+    #[test]
+    fn a_request_after_the_reader_stopped_fails_immediately() {
+        let (shared, _written) = shared_over_ready(&[outer(OUTER_READY, 1, 0, &[])]);
+        shared.running.store(false, Ordering::Release);
+
+        let started = Instant::now();
+        let error = shared
+            .start_exec(&true_workload(), Instant::now() + Duration::from_secs(30))
+            .err()
+            .expect("a dead session cannot start an execution");
+        assert!(matches!(error, SessionError::Closed), "got {error:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the request waited for its deadline instead of failing"
+        );
+    }
+
+    /// A session that ends fails every execution that is still waiting on it.
+    #[test]
+    fn a_shared_session_fails_every_waiting_execution() {
+        let (shared, _written) = shared_over_ready(&[outer(OUTER_READY, 1, 0, &[])]);
+        let (_first, first_events) = shared.start_exec(&true_workload(), deadline()).unwrap();
+        let (_second, second_events) = shared.start_exec(&true_workload(), deadline()).unwrap();
+
+        shared.fail_all("the VM went away".to_owned());
+
+        for events in [first_events, second_events] {
+            match events.into_iter().next() {
+                Some(Delivery::Failed(reason)) => assert!(reason.contains("went away")),
+                _ => panic!("a waiting execution must be told why it ended"),
+            }
+        }
     }
 }

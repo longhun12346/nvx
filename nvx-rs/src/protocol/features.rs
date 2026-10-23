@@ -40,6 +40,15 @@ impl GuestFeatures {
     /// table that `nvx_maps=` announced is mounted. Not in [`GuestFeatures::REQUIRED`]: only the
     /// live-share experiment needs it.
     pub const RUNTIME_MAPPINGS: Self = Self(1 << 7);
+    /// Serves several executions at once: each `EXEC` request keeps its own process, cgroup,
+    /// output stream and deadline, so cancelling or timing out one leaves the others running.
+    /// Not in [`GuestFeatures::REQUIRED`]: a host that starts only one execution at a time works
+    /// with an image that lacks it.
+    pub const EXEC_SLOTS: Self = Self(1 << 8);
+    /// Enforces the `memMb`, `cpuPercent` and `pidsMax` limits of an `EXEC` request on the
+    /// execution's own cgroup, and refuses an execution whose limit it cannot enforce. Not in
+    /// [`GuestFeatures::REQUIRED`]: a host that asks for no limits works without it.
+    pub const EXEC_LIMITS: Self = Self(1 << 9);
     /// The features that the host depends on.
     pub const REQUIRED: Self = Self(
         Self::CANCEL.0
@@ -50,14 +59,16 @@ impl GuestFeatures {
             | Self::HOST_MAPPING_TABLE.0,
     );
 
-    /// Human-readable names of every required feature, used in compatibility errors.
-    pub(crate) const NAMES: [(Self, &'static str); 6] = [
+    /// Human-readable names of every feature, used in compatibility errors.
+    pub(crate) const NAMES: [(Self, &'static str); 8] = [
         (Self::CANCEL, "cancellation"),
         (Self::WORKLOAD_ACCOUNT, "workload accounts"),
         (Self::EXEC_CGROUP, "workload containment"),
         (Self::EXEC_ENVIRONMENT, "per-execution environments"),
         (Self::EXEC_CWD, "working directories"),
         (Self::HOST_MAPPING_TABLE, "host path mapping tables"),
+        (Self::EXEC_SLOTS, "concurrent executions"),
+        (Self::EXEC_LIMITS, "per-execution resource limits"),
     ];
 
     /// Returns the features whose bits are set in `bits`.

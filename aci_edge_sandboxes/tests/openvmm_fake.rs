@@ -1994,27 +1994,6 @@ fn sandboxes_of_the_previous_state_format_are_refused() {
     assert!(error.message().contains("unsupported format"), "{error}");
 }
 
-#[test]
-fn concurrent_execs_are_serialized() {
-    let fixture = Fixture::new();
-    let nvx = fixture.nvx();
-    let sandbox_id = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
-    nvx.start(&sandbox_id).unwrap();
-    let slow = nvx
-        .exec(
-            &sandbox_id,
-            &ExecRequest::command_line("sleep 300; echo first"),
-        )
-        .unwrap();
-    let fast = nvx
-        .exec(&sandbox_id, &ExecRequest::command_line("echo second"))
-        .unwrap();
-    assert_eq!(slow.wait_with_output().unwrap().stdout, b"first\n");
-    assert_eq!(fast.wait_with_output().unwrap().stdout, b"second\n");
-    nvx.stop(&sandbox_id).unwrap();
-    nvx.deprovision(&sandbox_id).unwrap();
-}
-
 #[cfg(feature = "async")]
 #[test]
 fn dropped_async_execs_do_not_hold_the_sandbox() {
@@ -2031,7 +2010,7 @@ fn dropped_async_execs_do_not_hold_the_sandbox() {
     let sandbox_id = nvx.provision(&ProvisionRequest::new()).unwrap().sandbox_id;
     nvx.start(&sandbox_id).unwrap();
 
-    // The first execution holds the guest's only control slot, so the next one has to wait.
+    // The fake runs one workload at a time, so a second start stays pending behind the first.
     let first = nvx
         .exec(
             &sandbox_id,
@@ -2048,14 +2027,16 @@ fn dropped_async_execs_do_not_hold_the_sandbox() {
         )
         .await
     });
+    // The fake serves one workload at a time, so this start is still pending when the timeout
+    // expires; the client keeps the execution it was given and abandons it.
     assert!(
         abandoned.is_err(),
-        "the exec must wait for the control slot"
+        "the second start must still be pending when the timeout expires"
     );
     assert_eq!(first.wait_with_output().unwrap().stdout, b"first\n");
 
-    // The abandoned workload starts once the slot is free. It must be cancelled at once, or it
-    // would keep every later execution waiting for the slot until control_timeout fails it.
+    // The abandoned workload starts once the running one finishes. It must be cancelled at once,
+    // or it would keep every later execution waiting behind it until control_timeout fails it.
     let deadline = Instant::now() + Duration::from_secs(10);
     while run(&nvx, &sandbox_id, "read abandoned").stdout != b"started" {
         assert!(

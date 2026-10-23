@@ -24,6 +24,7 @@ use aci_edge_sandboxes::AciEdgeSandbox;
 use aci_edge_sandboxes::nvx::Hypervisor;
 use aci_edge_sandboxes::nvx::host::artifacts::Artifacts;
 use aci_edge_sandboxes::openvmm::{OpenVmmBackend, OpenVmmConfig};
+use aci_edge_sandboxes::nvx::protocol::{MAX_EXEC_CPU_PERCENT, MAX_EXEC_MEMORY_MIB, MAX_EXEC_PIDS};
 use serde_json::{Value, json};
 
 use control::Queue;
@@ -39,6 +40,10 @@ const CONTROL_CAPACITY: usize = 16;
 /// each other; work is queued per VM anyway, so a third worker would add nothing.
 const CONTROL_WORKERS: usize = 2;
 const DEFAULT_WORK_WORKERS: usize = 2;
+/// Executions the guest agent can supervise at once (`MAX_EXEC_SLOTS` in
+/// `guest/common/nvx-managed-agent.c`). Asking for more would have the guest refuse the surplus
+/// with `busy` instead of admitting them, so the sidecar refuses the configuration outright.
+const MAX_RUNNING: usize = 8;
 
 struct Args {
     /// A checkout whose conventional layout names the artifacts; development only.
@@ -65,6 +70,12 @@ struct Args {
     max_sessions: usize,
     /// How many executions may wait for the VM's single run slot.
     max_queue: usize,
+    /// How many executions the VM may run at once.
+    ///
+    /// One keeps the serial behaviour of every earlier release. More is only honoured by a guest
+    /// image that advertises concurrent executions, and the sidecar refuses to boot a VM whose
+    /// image does not when this is above one.
+    max_running: usize,
     /// Requests that may wait for a worker before the caller is refused.
     max_pending: usize,
     /// Workers that run the slow requests (open a session, start an execution).
@@ -72,6 +83,14 @@ struct Args {
     /// Frames that may wait for the caller to read them. Bounded on purpose: a caller that
     /// stops reading must cost a fixed amount of memory, not an unbounded backlog.
     outbound_capacity: usize,
+    /// Resource limits applied to every execution: memory in MiB, CPU in hundredths of a core,
+    /// and the largest number of tasks. Zero asks for no limit in that dimension.
+    ///
+    /// They exist so a deployment can bound executions without trusting each individual request;
+    /// a guest that cannot enforce one refuses the execution instead of running it unlimited.
+    exec_memory_mb: u32,
+    exec_cpu_percent: u32,
+    exec_pids: u32,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -87,9 +106,13 @@ fn parse_args() -> Result<Args, String> {
         session_ttl_secs: 0,
         max_sessions: 0,
         max_queue: crate::registry::DEFAULT_QUEUE_DEPTH,
+        max_running: 1,
         max_pending: DEFAULT_MAX_PENDING,
         work_workers: DEFAULT_WORK_WORKERS,
         outbound_capacity: outbound::DEFAULT_CAPACITY,
+        exec_memory_mb: 0,
+        exec_cpu_percent: 0,
+        exec_pids: 0,
     };
     let mut input = std::env::args().skip(1);
     while let Some(flag) = input.next() {
@@ -113,6 +136,18 @@ fn parse_args() -> Result<Args, String> {
             "--max-queue" => {
                 args.max_queue = value()?.parse().map_err(|e| format!("{e}"))?
             }
+            "--max-running" => {
+                args.max_running = value()?.parse().map_err(|e| format!("{e}"))?
+            }
+            "--exec-memory-mb" => {
+                args.exec_memory_mb = value()?.parse().map_err(|e| format!("{e}"))?
+            }
+            "--exec-cpu-percent" => {
+                args.exec_cpu_percent = value()?.parse().map_err(|e| format!("{e}"))?
+            }
+            "--exec-pids" => {
+                args.exec_pids = value()?.parse().map_err(|e| format!("{e}"))?
+            }
             "--max-pending" => {
                 args.max_pending = value()?.parse().map_err(|e| format!("{e}"))?
             }
@@ -130,6 +165,28 @@ fn parse_args() -> Result<Args, String> {
             }
             other => return Err(format!("unexpected argument {other}")),
         }
+    }
+    // The values are handed to the guest, which refuses an execution whose limit it cannot
+    // enforce; a value outside the agreed range is a configuration mistake, so it fails here
+    // rather than as a refusal on every execution.
+    if args.max_running == 0 || args.max_running > MAX_RUNNING {
+        return Err(format!(
+            "--max-running must be within 1..={MAX_RUNNING}; the guest agent supervises that many \
+             executions"
+        ));
+    }
+    if args.exec_memory_mb > MAX_EXEC_MEMORY_MIB {
+        return Err(format!(
+            "--exec-memory-mb must be at most {MAX_EXEC_MEMORY_MIB}"
+        ));
+    }
+    if args.exec_cpu_percent > MAX_EXEC_CPU_PERCENT {
+        return Err(format!(
+            "--exec-cpu-percent must be at most {MAX_EXEC_CPU_PERCENT}"
+        ));
+    }
+    if args.exec_pids > MAX_EXEC_PIDS {
+        return Err(format!("--exec-pids must be at most {MAX_EXEC_PIDS}"));
     }
     Ok(args)
 }
@@ -183,6 +240,12 @@ fn run() -> Result<(), String> {
         "sessionTtlSecs": args.session_ttl_secs,
         "maxSessions": args.max_sessions,
         "maxQueue": args.max_queue,
+        "maxRunning": args.max_running,
+        "execLimits": {
+            "memMb": args.exec_memory_mb,
+            "cpuPercent": args.exec_cpu_percent,
+            "pidsMax": args.exec_pids,
+        },
         "maxPending": args.max_pending,
         "workWorkers": args.work_workers,
         "outboundCapacity": args.outbound_capacity,
@@ -196,6 +259,11 @@ fn run() -> Result<(), String> {
     let mut config =
         OpenVmmConfig::from_artifacts(artifacts, hypervisor, args.state_dir.join("state"));
     config.cpu_profile = cpu_profile;
+    config.exec_limits = aci_edge_sandboxes::nvx::protocol::ExecLimits {
+        mem_mb: args.exec_memory_mb,
+        cpu_percent: args.exec_cpu_percent,
+        pids_max: args.exec_pids,
+    };
     let backend = Arc::new(OpenVmmBackend::new(config).map_err(|e| e.to_string())?);
     let client = AciEdgeSandbox::from_shared(backend.clone());
     // One bounded outbound path for every reply, event and chunk of output.
@@ -211,6 +279,7 @@ fn run() -> Result<(), String> {
         Arc::clone(&writer),
         args.max_queue,
         args.max_sessions,
+        args.max_running,
         state_dir.join("export-anchor"),
     ));
 

@@ -10743,7 +10743,7 @@ class ManagedAgentCgroupTests(unittest.TestCase):
         (self.cgroup / "cgroup.procs").touch()
         self.subtree_control = self.cgroup / "cgroup.subtree_control"
         self.subtree_control.touch()
-        self.execution = self.cgroup / "nvx-exec"
+        self.execution = self.cgroup / "nvx-exec-42"
         self.execution.mkdir()
         self.tasks = self.execution / "pids.current"
         self.tasks.write_bytes(b"0\n")
@@ -10769,7 +10769,7 @@ static pid_t harness_waitpid(pid_t pid, int *status, int options)
     pid_t result = waitpid(pid, status, options);
 
     if (result > 0 && result == harness_process) {{
-        int fd = open(EXEC_CGROUP "/pids.current", O_WRONLY | O_TRUNC | O_CLOEXEC);
+        int fd = open(CGROUP_ROOT "/nvx-exec-42/pids.current", O_WRONLY | O_TRUNC | O_CLOEXEC);
 
         if (fd < 0 || write(fd, "0\\n", 2) != 2 || close(fd) != 0) {{
             _exit(3);
@@ -10812,33 +10812,72 @@ static int with_exiting_process(int (*check)(void), int exited)
     return result;
 }}
 
+static struct exec_slot harness_slots[1];
+
+/* The slot of one execution, with the leaf the agent would have created for it. */
+static struct exec_slot *harness_slot(uint64_t request_id)
+{{
+    struct exec_slot *slot = &harness_slots[0];
+
+    memset(slot, 0, sizeof(*slot));
+    slot->flags = SLOT_USED;
+    slot->request_id = request_id;
+    slot->stdout_fd = -1;
+    slot->stderr_fd = -1;
+    slot->launch_fd = -1;
+    slot->child = harness_process;
+    snprintf(slot->cgroup, sizeof(slot->cgroup), CGROUP_ROOT "/nvx-exec-%llu",
+        (unsigned long long)request_id);
+    slot->cgroup_ready = 1;
+    return slot;
+}}
+
+static int settle_check(void)
+{{
+    /* The agent bounds one settle pass and comes back; the test runs it to completion. */
+    struct exec_slot *slot = harness_slot(42);
+    int result;
+
+    do {{
+        result = settle_cgroup(slot->cgroup, harness_slots, 1, &slot->settle_attempts);
+    }} while (result > 0);
+    return result;
+}}
+
+static int reap_check(void)
+{{
+    (void)harness_slot(42);
+    reap_children(harness_slots, 1);
+    return (harness_slots[0].flags & SLOT_EXITED) != 0 ? 0 : 1;
+}}
+
 int main(int argc, char **argv)
 {{
+    struct exec_slot *slot;
     int result;
+
     if (argc != 2) {{
         return 2;
     }}
+    memset(harness_slots, 0, sizeof(harness_slots));
     errno = 0;
-    if (strcmp(argv[1], "retry") == 0) {{
-        struct control_session session = {{.fd = STDOUT_FILENO}};
-        struct agent_config config = {{.direct = 1}};
-        struct exec_config exec_config = {{0}};
-        char *command[] = {{"/bin/true", NULL}};
-        result = run_exec(&session, &config, 42, 0, command, &exec_config);
-        return result == 0
-                   ? run_exec(&session, &config, 43, 0, command, &exec_config)
-                   : result;
-    }}
     if (strcmp(argv[1], "tasks") == 0) {{
-        result = exec_cgroup_has_tasks();
+        result = cgroup_has_tasks(harness_slot(42)->cgroup);
     }} else if (strcmp(argv[1], "prepare") == 0) {{
-        result = prepare_exec_cgroup();
+        result = prepare_cgroup_root(0, 0);
+    }} else if (strcmp(argv[1], "prepare-limits") == 0) {{
+        result = prepare_cgroup_root(1, 1);
     }} else if (strcmp(argv[1], "settle") == 0) {{
-        result = settle_exec_cgroup();
+        result = settle_check();
     }} else if (strcmp(argv[1], "settle-reap") == 0) {{
-        result = with_exiting_process(settle_exec_cgroup, 0);
-    }} else if (strcmp(argv[1], "verify-reap") == 0) {{
-        result = with_exiting_process(reap_exec_cgroup, 1);
+        result = with_exiting_process(settle_check, 0);
+    }} else if (strcmp(argv[1], "reap") == 0) {{
+        result = with_exiting_process(reap_check, 1);
+    }} else if (strcmp(argv[1], "limits") == 0) {{
+        /* Applies the limits of one execution and lets the test read the files
+         * the agent wrote; a plain directory records them the same way. */
+        slot = harness_slot(43);
+        result = create_slot_cgroup(slot, 64, 50, 8);
     }} else {{
         return 2;
     }}
@@ -10875,30 +10914,6 @@ int main(int argc, char **argv)
         value, status = result.stdout.split()
         return int(value), int(status)
 
-    def _assert_further_exec_refused(self):
-        result = subprocess.run(
-            [str(self.helper), "retry"],
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        frames = result.stdout
-        for expected_id in (42, 43):
-            outer = ManagedAgentStopTests.OUTER
-            app = ManagedAgentStopTests.APP
-            *_, length = outer.unpack(frames[: outer.size])
-            frame = frames[outer.size : outer.size + length]
-            _, _, kind, _, request_id, status, payload_len = app.unpack(
-                frame[: app.size]
-            )
-            payload = frame[app.size :]
-            self.assertEqual((kind, request_id, status), (0xFF, expected_id, 125))
-            self.assertEqual(payload_len, len(payload))
-            self.assertEqual(payload, b"containment-failed")
-            frames = frames[outer.size + length :]
-        self.assertEqual(frames, b"")
-
     def test_task_count_requires_a_canonical_decimal(self):
         for contents, expected in (
             (b"0\n", 0),
@@ -10932,17 +10947,20 @@ int main(int argc, char **argv)
     def test_missing_and_unreadable_task_counts_are_errors(self):
         self.tasks.unlink()
         self.assertEqual(self._check("tasks"), (-1, errno.ENOENT))
-        self._assert_further_exec_refused()
         self.tasks.mkdir()
         self.assertEqual(self._check("tasks"), (-1, errno.EISDIR))
-        self._assert_further_exec_refused()
 
-    def test_preparation_enables_the_pids_controller_once(self):
-        self.assertEqual(self._check("prepare")[0], 0)
-        self.assertEqual(self.subtree_control.read_bytes(), b"")
-        self.tasks.unlink()
+    def test_preparation_enables_the_controllers_a_request_needs(self):
+        # Every execution needs the pids controller: it is what proves the
+        # execution has finished. Memory and cpu are enabled only when a limit
+        # asks for them, so a guest that offers neither still runs executions.
         self.assertEqual(self._check("prepare")[0], 0)
         self.assertEqual(self.subtree_control.read_bytes(), b"+pids")
+        # A fresh hierarchy for the second phase: the writes are idempotent, so
+        # keeping the first phase's bytes would only repeat them.
+        self.subtree_control.write_bytes(b"")
+        self.assertEqual(self._check("prepare-limits")[0], 0)
+        self.assertEqual(self.subtree_control.read_bytes(), b"+pids+memory+cpu")
         self.subtree_control.unlink()
         self.assertEqual(self._check("prepare"), (-1, errno.ENOENT))
 
@@ -10950,22 +10968,25 @@ int main(int argc, char **argv)
         self.assertEqual(self._check("settle")[0], 0)
         self.assertEqual((self.execution / "cgroup.kill").read_bytes(), b"1")
 
-    def test_settlement_and_verification_reap_what_the_workload_left(self):
-        for mode in ("settle-reap", "verify-reap"):
+    def test_settlement_and_reaping_clear_what_the_workload_left(self):
+        for mode in ("settle-reap", "reap"):
             with self.subTest(mode=mode):
                 self.tasks.write_bytes(b"1\n")
                 self.assertEqual(self._check(mode)[0], 0)
                 self.assertEqual(self.tasks.read_bytes(), b"0\n")
 
-    def test_settlement_does_not_hide_kill_or_verification_failures(self):
+    def test_settlement_does_not_hide_kill_failures(self):
         self.tasks.write_bytes(b"1\n")
-        (self.execution / "cgroup.kill").unlink()
-        self.assertEqual(self._check("settle"), (-1, errno.ENOENT))
-        self._assert_further_exec_refused()
-        (self.execution / "cgroup.kill").touch()
+        kill = self.execution / "cgroup.kill"
+        # A directory cannot be written even with O_CREAT, which is how the
+        # agent creates a leaf's files when they are not there yet.
+        kill.unlink()
+        kill.mkdir()
+        self.assertEqual(self._check("settle"), (-1, errno.EISDIR))
+        kill.rmdir()
+        kill.touch()
         self.tasks.unlink()
         self.assertEqual(self._check("settle"), (-1, errno.ENOENT))
-        self._assert_further_exec_refused()
 
     def test_unreaped_tasks_at_deadline_are_not_settled(self):
         # cgroup.events no longer counts a killed process that awaits its
@@ -10975,15 +10996,23 @@ int main(int argc, char **argv)
         started = time.monotonic()
         self.assertEqual(self._check("settle"), (-1, errno.ETIMEDOUT))
         self.assertGreaterEqual(time.monotonic() - started, 1.9)
-        self._assert_further_exec_refused()
 
-    def test_malformed_task_count_refuses_further_exec_until_verified_empty(self):
+    def test_a_malformed_task_count_fails_settlement(self):
         self.tasks.write_bytes(b"max\n")
         self.assertEqual(self._check("settle"), (-1, errno.EPROTO))
-        self._assert_further_exec_refused()
         self.tasks.write_bytes(b"0\n")
         self.assertEqual(self._check("tasks")[0], 0)
         self.assertEqual(self._check("settle")[0], 0)
+
+    def test_per_execution_limits_are_applied_to_the_leaf(self):
+        # 64 MiB of memory, half a core, and eight tasks: the guest writes what
+        # the caller asked for, converted to the units cgroupfs uses.
+        self.assertEqual(self._check("limits")[0], 0)
+        leaf = self.cgroup / "nvx-exec-43"
+        self.assertEqual((leaf / "memory.max").read_bytes(), b"67108864")
+        self.assertEqual((leaf / "memory.oom.group").read_bytes(), b"1")
+        self.assertEqual((leaf / "cpu.max").read_bytes(), b"50000 100000")
+        self.assertEqual((leaf / "pids.max").read_bytes(), b"8")
 
 
 def _elf_file(
@@ -11362,11 +11391,12 @@ class ManagedAgentStopTests(unittest.TestCase):
     def test_agent_advertises_the_control_features_of_its_mode(self):
         cancel, workload_account, exec_cgroup, environment = (1, 4, 8, 16)
         exec_cwd, host_mapping_table, runtime_mappings = (32, 64, 128)
+        exec_slots, exec_limits = (256, 512)
         for rootfs, expected in (
             # Only the direct agent maps host paths (also after readiness), gives each
-            # workload a cgroup, and refuses a working directory that the workload cannot
-            # enter. Bit 1, which
-            # announced nvx_map= kernel tokens, is retired.
+            # workload a cgroup, refuses a working directory that the workload cannot
+            # enter, serves several executions at once, and enforces their per-execution
+            # limits. Bit 1, which announced nvx_map= kernel tokens, is retired.
             (
                 "-",
                 cancel
@@ -11375,7 +11405,9 @@ class ManagedAgentStopTests(unittest.TestCase):
                 | environment
                 | exec_cwd
                 | host_mapping_table
-                | runtime_mappings,
+                | runtime_mappings
+                | exec_slots
+                | exec_limits,
             ),
             ("/run/nvx/rootfs", cancel | workload_account | environment),
         ):
@@ -11464,11 +11496,13 @@ class ManagedAgentWorkingDirectoryTests(unittest.TestCase):
         # PWD and /bin/pwd -P agree only for a physical path.
         self.root = Path(temporary.name).resolve()
         cgroup = self.root / "cgroup"
-        execution = cgroup / "nvx-exec"
+        # The leaf of the one execution this harness runs (request id 42), with the
+        # file cgroupfs creates for a new leaf. The agent creates the other files it
+        # writes on demand, so a plain directory can stand in for the hierarchy.
+        execution = cgroup / "nvx-exec-42"
         execution.mkdir(parents=True)
         (cgroup / "cgroup.procs").touch()
-        (execution / "cgroup.procs").touch()
-        (execution / "cgroup.kill").touch()
+        (cgroup / "cgroup.subtree_control").touch()
         (execution / "pids.current").write_text("0\n")
         tools = self.root / "bin"
         tools.mkdir()
@@ -11496,6 +11530,7 @@ class ManagedAgentWorkingDirectoryTests(unittest.TestCase):
         source = self.root / "working-directory-test.c"
         source.write_text(
             f"""#define _GNU_SOURCE
+#include <stdint.h>
 #include <stdlib.h>
 int harness_setenv(const char *name, const char *value, int overwrite);
 #define setenv(name, value, overwrite) harness_setenv(name, value, overwrite)
@@ -11506,6 +11541,71 @@ int harness_setenv(const char *name, const char *value, int overwrite);
 #define main managed_agent_main
 #include {json.dumps(str(self.SOURCE))}
 #undef main
+
+/* Runs one execution to completion, as the agent's scheduler would. */
+static int run_one(struct control_session *session, const struct agent_config *config,
+    char **command, struct exec_config *exec_config)
+{{
+    static struct exec_slot slots[MAX_EXEC_SLOTS];
+    struct exec_slot *slot = &slots[0];
+    size_t index;
+
+    memset(slots, 0, sizeof(slots));
+    for (index = 0; index < MAX_EXEC_SLOTS; ++index) {{
+        slots[index].stdout_fd = -1;
+        slots[index].stderr_fd = -1;
+        slots[index].launch_fd = -1;
+    }}
+    if (start_slot(session, config, slot, 42, 0, command, exec_config) != 0) {{
+        return 1;
+    }}
+    while ((slot->flags & SLOT_USED) != 0) {{
+        struct pollfd descriptors[2];
+        int ready;
+        int chunk;
+
+        descriptors[0].fd =
+            (slot->flags & SLOT_STDOUT_OPEN) != 0 ? slot->stdout_fd : -1;
+        descriptors[0].events = POLLIN | POLLHUP;
+        descriptors[0].revents = 0;
+        descriptors[1].fd =
+            (slot->flags & SLOT_STDERR_OPEN) != 0 ? slot->stderr_fd : -1;
+        descriptors[1].events = POLLIN | POLLHUP;
+        descriptors[1].revents = 0;
+        ready = poll(descriptors, 2, 25);
+        if (ready < 0 && errno != EINTR) {{
+            return 1;
+        }}
+        if (descriptors[0].revents != 0) {{
+            chunk = stream_output(session, slot->request_id, slot->stdout_fd,
+                APP_STDOUT, &slot->output_bytes);
+            if (chunk == 1) {{
+                close(slot->stdout_fd);
+                slot->stdout_fd = -1;
+                slot->flags &= ~SLOT_STDOUT_OPEN;
+            }} else if (chunk < 0) {{
+                terminate_slot(config, slot);
+            }}
+        }}
+        if (descriptors[1].revents != 0) {{
+            chunk = stream_output(session, slot->request_id, slot->stderr_fd,
+                APP_STDERR, &slot->output_bytes);
+            if (chunk == 1) {{
+                close(slot->stderr_fd);
+                slot->stderr_fd = -1;
+                slot->flags &= ~SLOT_STDERR_OPEN;
+            }} else if (chunk < 0) {{
+                terminate_slot(config, slot);
+            }}
+        }}
+        reap_children(slots, MAX_EXEC_SLOTS);
+        if ((slot->flags & (SLOT_EXITED | SLOT_STDOUT_OPEN | SLOT_STDERR_OPEN)) ==
+            SLOT_EXITED) {{
+            return finish_slot(session, config, slots, MAX_EXEC_SLOTS, slot) == 0 ? 0 : 1;
+        }}
+    }}
+    return 0;
+}}
 
 int harness_setenv(const char *name, const char *value, int overwrite)
 {{
@@ -11553,21 +11653,42 @@ int main(int argc, char **argv)
         .user = "nobody",
         .home = "/",
     }};
-    char *environment[] = {{getenv("HARNESS_ENVIRONMENT"), NULL}};
-    struct exec_config exec_config = {{
-        .cwd = argc == 3 ? argv[2] : NULL,
-        .environment = environment[0] == NULL ? NULL : environment,
-        .environment_count = environment[0] == NULL ? 0 : 1,
-        .environment_present = environment[0] != NULL,
-        .inherit_default_env =
-            environment[0] != NULL && getenv("HARNESS_LAYER_ENVIRONMENT") != NULL,
-    }};
-    char *command[] = {{"/bin/sh", "-c", argv[1], NULL}};
+    /* The agent releases what it is given, exactly as it releases a decoded
+     * request: every string has to be its own allocation. */
+    char *environment_entry = getenv("HARNESS_ENVIRONMENT");
+    char **environment = NULL;
+    struct exec_config exec_config = {{0}};
+    char **command = calloc(4, sizeof(*command));
+
+    if (command == NULL) {{
+        return 1;
+    }}
+    command[0] = strdup("/bin/sh");
+    command[1] = strdup("-c");
+    command[2] = strdup(argc >= 2 ? argv[1] : "");
+    if (command[0] == NULL || command[1] == NULL || command[2] == NULL) {{
+        return 1;
+    }}
+    exec_config.cwd = argc == 3 ? strdup(argv[2]) : NULL;
+    if (environment_entry != NULL) {{
+        environment = calloc(2, sizeof(*environment));
+        if (environment == NULL) {{
+            return 1;
+        }}
+        environment[0] = strdup(environment_entry);
+        if (environment[0] == NULL) {{
+            return 1;
+        }}
+        exec_config.environment = environment;
+        exec_config.environment_count = 1;
+        exec_config.environment_present = 1;
+        exec_config.inherit_default_env = getenv("HARNESS_LAYER_ENVIRONMENT") != NULL;
+    }}
 
     if (argc != 2 && argc != 3) {{
         return 2;
     }}
-    return run_exec(&session, &config, 42, 0, command, &exec_config) == 0 ? 0 : 1;
+    return run_one(&session, &config, command, &exec_config);
 }}
 """,
             encoding="utf-8",

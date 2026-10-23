@@ -738,7 +738,9 @@ def main():
                 raise RuntimeError(f"the VM was replaced by closing A: {final.get('vm')}")
             if vm.get("runtimeId") != opened_a["runtimeId"]:
                 raise RuntimeError(f"the VM changed identity: {final.get('vm')}")
-            if final.get("queued") != 0 or final.get("running") is not None:
+            # `running` is a list now that a VM can run several executions at once: an empty list
+            # means idle, and a null from an older sidecar counts the same.
+            if final.get("queued") != 0 or final.get("running"):
                 raise RuntimeError(f"the VM is not idle after the work finished: {final}")
             idle_sessions = sum(
                 1 for entry in sessions if not entry.get("busy") and entry.get("execs") == 0

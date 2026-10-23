@@ -34,11 +34,28 @@ pub const REASON_HANDLE_UNKNOWN: &str = "E_BACKEND_HANDLE_UNKNOWN";
 
 use serde_json::Value;
 
+/// Guest RAM accepted per session.
+///
+/// The floor is measured, not chosen for looks. The guest rootfs is a RAM initramfs of
+/// ~253 MiB uncompressed, so everything above it (kernel, agent, the shipped runtimes) has
+/// to fit in what is left. On the reference machine: at 640 MiB the guest boots but Node
+/// aborts in V8 startup, 672 MiB is the first size where Python and Node both run, and at
+/// or below 576 MiB the guest never reaches the control channel and the failure surfaces
+/// only as an opaque 60 s timeout. The floor stays at the validated 1024 MiB baseline so a
+/// caller can raise the size for heavier work without lowering it into that band.
+///
+/// The ceiling matches the instance budget the host reserves by default, so one session can
+/// never ask for more guest RAM than the host is willing to hold.
+pub const MIN_MEMORY_MIB: u64 = 1024;
+pub const MAX_MEMORY_MIB: u64 = 4096;
+
 pub fn validate_memory(memory_mib: u64) -> Result<(), (&'static str, String)> {
-    if memory_mib != DEFAULT_MEMORY_MIB {
+    if !(MIN_MEMORY_MIB..=MAX_MEMORY_MIB).contains(&memory_mib) {
         return Err((
             REASON_MEMORY_UNSUPPORTED,
-            format!("NVX v1 requires exactly {DEFAULT_MEMORY_MIB} MiB per session"),
+            format!(
+                "memoryMiB must be within {MIN_MEMORY_MIB}..={MAX_MEMORY_MIB}, got {memory_mib}"
+            ),
         ));
     }
     Ok(())
@@ -114,6 +131,19 @@ mod tests {
         assert!(validate_memory(DEFAULT_MEMORY_MIB).is_ok());
         let error = validate_memory(768).unwrap_err();
         assert_eq!(error.0, REASON_MEMORY_UNSUPPORTED);
+    }
+
+    /// The range is a correctness boundary, not a suggestion: a size below the floor boots
+    /// nothing (or boots and then kills the runtimes), so it must be refused up front.
+    #[test]
+    fn only_sizes_inside_the_supported_range_are_accepted() {
+        for mib in [MIN_MEMORY_MIB, DEFAULT_MEMORY_MIB, 2048, MAX_MEMORY_MIB] {
+            assert!(validate_memory(mib).is_ok(), "{mib} MiB should be accepted");
+        }
+        for mib in [0, 512, MIN_MEMORY_MIB - 1, MAX_MEMORY_MIB + 1] {
+            let error = validate_memory(mib).unwrap_err();
+            assert_eq!(error.0, REASON_MEMORY_UNSUPPORTED, "{mib} MiB should be refused");
+        }
     }
 
     #[test]

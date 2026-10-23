@@ -32,6 +32,9 @@ pub const REASON_CPU_LIMIT_UNSUPPORTED: &str = "E_NVX_CPU_LIMIT_UNSUPPORTED";
 pub const REASON_MEMORY_UNSUPPORTED: &str = "E_NVX_MEMORY_UNSUPPORTED";
 pub const REASON_STDIN_UNSUPPORTED: &str = "E_NVX_STDIN_UNSUPPORTED";
 pub const REASON_INVALID_LIMIT: &str = "E_NVX_INVALID_LIMIT";
+/// The guest image cannot enforce per-execution limits, so an execution that asks for one is
+/// refused instead of running without the limit the caller asked for.
+pub const REASON_GUEST_NO_LIMITS: &str = "E_NVX_GUEST_NO_LIMITS";
 pub const REASON_BACKEND_UNAVAILABLE: &str = "E_BACKEND_UNAVAILABLE";
 pub const REASON_BACKEND_BUSY: &str = "E_BACKEND_BUSY";
 pub const REASON_SESSION_UNKNOWN: &str = "E_BACKEND_SESSION_UNKNOWN";
@@ -50,7 +53,85 @@ pub const REASON_GENERATION_STALE: &str = "E_BACKEND_GENERATION_STALE";
 /// anything was registered, so the caller may retry once the backlog drains.
 pub const REASON_OVERLOAD: &str = "E_BACKEND_OVERLOAD";
 
+use aci_edge_sandboxes::nvx::protocol::{ExecLimits, MAX_EXEC_CPU_PERCENT, MAX_EXEC_MEMORY_MIB};
 use serde_json::Value;
+
+/// Validates a request-level `limits` object.
+///
+/// `memMb` and `cpuPercent` are accepted up to what the guest agent can enforce: the guest
+/// writes them into the execution's own cgroup and refuses an execution whose limit it cannot
+/// apply, so an out-of-range request is refused here instead of becoming a silent no-op.
+/// Zero keeps its v1 meaning: "inherit the deployment default, no extra limit from this field".
+pub fn validate_limits(limits: &serde_json::Map<String, Value>) -> Result<(), (&'static str, String)> {
+    for key in limits.keys() {
+        if key != "memMb" && key != "cpuPercent" && key != "hardTimeoutSec" {
+            return Err((REASON_INVALID_LIMIT, format!("unknown limits field {key}")));
+        }
+    }
+    if let Some(value) = limits.get("memMb") {
+        let memory = unsigned_number(Some(value)).ok_or((
+            REASON_INVALID_LIMIT,
+            "memMb must be an unsigned integer".to_owned(),
+        ))?;
+        if memory > u64::from(MAX_EXEC_MEMORY_MIB) {
+            return Err((
+                REASON_INVALID_LIMIT,
+                format!("memMb must be at most {MAX_EXEC_MEMORY_MIB}"),
+            ));
+        }
+    }
+    if let Some(value) = limits.get("cpuPercent") {
+        let cpu = unsigned_number(Some(value)).ok_or((
+            REASON_INVALID_LIMIT,
+            "cpuPercent must be an unsigned integer".to_owned(),
+        ))?;
+        if cpu > u64::from(MAX_EXEC_CPU_PERCENT) {
+            return Err((
+                REASON_INVALID_LIMIT,
+                format!("cpuPercent must be at most {MAX_EXEC_CPU_PERCENT}"),
+            ));
+        }
+    }
+    if let Some(value) = limits.get("hardTimeoutSec") {
+        let timeout = signed_number(Some(value)).ok_or((
+            REASON_INVALID_LIMIT,
+            "hardTimeoutSec must be an integer".to_owned(),
+        ))?;
+        if timeout < 0 || timeout > MAX_HARD_TIMEOUT_SEC {
+            return Err((
+                REASON_INVALID_LIMIT,
+                format!("hardTimeoutSec must be in 0..{MAX_HARD_TIMEOUT_SEC}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Turns a validated `limits` object into the per-execution limits to send to the guest.
+///
+/// Returns `None` when the request asks for nothing: the deployment-level limits then apply
+/// unchanged. A field left at zero keeps that meaning per field, which is what the merge in the
+/// backend does.
+pub fn request_exec_limits(
+    limits: &serde_json::Map<String, Value>,
+) -> Option<ExecLimits> {
+    let mem = limits
+        .get("memMb")
+        .and_then(|value| unsigned_number(Some(value)))
+        .unwrap_or(0);
+    let cpu = limits
+        .get("cpuPercent")
+        .and_then(|value| unsigned_number(Some(value)))
+        .unwrap_or(0);
+    if mem == 0 && cpu == 0 {
+        return None;
+    }
+    Some(ExecLimits {
+        mem_mb: u32::try_from(mem).unwrap_or(0),
+        cpu_percent: u32::try_from(cpu).unwrap_or(0),
+        pids_max: 0,
+    })
+}
 
 /// Guest RAM accepted per session.
 ///
@@ -75,53 +156,6 @@ pub fn validate_memory(memory_mib: u64) -> Result<(), (&'static str, String)> {
                 "memoryMiB must be within {MIN_MEMORY_MIB}..={MAX_MEMORY_MIB}, got {memory_mib}"
             ),
         ));
-    }
-    Ok(())
-}
-
-pub fn validate_limits(
-    limits: &serde_json::Map<String, Value>,
-) -> Result<(), (&'static str, String)> {
-    for key in limits.keys() {
-        if key != "memMb" && key != "cpuPercent" && key != "hardTimeoutSec" {
-            return Err((REASON_INVALID_LIMIT, format!("unknown limits field {key}")));
-        }
-    }
-    if let Some(value) = limits.get("memMb") {
-        let memory = unsigned_number(Some(value)).ok_or((
-            REASON_INVALID_LIMIT,
-            "memMb must be an unsigned integer".to_owned(),
-        ))?;
-        if memory > 0 {
-            return Err((
-                REASON_MEMORY_LIMIT_UNSUPPORTED,
-                "NVX v1 does not support per-task memory limits".to_owned(),
-            ));
-        }
-    }
-    if let Some(value) = limits.get("cpuPercent") {
-        let cpu = unsigned_number(Some(value)).ok_or((
-            REASON_INVALID_LIMIT,
-            "cpuPercent must be an unsigned integer".to_owned(),
-        ))?;
-        if cpu > 0 {
-            return Err((
-                REASON_CPU_LIMIT_UNSUPPORTED,
-                "NVX v1 does not support per-task CPU limits".to_owned(),
-            ));
-        }
-    }
-    if let Some(value) = limits.get("hardTimeoutSec") {
-        let timeout = signed_number(Some(value)).ok_or((
-            REASON_INVALID_LIMIT,
-            "hardTimeoutSec must be an integer".to_owned(),
-        ))?;
-        if timeout < 0 || timeout > MAX_HARD_TIMEOUT_SEC {
-            return Err((
-                REASON_INVALID_LIMIT,
-                format!("hardTimeoutSec must be in 0..{MAX_HARD_TIMEOUT_SEC}"),
-            ));
-        }
     }
     Ok(())
 }
@@ -175,17 +209,35 @@ mod tests {
         assert_eq!(REASON_STDIN_UNSUPPORTED, "E_NVX_STDIN_UNSUPPORTED");
     }
 
+    /// A request may ask for its own per-execution limits, up to what the guest can enforce.
     #[test]
-    fn zero_limits_are_accepted_but_positive_vm_limits_are_rejected() {
+    fn request_limits_are_accepted_inside_the_guest_ceiling() {
         let zero = serde_json::json!({
             "memMb": 0, "cpuPercent": "0", "hardTimeoutSec": 0
         });
         assert!(validate_limits(zero.as_object().unwrap()).is_ok());
+        assert!(
+            request_exec_limits(zero.as_object().unwrap()).is_none(),
+            "zero everywhere means the deployment default, nothing to send"
+        );
 
-        let memory = serde_json::json!({"memMb": 512});
+        let inside = serde_json::json!({"memMb": 512, "cpuPercent": 150});
+        assert!(validate_limits(inside.as_object().unwrap()).is_ok());
+        let sent = request_exec_limits(inside.as_object().unwrap()).expect("limits to send");
+        assert_eq!(sent.mem_mb, 512);
+        assert_eq!(sent.cpu_percent, 150);
+
+        // The ceiling is the guest's, checked here so an impossible request is refused by the
+        // sidecar rather than surviving until the guest refuses the execution.
+        let too_much_memory = serde_json::json!({"memMb": MAX_EXEC_MEMORY_MIB + 1});
         assert_eq!(
-            validate_limits(memory.as_object().unwrap()).unwrap_err().0,
-            REASON_MEMORY_LIMIT_UNSUPPORTED
+            validate_limits(too_much_memory.as_object().unwrap()).unwrap_err().0,
+            REASON_INVALID_LIMIT
+        );
+        let too_much_cpu = serde_json::json!({"cpuPercent": MAX_EXEC_CPU_PERCENT + 1});
+        assert_eq!(
+            validate_limits(too_much_cpu.as_object().unwrap()).unwrap_err().0,
+            REASON_INVALID_LIMIT
         );
     }
 

@@ -765,6 +765,9 @@ def main():
             if after.get("sessionCount") != 0:
                 raise RuntimeError(f"a session outlived its close: {after}")
             print("genflow-nvxd shared-VM e2e passed")
+            # Case id for `verify-nvx-vm.ps1 -Stage P7`: the serial shared-VM behaviour must keep
+            # working once several executions may run at once.
+            print("CASE p7.regression.shared_vm PASS", flush=True)
         except Exception as error:
             for head, payload in sidecar.events:
                 print(

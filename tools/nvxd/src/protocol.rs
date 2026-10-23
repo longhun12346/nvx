@@ -12,6 +12,11 @@ pub const OP_SESSION_CLOSE: &str = "session.close";
 pub const OP_MEMORY_STATS: &str = "memory.stats";
 pub const OP_MEMORY_TRIM: &str = "memory.trim";
 pub const OP_SHUTDOWN: &str = "shutdown";
+/// Asks what became of one execution, by the id the host assigned before sending it.
+///
+/// Needed because a lost start reply says nothing about whether the work started: the host
+/// asks instead of guessing, and "unknown" is a real answer rather than a retry signal.
+pub const OP_EXEC_STATUS: &str = "exec.status";
 /// Returns this sidecar's own counters and session summary. Read-only, so a diagnostic
 /// run never changes what it is measuring.
 pub const OP_DIAGNOSTICS: &str = "diagnostics";
@@ -31,6 +36,19 @@ pub const REASON_BACKEND_UNAVAILABLE: &str = "E_BACKEND_UNAVAILABLE";
 pub const REASON_BACKEND_BUSY: &str = "E_BACKEND_BUSY";
 pub const REASON_SESSION_UNKNOWN: &str = "E_BACKEND_SESSION_UNKNOWN";
 pub const REASON_HANDLE_UNKNOWN: &str = "E_BACKEND_HANDLE_UNKNOWN";
+/// The same exec id was used with different arguments. Two commands must never share an id,
+/// because a lost reply is resolved by resending that id and comparing it.
+pub const REASON_EXEC_CONFLICT: &str = "E_BACKEND_EXEC_ID_CONFLICT";
+/// The queue is full: refused before anything was registered.
+pub const REASON_QUEUE_FULL: &str = "E_BACKEND_QUEUE_FULL";
+/// The session is closing or closed and takes no new executions.
+pub const REASON_SESSION_CLOSING: &str = "E_BACKEND_SESSION_CLOSING";
+/// The request names a VM instance this sidecar no longer serves.
+pub const REASON_GENERATION_STALE: &str = "E_BACKEND_GENERATION_STALE";
+
+/// The sidecar's own request or output path is saturated: the request was refused before
+/// anything was registered, so the caller may retry once the backlog drains.
+pub const REASON_OVERLOAD: &str = "E_BACKEND_OVERLOAD";
 
 use serde_json::Value;
 

@@ -7,6 +7,7 @@ use nvx::Hypervisor;
 use nvx::host::artifacts::{Artifacts, absolute};
 use nvx::host::instance::SOCKET_NAME;
 use nvx::host::launch::{self, WorkloadIdentity};
+use nvx::protocol::ExecLimits;
 
 use crate::error::{Error, Result};
 
@@ -69,6 +70,13 @@ pub struct OpenVmmConfig {
     pub stop_timeout: Duration,
     /// Extra time to wait for an outcome after a workload's own timeout elapses.
     pub exec_response_grace: Duration,
+    /// Resource limits applied to every execution of this backend.
+    ///
+    /// Zero fields ask for none, which keeps the previous behaviour. A non-zero field is enforced
+    /// on the guest's own cgroup for that execution alone, and a guest that cannot enforce it
+    /// refuses the execution instead of running it unlimited. Per-call limits are not part of the
+    /// public contract yet, so a deployment configures them once, here.
+    pub exec_limits: ExecLimits,
     /// Windows only: start OpenVMM outside the caller's job object so the sandbox VM survives
     /// the caller. The job must permit breakaway.
     pub breakaway_from_job: bool,
@@ -121,6 +129,7 @@ impl OpenVmmConfig {
             control_timeout: Duration::from_secs(60),
             stop_timeout: Duration::from_secs(30),
             exec_response_grace: Duration::from_secs(30),
+            exec_limits: ExecLimits::default(),
             breakaway_from_job: false,
             #[cfg(feature = "testing")]
             skip_hypervisor_probe: false,

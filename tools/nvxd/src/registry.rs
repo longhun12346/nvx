@@ -118,8 +118,8 @@ pub enum Cancel {
 pub struct Closed {
     /// Executions that never ran and are now cancelled.
     pub cancelled_queued: Vec<String>,
-    /// The execution currently holding the run slot, if it belongs to this session.
-    pub running: Option<String>,
+    /// Executions of this session that still hold a run slot.
+    pub running: Vec<String>,
 }
 
 /// An execution as reported by `diagnostics`.
@@ -158,8 +158,12 @@ struct SessionEntry {
 pub struct Registry {
     generation: u64,
     max_queue: usize,
+    /// How many executions may run at the same time. One until the guest image and the product
+    /// configuration both accept more.
+    max_running: usize,
     queue: VecDeque<String>,
-    running: Option<String>,
+    /// Executions that hold a run slot, in dispatch order.
+    running: Vec<String>,
     execs: HashMap<String, Exec>,
     /// Terminal state and request digest of completed executions. The digest is kept so a
     /// repeated id with different arguments is still a conflict after the first one ended.
@@ -173,12 +177,13 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn new(max_queue: usize, generation: u64) -> Self {
+    pub fn new(max_queue: usize, max_running: usize, generation: u64) -> Self {
         Self {
             generation,
             max_queue: max_queue.max(1),
+            max_running: max_running.max(1),
             queue: VecDeque::new(),
-            running: None,
+            running: Vec::new(),
             execs: HashMap::new(),
             finished: HashMap::new(),
             finished_order: VecDeque::new(),
@@ -198,7 +203,7 @@ impl Registry {
     pub fn new_generation(&mut self) -> u64 {
         self.generation += 1;
         self.queue.clear();
-        self.running = None;
+        self.running.clear();
         self.execs.clear();
         self.finished.clear();
         self.finished_order.clear();
@@ -290,19 +295,26 @@ impl Registry {
         Accept::Queued { position }
     }
 
-    /// Hands out the next execution when the VM's run slot is free.
+    /// Hands out the next executions that may start while run slots are free.
     ///
-    /// The returned id is now `Running` but not yet released: the caller answers the start
-    /// request, then calls [`Self::release`], and only then may events be emitted.
-    pub fn dispatch(&mut self) -> Option<String> {
-        if self.running.is_some() {
-            return None;
+    /// Each returned id is now `Running` but not yet released: the caller answers its start
+    /// request, then calls [`Self::release`], and only then may events be emitted. The executions
+    /// are taken in queue order, so a session that queued first is served first; the caller
+    /// starts them concurrently.
+    pub fn dispatch(&mut self) -> Vec<String> {
+        let mut started = Vec::new();
+        while self.running.len() < self.max_running {
+            let Some(id) = self.queue.pop_front() else {
+                break;
+            };
+            let Some(exec) = self.execs.get_mut(&id) else {
+                continue;
+            };
+            exec.phase = Phase::Running;
+            self.running.push(id.clone());
+            started.push(id);
         }
-        let id = self.queue.pop_front()?;
-        let exec = self.execs.get_mut(&id)?;
-        exec.phase = Phase::Running;
-        self.running = Some(id.clone());
-        Some(id)
+        started
     }
 
     /// Opens the start gate for `id` once its reply has been written.
@@ -324,8 +336,19 @@ impl Registry {
         self.execs.get(id).is_some_and(|exec| exec.cancel_requested)
     }
 
-    pub fn running_id(&self) -> Option<&str> {
-        self.running.as_deref()
+    pub fn running_ids(&self) -> &[String] {
+        &self.running
+    }
+
+    /// The one execution a single-slot registry starts, for tests that predate concurrent runs.
+    #[cfg(test)]
+    pub fn dispatch_one(&mut self) -> Option<String> {
+        self.dispatch().into_iter().next()
+    }
+
+    /// How many executions this VM may run at once.
+    pub fn max_running(&self) -> usize {
+        self.max_running
     }
 
     pub fn queued_len(&self) -> usize {
@@ -355,8 +378,8 @@ impl Registry {
         if let Some(entry) = self.sessions.get_mut(&session) {
             entry.execs.retain(|known| known != id);
         }
-        if self.running.as_deref() == Some(id) {
-            self.running = None;
+        if let Some(position) = self.running.iter().position(|running| running == id) {
+            self.running.remove(position);
         } else {
             self.queue.retain(|queued| queued != id);
         }
@@ -445,7 +468,7 @@ impl Registry {
                     let _ = self.finish(&id, terminal);
                     closed.cancelled_queued.push(id);
                 }
-                Phase::Running => closed.running = Some(id),
+                Phase::Running => closed.running.push(id),
             }
         }
         closed
@@ -454,7 +477,7 @@ impl Registry {
     /// Whether anything at all still refers to this VM instance.
     pub fn is_idle(&self) -> bool {
         self.sessions.is_empty()
-            && self.running.is_none()
+            && self.running.is_empty()
             && self.queue.is_empty()
             && self.execs.is_empty()
     }
@@ -517,7 +540,7 @@ mod tests {
     const DIGEST: u64 = 0x5eed;
 
     fn registry() -> Registry {
-        Registry::new(DEFAULT_QUEUE_DEPTH, 1)
+        Registry::new(DEFAULT_QUEUE_DEPTH, 1, 1)
     }
 
     /// Registers a session and one queued execution; panics if either is refused.
@@ -561,12 +584,12 @@ mod tests {
         accept(&mut registry, "A", "A1");
         accept(&mut registry, "B", "B1");
 
-        assert_eq!(registry.dispatch().as_deref(), Some("A1"));
-        assert_eq!(registry.running_id(), Some("A1"));
-        assert_eq!(registry.dispatch(), None, "the slot is taken");
+        assert_eq!(registry.dispatch_one().as_deref(), Some("A1"));
+        assert_eq!(registry.running_ids(), ["A1"]);
+        assert_eq!(registry.dispatch_one(), None, "the slot is taken");
 
         registry.finish("A1", Terminal::new("exited", Some(0), ""));
-        assert_eq!(registry.dispatch().as_deref(), Some("B1"), "the slot moved on");
+        assert_eq!(registry.dispatch_one().as_deref(), Some("B1"), "the slot moved on");
     }
 
     /// A start reply must be written before any event for that execution.
@@ -576,10 +599,56 @@ mod tests {
         open(&mut registry, "A");
         accept(&mut registry, "A", "A1");
 
-        let id = registry.dispatch().expect("dispatched");
+        let id = registry.dispatch_one().expect("dispatched");
         assert!(!registry.is_released(&id), "not released before the reply");
         registry.release(&id);
         assert!(registry.is_released(&id));
+    }
+
+    /// With more than one run slot, dispatch fills them in queue order.
+    #[test]
+    fn several_executions_run_at_once_when_the_slots_allow_it() {
+        let mut registry = Registry::new(DEFAULT_QUEUE_DEPTH, 2, 1);
+        open(&mut registry, "A");
+        open(&mut registry, "B");
+        accept(&mut registry, "A", "A1");
+        accept(&mut registry, "A", "A2");
+        accept(&mut registry, "B", "B1");
+
+        // One call fills both slots: two executions start together, the third waits.
+        assert_eq!(registry.dispatch(), ["A1", "A2"]);
+        assert_eq!(registry.running_ids(), ["A1", "A2"]);
+        assert!(registry.dispatch().is_empty(), "both slots are taken");
+
+        // Releasing one slot admits exactly one more, and leaves the other running.
+        registry.finish("A1", Terminal::new("exited", Some(0), ""));
+        assert_eq!(registry.running_ids(), ["A2"], "A2 is untouched");
+        assert_eq!(registry.dispatch(), ["B1"]);
+        assert_eq!(registry.running_ids(), ["A2", "B1"]);
+    }
+
+    /// Closing a session stops every execution of it that holds a slot, not just one.
+    #[test]
+    fn closing_a_session_frees_all_of_its_run_slots() {
+        let mut registry = Registry::new(DEFAULT_QUEUE_DEPTH, 2, 1);
+        open(&mut registry, "A");
+        open(&mut registry, "B");
+        accept(&mut registry, "A", "A1");
+        accept(&mut registry, "A", "A2");
+        accept(&mut registry, "B", "B1");
+        assert_eq!(registry.dispatch(), ["A1", "A2"]);
+
+        let closed = registry.close_session("A");
+
+        assert_eq!(closed.running, ["A1", "A2"]);
+        assert!(closed.cancelled_queued.is_empty());
+        // A closed session's executions keep their slots until the caller has stopped them and
+        // reported their terminal state; B still waits its turn and is not affected.
+        assert_eq!(registry.running_ids(), ["A1", "A2"]);
+        assert!(registry.dispatch().is_empty(), "no slot is free yet");
+        registry.finish("A1", Terminal::new("cancelled", None, "session closed"));
+        registry.finish("A2", Terminal::new("cancelled", None, "session closed"));
+        assert_eq!(registry.dispatch(), ["B1"], "B runs once A's slots are gone");
     }
 
     /// Cancelling a queued execution must leave whatever is running alone.
@@ -591,17 +660,17 @@ mod tests {
         accept(&mut registry, "A", "A1");
         accept(&mut registry, "A", "A2");
         accept(&mut registry, "B", "B1");
-        assert_eq!(registry.dispatch().as_deref(), Some("A1"));
+        assert_eq!(registry.dispatch_one().as_deref(), Some("A1"));
 
         let cancelled = registry.cancel("A2");
         assert!(matches!(cancelled, Cancel::Queued(_)), "{cancelled:?}");
-        assert_eq!(registry.running_id(), Some("A1"));
+        assert_eq!(registry.running_ids(), ["A1"]);
         assert!(!registry.cancel_requested("A1"), "A1 was not cancelled");
         assert_eq!(registry.queued_len(), 1, "only B1 is still queued");
         assert_eq!(registry.terminal_of("A2").unwrap().outcome, "cancelled");
 
         registry.finish("A1", Terminal::new("exited", Some(0), ""));
-        assert_eq!(registry.dispatch().as_deref(), Some("B1"), "B was not affected");
+        assert_eq!(registry.dispatch_one().as_deref(), Some("B1"), "B was not affected");
     }
 
     /// Cancelling the running execution records the request; the slot is released when the
@@ -613,15 +682,15 @@ mod tests {
         open(&mut registry, "B");
         accept(&mut registry, "A", "A1");
         accept(&mut registry, "B", "B1");
-        assert_eq!(registry.dispatch().as_deref(), Some("A1"));
+        assert_eq!(registry.dispatch_one().as_deref(), Some("A1"));
 
         assert_eq!(registry.cancel("A1"), Cancel::Running);
         assert!(registry.cancel_requested("A1"));
-        assert_eq!(registry.running_id(), Some("A1"), "cleanup still owns the slot");
-        assert_eq!(registry.dispatch(), None, "no new work before cleanup is confirmed");
+        assert_eq!(registry.running_ids(), ["A1"], "cleanup still owns the slot");
+        assert_eq!(registry.dispatch_one(), None, "no new work before cleanup is confirmed");
 
         registry.finish("A1", Terminal::cancelled("cancelled by the caller"));
-        assert_eq!(registry.dispatch().as_deref(), Some("B1"));
+        assert_eq!(registry.dispatch_one().as_deref(), Some("B1"));
     }
 
     /// Closing A takes A's work only: B keeps what it had, in the same VM.
@@ -633,19 +702,19 @@ mod tests {
         accept(&mut registry, "A", "A1");
         accept(&mut registry, "A", "A2");
         accept(&mut registry, "B", "B1");
-        assert_eq!(registry.dispatch().as_deref(), Some("A1"));
-        assert_eq!(registry.dispatch(), None, "A1 holds the slot");
+        assert_eq!(registry.dispatch_one().as_deref(), Some("A1"));
+        assert_eq!(registry.dispatch_one(), None, "A1 holds the slot");
 
         let closed = registry.close_session("A");
         assert_eq!(closed.cancelled_queued, vec!["A2".to_owned()]);
-        assert_eq!(closed.running.as_deref(), Some("A1"));
+        assert_eq!(closed.running, ["A1"]);
         assert_eq!(registry.session_count(), 1, "A is gone, B is not");
         assert_eq!(registry.generation(), 1, "closing a session does not replace the VM");
 
         // B1 is untouched and still queued behind A1's cleanup.
         assert_eq!(registry.session_of("B1"), Some("B"));
         registry.finish("A1", Terminal::cancelled("session closed"));
-        assert_eq!(registry.dispatch().as_deref(), Some("B1"));
+        assert_eq!(registry.dispatch_one().as_deref(), Some("B1"));
     }
 
     /// A closed session may not take new work; the VM itself stays up for the others.
@@ -707,7 +776,7 @@ mod tests {
             Accept::Cancelled
         );
         assert_eq!(registry.queued_len(), 0);
-        assert_eq!(registry.dispatch(), None, "a cancelled id never runs");
+        assert_eq!(registry.dispatch_one(), None, "a cancelled id never runs");
     }
 
     /// Ids from a replaced VM instance must not resolve against the new one.
@@ -717,11 +786,11 @@ mod tests {
         open(&mut registry, "A");
         let old = registry.generation();
         accept(&mut registry, "A", "A1");
-        assert_eq!(registry.dispatch().as_deref(), Some("A1"));
+        assert_eq!(registry.dispatch_one().as_deref(), Some("A1"));
 
         let new = registry.new_generation();
         assert!(new > old);
-        assert_eq!(registry.running_id(), None, "old work is gone with the old VM");
+        assert!(registry.running_ids().is_empty(), "old work is gone with the old VM");
         assert_eq!(registry.session_count(), 0, "sessions belonged to that VM");
 
         old_style_accept_is_stale(&mut registry, old);
@@ -742,7 +811,7 @@ mod tests {
     /// Admission is bounded: the queue refuses before it registers anything.
     #[test]
     fn a_full_queue_refuses_before_registering() {
-        let mut registry = Registry::new(2, 1);
+        let mut registry = Registry::new(2, 1, 1);
         open(&mut registry, "A");
         accept(&mut registry, "A", "A1");
         accept(&mut registry, "A", "A2");
@@ -788,7 +857,7 @@ mod tests {
         assert_eq!(registry.terminal_of("A2").unwrap().outcome, "timedOut");
         assert_eq!(registry.queued_len(), 1, "A1 is still waiting its turn");
         assert_eq!(
-            registry.dispatch().as_deref(),
+            registry.dispatch_one().as_deref(),
             Some("A1"),
             "the running execution was untouched"
         );
@@ -814,7 +883,7 @@ mod tests {
         open(&mut registry, "A");
         for id in ["A1", "A2", "A3"] {
             accept(&mut registry, "A", id);
-            registry.dispatch();
+            registry.dispatch_one();
             registry.finish(id, Terminal::new("exited", Some(0), ""));
         }
         assert!(registry.terminal_of("A1").is_none(), "the oldest was evicted");
@@ -829,7 +898,7 @@ mod tests {
         let mut registry = registry();
         open(&mut registry, "A");
         accept(&mut registry, "A", "A1");
-        registry.dispatch();
+        registry.dispatch_one();
         registry.finish("A1", Terminal::new("exited", Some(0), ""));
 
         assert_eq!(
@@ -848,7 +917,7 @@ mod tests {
         let mut registry = registry();
         open(&mut registry, "A");
         accept(&mut registry, "A", "A1");
-        registry.dispatch();
+        registry.dispatch_one();
         assert!(!registry.is_idle());
 
         registry.close_session("A");

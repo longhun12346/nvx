@@ -132,7 +132,7 @@ use std::time::Duration;
 
 use nvx::Artifacts;
 use nvx::host::filesystem::{self, ExportPlan, ExportRequest, PathList};
-use nvx::host::instance::{Execution, RuntimeRecord, WorkloadOutcome};
+use nvx::host::instance::{RuntimeRecord, SharedExecution, WorkloadOutcome};
 use nvx::host::launch::{LaunchSpec, WorkloadIdentity};
 use nvx::host::report::Report;
 use nvx::host::{network, platform};
@@ -545,6 +545,8 @@ fn prepare_exec(process: &ProcessSpec) -> Result<Workload<'_>> {
         timeout_ms: exec_timeout_ms(process)?,
         cwd: process.cwd.as_deref(),
         environment,
+        // Filled in by the caller from the backend configuration; a request carries no limits.
+        limits: nvx::protocol::ExecLimits::default(),
     };
     protocol::encode_exec_payload(&workload)
         .map_err(|error| Error::policy_validation(error.into_message()))?;
@@ -706,6 +708,12 @@ impl Backend for OpenVmmBackend {
         let mut metadata = Metadata::new();
         let boot_ms = u64::try_from(started.boot.as_millis()).unwrap_or(u64::MAX);
         metadata.insert("bootMilliseconds".to_owned(), boot_ms.into());
+        // What the image can do, so a caller that needs concurrent executions or per-execution
+        // limits refuses to run against an image that cannot serve them instead of degrading.
+        metadata.insert(
+            "guestFeatures".to_owned(),
+            u64::from(started.features.bits()).into(),
+        );
         Ok(StartResult {
             metadata: Some(metadata),
         })
@@ -717,7 +725,10 @@ impl Backend for OpenVmmBackend {
         request: &ExecRequest,
         io: ExecIo,
     ) -> Result<Box<dyn ExecControl>> {
-        let workload = prepare_exec(&request.process)?;
+        let mut workload = prepare_exec(&request.process)?;
+        // The backend's configured per-execution limits travel with every request: the guest
+        // enforces them on the execution's own cgroup, and refuses an execution it cannot.
+        workload.limits = self.config.exec_limits;
         let instance = self.store.instance(sandbox_id);
         let (runtime, capability) = {
             let (_guard, _) = self.store.lock_and_load(sandbox_id)?;
@@ -733,10 +744,14 @@ impl Backend for OpenVmmBackend {
                 }
             }
         };
+        // Every execution of the sandbox shares the VM's one control session, so that several of
+        // them can run at the same time; the guest demultiplexes them by request id.
+        let session = instance
+            .control_session(&runtime, &capability, self.config.control_timeout)
+            .map_err(exec_error)?;
         let execution = instance
-            .exec(
-                &runtime,
-                &capability,
+            .exec_shared(
+                &session,
                 &workload,
                 self.config.control_timeout,
                 self.config.exec_response_grace,
@@ -794,7 +809,7 @@ impl Backend for OpenVmmBackend {
 /// Relays workload events to the output sinks of `io` and returns the terminal outcome. The
 /// sinks close when it returns.
 fn pump(
-    execution: Execution,
+    execution: SharedExecution,
     mut io: ExecIo,
     cancel_requested: &AtomicBool,
 ) -> Result<ExecOutcome> {

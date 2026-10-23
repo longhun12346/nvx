@@ -48,7 +48,7 @@
 //! mount a mapped path. The command line is recorded in `fake-openvmm-<token>.json` next to the
 //! kernel.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::{
     APP_CANCEL, APP_ERROR, APP_EXEC, APP_EXIT, APP_FEATURES, APP_MAPS, APP_PING, APP_READY,
-    APP_STDERR, APP_STDOUT, APP_STOP, APP_STOPPED, BUSY, CAPABILITY_LEN, CWD_FAILED, ExitCategory,
+    APP_STDERR, APP_STDOUT, APP_STOP, APP_STOPPED, CAPABILITY_LEN, CWD_FAILED, ExitCategory,
     GuestFeatures, INVALID_REQUEST, LAUNCH_FAILED, MAPPING_FAILED, MAPPINGS_INCOMPLETE, MAPS_TOKEN,
     MAX_HOST_MAPPINGS, MAX_OUTPUT_BYTES, MapsPayload, OUTER_DATA, OUTER_ERROR, OUTER_HEADER_LEN,
     OUTER_HOST_ATTACH, OUTER_READY, OuterHeader, UNSUPPORTED_OPERATION, WORKLOAD_ACCOUNT_TOKEN,
@@ -247,7 +247,7 @@ fn program_name() -> String {
 
 /// Parses the OpenVMM command line plus fake controls, rejecting unsupported combinations.
 fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
-    const VALUED: [&str; 24] = [
+    const VALUED: [&str; 26] = [
         "--mount-aggregate",
         "--mount-child",
         "--mount-deny",
@@ -260,6 +260,11 @@ fn parse(program: &str, arguments: &[String]) -> Result<Options, String> {
         "--microvm-lifecycle",
         "--hypervisor",
         "--memory",
+        // The launcher chooses the guest CPU profile explicitly and passes the export channel the
+        // VMM should serve; the fake serves the control protocol, so it accepts both and ignores
+        // what it does not model. Without them every start fails with "unsupported argument".
+        "--cpu-profile",
+        "--microvm-virtiofs-control",
         "--kernel",
         "--initrd",
         "--cmdline",
@@ -692,6 +697,15 @@ struct Session<'a, S> {
     host_sequence: u64,
     /// Whether matching cancellation requests are ignored for fault injection.
     ignore_cancel: bool,
+    /// Requests that arrived while a workload ran.
+    ///
+    /// A host used to give each execution its own session, so the fake served one request at a
+    /// time per connection and never met a second request mid-workload. Now one session carries
+    /// several executions, so the fake queues what arrives and serves it once the current
+    /// workload finishes. That keeps every request answered, in order, which is what the
+    /// host-layer tests depend on; how concurrent executions overlap is proved against a real
+    /// guest by `tools/nvxd/tests/parallel_exec.py`.
+    deferred: VecDeque<(u8, u64, Vec<u8>)>,
 }
 
 impl<S: Read + Write + Pending> Session<'_, S> {
@@ -730,38 +744,59 @@ impl<S: Read + Write + Pending> Session<'_, S> {
     /// Serves requests until the host disconnects or asks the VM to stop.
     fn run(&mut self, options: &Options, guest: &mut Guest) -> io::Result<Flow> {
         loop {
-            let Some((kind, request_id, payload)) = self.request()? else {
+            // Requests that arrived while a workload ran are served first, in arrival order.
+            let next = match self.deferred.pop_front() {
+                Some(request) => Some(request),
+                None => self.request()?,
+            };
+            let Some((kind, request_id, payload)) = next else {
                 return Ok(Flow::Continue);
             };
-            match kind {
-                APP_PING => self.send(APP_READY, request_id, 0, &[])?,
-                APP_FEATURES if !options.legacy_guest => {
-                    self.send(APP_READY, request_id, 0, &options.guest_features.encode())?;
-                }
-                APP_EXEC if guest.mapped.len() < options.maps => {
-                    self.send(APP_ERROR, request_id, 11, MAPPINGS_INCOMPLETE.as_bytes())?;
-                }
-                APP_EXEC => {
-                    if !self.exec(request_id, &payload, guest)? {
-                        return Ok(Flow::Continue);
-                    }
-                }
-                APP_MAPS => match guest.map(options, &payload) {
-                    Ok(()) => self.send(APP_READY, request_id, 0, &[])?,
-                    Err((status, category)) => {
-                        self.send(APP_ERROR, request_id, status, category.as_bytes())?;
-                    }
-                },
-                // The targeted workload already finished.
-                APP_CANCEL => {}
-                APP_STOP if options.ignore_stop => {}
-                APP_STOP => {
-                    let _ = self.send(APP_STOPPED, request_id, 0, &[]);
-                    return Ok(Flow::Exit);
-                }
-                _ => self.send(APP_ERROR, request_id, 95, UNSUPPORTED_OPERATION)?,
+            match self.handle(kind, request_id, &payload, options, guest)? {
+                Flow::Continue => {}
+                other => return Ok(other),
             }
         }
+    }
+
+    /// Serves one request. Returns [`Flow::Exit`] when the guest should stop.
+    fn handle(
+        &mut self,
+        kind: u8,
+        request_id: u64,
+        payload: &[u8],
+        options: &Options,
+        guest: &mut Guest,
+    ) -> io::Result<Flow> {
+        match kind {
+            APP_PING => self.send(APP_READY, request_id, 0, &[])?,
+            APP_FEATURES if !options.legacy_guest => {
+                self.send(APP_READY, request_id, 0, &options.guest_features.encode())?;
+            }
+            APP_EXEC if guest.mapped.len() < options.maps => {
+                self.send(APP_ERROR, request_id, 11, MAPPINGS_INCOMPLETE.as_bytes())?;
+            }
+            APP_EXEC => {
+                if !self.exec(request_id, payload, guest)? {
+                    return Ok(Flow::Continue);
+                }
+            }
+            APP_MAPS => match guest.map(options, payload) {
+                Ok(()) => self.send(APP_READY, request_id, 0, &[])?,
+                Err((status, category)) => {
+                    self.send(APP_ERROR, request_id, status, category.as_bytes())?;
+                }
+            },
+            // The targeted workload already finished.
+            APP_CANCEL => {}
+            APP_STOP if options.ignore_stop => {}
+            APP_STOP => {
+                let _ = self.send(APP_STOPPED, request_id, 0, &[]);
+                return Ok(Flow::Exit);
+            }
+            _ => self.send(APP_ERROR, request_id, 95, UNSUPPORTED_OPERATION)?,
+        }
+        Ok(Flow::Continue)
     }
 
     /// Handles control traffic that arrives while workload `request_id` runs.
@@ -773,7 +808,10 @@ impl<S: Read + Write + Pending> Session<'_, S> {
                     return Ok(Interrupt::Cancel);
                 }
                 Some((APP_CANCEL, _, _)) => {}
-                Some((_, id, _)) => self.send(APP_ERROR, id, 16, BUSY.as_bytes())?,
+                // A host used to give each execution its own session, so the fake never met a
+                // second request mid-workload. Now one session carries several executions: queue
+                // what arrives and serve it when this workload finishes, instead of refusing it.
+                Some((kind, id, payload)) => self.deferred.push_back((kind, id, payload)),
             }
         }
         Ok(Interrupt::None)
@@ -1037,6 +1075,7 @@ fn serve_client<S: Read + Write + Pending>(
         guest_sequence: 1,
         host_sequence: 0,
         ignore_cancel: options.ignore_cancel,
+        deferred: VecDeque::new(),
     };
     match session.run(options, guest) {
         Ok(Flow::Exit) => {
@@ -1186,5 +1225,50 @@ mod tests {
     fn the_current_guest_advertises_every_required_feature() {
         assert_eq!(GUEST_FEATURES, GuestFeatures::REQUIRED);
         assert!(GUEST_FEATURES.missing(GuestFeatures::REQUIRED).is_empty());
+    }
+
+    /// Every argument the launcher emits must be one this double accepts.
+    ///
+    /// The launcher grew `--cpu-profile` and `--microvirtiofs-control` while the fake still
+    /// rejected them, so every start failed with "unsupported argument" and the suites that use
+    /// the fake quietly stopped running. This test fails the moment the two drift apart, instead
+    /// of waiting for somebody to run those suites.
+    #[test]
+    fn the_launcher_emits_only_arguments_the_fake_accepts() {
+        let directory = std::env::temp_dir().join("nvx-fake-arguments");
+        std::fs::create_dir_all(&directory).expect("a temporary directory");
+        // The fake checks that the artifacts it was told about exist; the contents are never read.
+        for name in ["openvmm.exe", "vmlinux", "initramfs.cpio.gz"] {
+            std::fs::write(directory.join(name), b"").expect("an empty artifact");
+        }
+        let artifacts = crate::host::artifacts::Artifacts::new(
+            directory.join("openvmm.exe"),
+            directory.join("vmlinux"),
+            directory.join("initramfs.cpio.gz"),
+        );
+        let mut spec = crate::host::launch::LaunchSpec::new(
+            artifacts,
+            crate::Hypervisor::platform_default().expect("tests run on Linux or Windows"),
+        );
+        // The families that changed last: an explicit CPU profile, an export channel, and a
+        // kernel parameter the launcher passes through.
+        spec.cpu_profile = crate::host::launch::CpuProfile::Host;
+        spec.kernel_parameters = "quiet".to_owned();
+
+        let arguments = spec
+            .openvmm_arguments_with_control(
+                "//./pipe/nvx-fake-arguments",
+                &directory.join("report.json"),
+                Some("//./pipe/nvx-fake-export"),
+            )
+            .expect("the launcher builds arguments for a default specification");
+        let arguments: Vec<String> = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+
+        parse("nvx-fake-openvmm", &arguments).unwrap_or_else(|error| {
+            panic!("the launcher emits an argument the fake rejects: {error} in {arguments:?}")
+        });
     }
 }

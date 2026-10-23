@@ -44,6 +44,7 @@ fn workload(argv: &[&str]) -> Workload<'static> {
         timeout_ms: 0,
         cwd: None,
         environment: WorkloadEnvironment::Default,
+        limits: nvx::protocol::ExecLimits::default(),
     }
 }
 
@@ -78,6 +79,23 @@ fn run(instance: &Instance, workload: &Workload<'_>, cancel: &AtomicBool) -> Out
         stdout,
         stderr,
     }
+}
+
+#[test]
+fn a_stop_after_the_guest_died_is_not_reported_as_forced() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut spec, instance) = setup(directory.path());
+    spec.kernel_parameters = "fake_crash_after_ms=200".to_owned();
+    let started = instance.start(&spec, TIMEOUT).unwrap();
+    thread::sleep(Duration::from_secs(2));
+
+    // The guest is gone, so the stop reaches nothing; that is not the same as a stop that had to
+    // terminate a running VM, and the reported outcome says which one happened.
+    let stopped = instance.stop(&started.runtime, TIMEOUT).unwrap();
+    assert!(
+        !stopped.forced,
+        "a VM that had already exited was reported as forcibly stopped"
+    );
 }
 
 #[test]

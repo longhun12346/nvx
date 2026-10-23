@@ -27,6 +27,7 @@ fn program<'a>(argv: &[&str]) -> Workload<'a> {
         timeout_ms: 0,
         cwd: None,
         environment: WorkloadEnvironment::Default,
+        limits: ExecLimits::default(),
     }
 }
 
@@ -236,6 +237,7 @@ fn golden_exec_payloads_round_trip() {
                 cwd: None,
                 environment: None,
                 inherit_default_env: true,
+                limits: ExecLimits::default(),
             },
         ),
         (
@@ -250,6 +252,7 @@ fn golden_exec_payloads_round_trip() {
                 cwd: None,
                 environment: None,
                 inherit_default_env: true,
+                limits: ExecLimits::default(),
             },
         ),
         (
@@ -269,6 +272,7 @@ fn golden_exec_payloads_round_trip() {
                 cwd: Some("/tmp".to_owned()),
                 environment: None,
                 inherit_default_env: true,
+                limits: ExecLimits::default(),
             },
         ),
         (
@@ -291,6 +295,7 @@ fn golden_exec_payloads_round_trip() {
                 cwd: Some("/tmp".to_owned()),
                 environment: Some(environment.clone()),
                 inherit_default_env: true,
+                limits: ExecLimits::default(),
             },
         ),
         (
@@ -311,6 +316,7 @@ fn golden_exec_payloads_round_trip() {
                 cwd: None,
                 environment: Some(environment.clone()),
                 inherit_default_env: false,
+                limits: ExecLimits::default(),
             },
         ),
         (
@@ -329,6 +335,7 @@ fn golden_exec_payloads_round_trip() {
                 cwd: None,
                 environment: Some(Vec::new()),
                 inherit_default_env: false,
+                limits: ExecLimits::default(),
             },
         ),
     ];
@@ -445,6 +452,65 @@ fn exec_payload_distinguishes_explicit_environments() {
     assert_eq!(&layered[8..10], &6u16.to_le_bytes());
     let default = encode_exec_payload(&program(&["/bin/env"])).unwrap();
     assert_eq!(&default[6..8], &[0, 0]);
+}
+
+/// A payload that carries per-execution limits uses the second extension, and the guest reads
+/// back the values the host wrote; a request outside the supported range is refused instead of
+/// being clipped.
+#[test]
+fn exec_limits_round_trip_and_are_bounded() {
+    let workload = |limits: ExecLimits| Workload {
+        limits,
+        ..program(&["/bin/true"])
+    };
+    let limits = ExecLimits {
+        mem_mb: 256,
+        cpu_percent: 50,
+        pids_max: 8,
+    };
+    let payload = encode_exec_payload(&workload(limits)).unwrap();
+    // The header announces the second extension, which is what a guest keys on.
+    assert_eq!(
+        u16::from_le_bytes([payload[6], payload[7]]),
+        EXEC_EXTENDED_V2,
+        "a payload with limits must use extension 2"
+    );
+    let decoded = decode_exec_payload(&payload).unwrap();
+    assert_eq!(decoded.limits, limits);
+    assert_eq!(decoded.argv, ["/bin/true"]);
+
+    // Without limits the payload stays what an older guest understands, and decodes to no limits.
+    let plain = encode_exec_payload(&workload(ExecLimits::default())).unwrap();
+    assert_ne!(
+        u16::from_le_bytes([plain[6], plain[7]]),
+        EXEC_EXTENDED_V2,
+        "a payload without limits must not claim the new extension"
+    );
+    assert_eq!(
+        decode_exec_payload(&plain).unwrap().limits,
+        ExecLimits::default()
+    );
+
+    // One field over its bound refuses the request: clipping a limit would be a silent promise.
+    for out_of_range in [
+        ExecLimits {
+            mem_mb: MAX_EXEC_MEMORY_MIB + 1,
+            ..limits
+        },
+        ExecLimits {
+            cpu_percent: MAX_EXEC_CPU_PERCENT + 1,
+            ..limits
+        },
+        ExecLimits {
+            pids_max: MAX_EXEC_PIDS + 1,
+            ..limits
+        },
+    ] {
+        assert!(
+            encode_exec_payload(&workload(out_of_range)).is_err(),
+            "an out-of-range limit must be refused: {out_of_range:?}"
+        );
+    }
 }
 
 #[test]
@@ -925,9 +991,15 @@ fn exec_extension_matches_the_guest_agent_source() {
     };
     for expected in [
         format!("#define EXEC_EXTENDED {EXEC_EXTENDED}U"),
+        format!("#define EXEC_EXTENDED_V2 {EXEC_EXTENDED_V2}U"),
         format!("#define EXEC_CWD_PRESENT {EXEC_CWD_PRESENT}U"),
         format!("#define EXEC_ENVIRONMENT_PRESENT {EXEC_ENVIRONMENT_PRESENT}U"),
         format!("#define EXEC_INHERIT_DEFAULT_ENV {EXEC_INHERIT_DEFAULT_ENV}U"),
+        // The guest refuses a limit outside these ranges, so a drift here would turn a valid
+        // request into a refused one (or the reverse) without either side noticing.
+        format!("#define MAX_EXEC_MEMORY_MIB {MAX_EXEC_MEMORY_MIB}U"),
+        format!("#define MAX_EXEC_CPU_PERCENT {MAX_EXEC_CPU_PERCENT}U"),
+        format!("#define MAX_EXEC_PIDS {MAX_EXEC_PIDS}U"),
         format!("#define MAX_ARGUMENTS {MAX_ARGUMENTS}U"),
         format!("#define MAX_ARGUMENT_LEN {MAX_ARGUMENT_BYTES}U"),
         format!("#define MAX_ENVIRONMENT {MAX_ENVIRONMENT}U"),

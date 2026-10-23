@@ -92,11 +92,11 @@
     {
       "name": "libcares2",
       "source_name": "c-ares",
-      "source_version": "1.34.6-1ubuntu0.1",
-      "version": "1.34.6-1ubuntu0.1",
+      "source_version": "1.34.6-1ubuntu0.2",
+      "version": "1.34.6-1ubuntu0.2",
       "architecture": "amd64",
-      "url": "https://archive.ubuntu.com/ubuntu/pool/main/c/c-ares/libcares2_1.34.6-1ubuntu0.1_amd64.deb",
-      "sha256": "9c8a576345e6f46a58c5fd2c3335cb728aaed41602ddd3c0734d1800bdcdd15d",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/c/c-ares/libcares2_1.34.6-1ubuntu0.2_amd64.deb",
+      "sha256": "e493f60515895fde6c235e787605b935f6a50c71150a6be1f66903d1359ba090",
       "license_path": "/usr/share/doc/libcares2/copyright",
       "required_by": [
         "libnode127"

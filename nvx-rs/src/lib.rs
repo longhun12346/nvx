@@ -31,7 +31,7 @@
 //!
 //! use nvx::host::instance::{self, Instance};
 //! use nvx::host::launch::LaunchSpec;
-//! use nvx::protocol::{Workload, WorkloadEnvironment};
+//! use nvx::protocol::{ExecLimits, Workload, WorkloadEnvironment};
 //! use nvx::{Artifacts, Hypervisor};
 //!
 //! // Locates OpenVMM, the guest kernel, and the Alpine initramfs.
@@ -46,6 +46,8 @@
 //!     timeout_ms: 0,
 //!     cwd: None,
 //!     environment: WorkloadEnvironment::Default,
+//!     // Zero fields ask for no per-execution limit; the guest enforces whatever is set.
+//!     limits: ExecLimits::default(),
 //! };
 //! let capability = instance.read_capability()?;
 //! let timeout = Duration::from_secs(60);

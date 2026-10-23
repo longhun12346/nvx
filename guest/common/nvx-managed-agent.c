@@ -63,6 +63,19 @@
 #define FEATURE_HOST_MAPPING_TABLE (1U << 6)
 /* APP_MAPS may append entries beyond the announced count once it is mounted. */
 #define FEATURE_RUNTIME_MAPPINGS (1U << 7)
+/*
+ * The agent serves several workloads at the same time. Each exec request keeps
+ * its own process group, cgroup leaf, output pipes and deadline, so cancelling
+ * or timing out one execution leaves the others running. A host that does not
+ * see this bit must keep sending one execution at a time.
+ */
+#define FEATURE_EXEC_SLOTS (1U << 8)
+/*
+ * An exec request may carry memMb, cpuPercent and pidsMax, which the agent
+ * enforces on the execution's own cgroup leaf. A request that asks for a limit
+ * the agent cannot enforce is refused instead of running unlimited.
+ */
+#define FEATURE_EXEC_LIMITS (1U << 9)
 
 #define MAX_ARGUMENTS 64U
 #define MAX_ARGUMENT_LEN 4096U
@@ -72,6 +85,13 @@
 #define EXEC_ENVIRONMENT_PRESENT 2U
 #define EXEC_INHERIT_DEFAULT_ENV 4U
 /*
+ * Extension 2 appends the execution's resource limits to the extended payload:
+ * memory in MiB, CPU as a percentage of one core, and the largest number of
+ * tasks. Zero means "no limit". A host asks for these only when the agent
+ * advertises FEATURE_EXEC_LIMITS.
+ */
+#define EXEC_EXTENDED_V2 2U
+/*
  * Set only in the configuration that a direct-mode child hands its launch
  * helper, never on the wire: the child already entered the working directory,
  * so the helper keeps it instead of looking the path up again.
@@ -79,6 +99,26 @@
 #define EXEC_CWD_ENTERED 0x8000U
 #define MAX_OUTPUT_BYTES (1024U * 1024U)
 #define OUTPUT_CHUNK_BYTES 32768U
+/*
+ * Executions the agent can supervise at once in direct mode. The host bounds
+ * how many it actually starts; this is the agent's own capacity, and a request
+ * beyond it is refused with "busy" before anything is forked.
+ */
+#define MAX_EXEC_SLOTS 8U
+/* Bounds of the per-execution limits a host may ask for; a larger value is a
+ * malformed request, not a hint. */
+#define MAX_EXEC_MEMORY_MIB 4096U
+#define MAX_EXEC_CPU_PERCENT 6400U
+#define MAX_EXEC_PIDS 4096U
+/* cgroup leaf of one execution, below the agent's cgroup root. Generous on
+ * purpose: a test hierarchy can live under a long temporary directory. */
+#define EXEC_CGROUP_NAME_BYTES 256U
+/* CPU period the guest uses for every per-execution quota: 100 ms. */
+#define CGROUP_CPU_PERIOD_US 100000U
+/* Attempts one settle pass may spend before the agent serves control traffic again. */
+#define SETTLE_ATTEMPTS_PER_PASS 8U
+/* Total attempts before a cgroup that will not empty is reported as a failure. */
+#define SETTLE_MAX_ATTEMPTS 200U
 #define CONTAINER_BARRIER_ATTEMPTS 500U
 #define PORTB_CONSOLE 0xe9
 #define AGENT_STOPPED 1
@@ -139,6 +179,14 @@ struct exec_config {
     uint16_t environment_count;
     int environment_present;
     int inherit_default_env;
+    /*
+     * Resource limits of this execution, from the extended payload. Zero means
+     * "no limit"; a non-zero value is enforced on the execution's own cgroup
+     * leaf, and the execution is refused if the guest cannot enforce it.
+     */
+    uint32_t mem_mb;
+    uint32_t cpu_percent;
+    uint32_t pids_max;
 };
 
 /*
@@ -173,6 +221,51 @@ struct host_mappings {
 struct launch_failure {
     int32_t stage;
     int32_t error;
+};
+
+/*
+ * One execution the agent supervises. Each has its own process group, cgroup
+ * leaf, output pipes, deadline and output budget, so the agent can move several
+ * of them forward in one poll loop instead of blocking on a single child.
+ */
+#define SLOT_USED 0x0001U
+#define SLOT_STDOUT_OPEN 0x0002U
+#define SLOT_STDERR_OPEN 0x0004U
+#define SLOT_EXITED 0x0008U
+#define SLOT_CANCELLED 0x0010U
+#define SLOT_TIMED_OUT 0x0020U
+#define SLOT_OUTPUT_LIMITED 0x0040U
+#define SLOT_STRAGGLERS_KILLED 0x0080U
+/*
+ * The host that could observe this execution is gone. Its output is drained
+ * and its process killed, but nothing may be sent for it again: a reply for the
+ * old epoch would be a protocol violation.
+ */
+#define SLOT_ABANDONED 0x0100U
+
+struct exec_slot {
+    uint32_t flags;
+    uint64_t request_id;
+    pid_t child;
+    int stdout_fd;
+    int stderr_fd;
+    /* Direct mode: the child closes this pipe when it replaces itself with setpriv,
+     * or writes why it could not. Read once the child has exited. */
+    int launch_fd;
+    /* Owned by the slot and released when the execution ends. */
+    char **workload_argv;
+    struct exec_config config;
+    uint32_t timeout_ms;
+    uint64_t started_ms;
+    size_t output_bytes;
+    int wait_status;
+    int launch_report;
+    struct launch_failure launch_failure;
+    /* Empty when the execution has no cgroup (sandbox mode). */
+    char cgroup[EXEC_CGROUP_NAME_BYTES];
+    int cgroup_ready;
+    /* Attempts spent settling this execution's cgroup, so one pass stays bounded. */
+    unsigned settle_attempts;
 };
 
 static uint16_t read_u16(const uint8_t *bytes)
@@ -870,31 +963,54 @@ static int release_container_barrier(const char *path, pid_t child)
     return -1;
 }
 
-static int enable_pids_controller(void)
+/*
+ * Enables one controller in the root cgroup, so every leaf below it can enforce
+ * it. The kernel refuses a controller it does not offer, which is how a caller
+ * learns that a limit it asked for cannot be enforced in this guest.
+ */
+static int enable_controller(const char *controller)
 {
-    int fd = open(CGROUP_ROOT "/cgroup.subtree_control", O_WRONLY | O_CLOEXEC);
+    char command[32];
+    int fd;
     int result;
     int status;
+    int length = snprintf(command, sizeof(command), "+%s", controller);
 
+    if (length <= 0 || (size_t)length >= sizeof(command)) {
+        errno = EINVAL;
+        return -1;
+    }
+    /*
+     * cgroupfs ignores the file position of a write, so O_APPEND changes
+     * nothing there; it keeps the sequence visible when the file is a regular
+     * one, as the unit tests' stand-in for the hierarchy is.
+     */
+    fd = open(CGROUP_ROOT "/cgroup.subtree_control", O_WRONLY | O_APPEND | O_CLOEXEC);
     if (fd < 0) {
         return -1;
     }
-    result = write_all(fd, "+pids", 5);
+    result = write_all(fd, command, (size_t)length);
     status = errno;
     if (close(fd) != 0 && result == 0) {
         return -1;
     }
-    errno = status;
+    if (result != 0) {
+        errno = status;
+    }
     return result;
 }
 
 /*
- * Direct-mode workloads run in the guest's own root file system, contained by
- * a cgroup that every process of the workload inherits, whatever session or
- * process group it moves to. Killing the cgroup ends all of them, and its pids
+ * Direct-mode workloads run in the guest's own root file system, contained by a
+ * cgroup leaf that every process of the execution inherits, whatever session or
+ * process group it moves to. Killing the leaf ends all of them, and its pids
  * controller counts each of them until PID 1 reaps it.
+ *
+ * `pids` is always enabled: it is what proves an execution has really finished.
+ * `memory` and `cpu` are enabled only when an execution asks for them, so a
+ * guest that offers neither still runs unrestricted executions.
  */
-static int prepare_exec_cgroup(void)
+static int prepare_cgroup_root(int need_memory, int need_cpu)
 {
     struct stat status;
 
@@ -907,22 +1023,39 @@ static int prepare_exec_cgroup(void)
             return -1;
         }
     }
-    if (mkdir(EXEC_CGROUP, 0755) != 0 && errno != EEXIST) {
+    if (enable_controller("pids") != 0) {
         return -1;
     }
-    if (stat(EXEC_CGROUP "/pids.current", &status) == 0) {
-        return 0;
+    if (need_memory && enable_controller("memory") != 0) {
+        return -1;
     }
-    return errno == ENOENT ? enable_pids_controller() : -1;
+    if (need_cpu && enable_controller("cpu") != 0) {
+        return -1;
+    }
+    return 0;
 }
 
-static int join_exec_cgroup(void)
+/* Leaf the next forked child joins; the child inherits it across fork(). */
+static const char *g_child_cgroup;
+
+static int join_cgroup(const char *path)
 {
     char buffer[32];
-    int fd = open(EXEC_CGROUP "/cgroup.procs", O_WRONLY | O_CLOEXEC);
+    char procs[EXEC_CGROUP_NAME_BYTES + 16U];
+    int fd;
     int length;
     int result;
+    int written = snprintf(procs, sizeof(procs), "%s/cgroup.procs", path);
 
+    if (written <= 0 || (size_t)written >= sizeof(procs)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    /*
+     * O_CREAT is a no-op on cgroupfs, which creates a leaf's files with the
+     * leaf; it lets the unit tests model a leaf with a plain directory.
+     */
+    fd = open(procs, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) {
         return -1;
     }
@@ -934,44 +1067,138 @@ static int join_exec_cgroup(void)
     return result;
 }
 
-static int kill_exec_cgroup(void)
+/* Writes one file of a cgroup leaf. */
+static int write_cgroup_file(const char *path, const char *name, const char *value)
 {
-    int fd = open(EXEC_CGROUP "/cgroup.kill", O_WRONLY | O_CLOEXEC);
+    char file[EXEC_CGROUP_NAME_BYTES + 32U];
+    int fd;
     int result;
     int status;
+    int written = snprintf(file, sizeof(file), "%s/%s", path, name);
 
-    if (fd < 0) {
-        goto error;
+    if (written <= 0 || (size_t)written >= sizeof(file)) {
+        errno = ENAMETOOLONG;
+        return -1;
     }
-    result = write_all(fd, "1", 1);
+    /* O_CREAT is a no-op on cgroupfs; see join_cgroup(). */
+    fd = open(file, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return -1;
+    }
+    result = write_all(fd, value, strlen(value));
     status = errno;
     if (close(fd) != 0 && result == 0) {
-        goto error;
+        return -1;
     }
-    if (result == 0) {
-        return 0;
+    if (result != 0) {
+        errno = status;
     }
-    errno = status;
-error:
-    status = errno;
-    portb_error("exec-cgroup-kill", status);
-    errno = status;
-    return -1;
+    return result;
+}
+
+/* Defined with the rest of the pids-controller helpers below. */
+static int cgroup_has_tasks(const char *path);
+
+/*
+ * Creates the leaf of one execution and applies its limits before the child can
+ * join it, so a workload never runs without what the caller asked for. A limit
+ * the guest cannot enforce fails here, and the execution is refused instead of
+ * running unlimited.
+ */
+static int create_slot_cgroup(struct exec_slot *slot, uint32_t memory_mib,
+    uint32_t cpu_percent, uint32_t pids_max)
+{
+    char value[64];
+    int written;
+
+    written = snprintf(slot->cgroup, sizeof(slot->cgroup), CGROUP_ROOT "/nvx-exec-%llu",
+        (unsigned long long)slot->request_id);
+    if (written <= 0 || (size_t)written >= sizeof(slot->cgroup)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (mkdir(slot->cgroup, 0755) != 0) {
+        /*
+         * A leaf that is already there is reusable only when it is empty: the
+         * request id must not inherit processes from an earlier execution.
+         */
+        int remaining;
+
+        if (errno != EEXIST) {
+            return -1;
+        }
+        remaining = cgroup_has_tasks(slot->cgroup);
+        if (remaining != 0) {
+            errno = EEXIST;
+            return -1;
+        }
+    }
+    if (memory_mib != 0) {
+        written = snprintf(value, sizeof(value), "%llu",
+            (unsigned long long)memory_mib * 1024ULL * 1024ULL);
+        if (written <= 0 || (size_t)written >= sizeof(value) ||
+            write_cgroup_file(slot->cgroup, "memory.max", value) != 0) {
+            return -1;
+        }
+        /* The whole execution dies with its cgroup, not a random task of it. */
+        if (write_cgroup_file(slot->cgroup, "memory.oom.group", "1") != 0) {
+            return -1;
+        }
+    }
+    if (cpu_percent != 0) {
+        unsigned long long quota =
+            (unsigned long long)cpu_percent * CGROUP_CPU_PERIOD_US / 100ULL;
+
+        written = snprintf(value, sizeof(value), "%llu %u", quota, CGROUP_CPU_PERIOD_US);
+        if (written <= 0 || (size_t)written >= sizeof(value) ||
+            write_cgroup_file(slot->cgroup, "cpu.max", value) != 0) {
+            return -1;
+        }
+    }
+    if (pids_max != 0) {
+        written = snprintf(value, sizeof(value), "%u", pids_max);
+        if (written <= 0 || (size_t)written >= sizeof(value) ||
+            write_cgroup_file(slot->cgroup, "pids.max", value) != 0) {
+            return -1;
+        }
+    }
+    slot->cgroup_ready = 1;
+    return 0;
+}
+
+static int kill_cgroup(const char *path)
+{
+    int result = write_cgroup_file(path, "cgroup.kill", "1");
+
+    if (result != 0) {
+        int status = errno;
+
+        portb_error("exec-cgroup-kill", status);
+        errno = status;
+    }
+    return result;
 }
 
 /*
- * Returns 1 if the pids controller still charges a task to the exec cgroup,
- * 0 if it charges none, or -1. A task stays charged until it is reaped, while
+ * Returns 1 if the pids controller still charges a task to the leaf, 0 if it
+ * charges none, or -1. A task stays charged until it is reaped, while
  * cgroup.events stops counting a killed process as populated before the
  * process even becomes a zombie.
  */
-static int exec_cgroup_has_tasks(void)
+static int cgroup_has_tasks(const char *path)
 {
     char buffer[32];
+    char file[EXEC_CGROUP_NAME_BYTES + 32U];
     size_t length = 0;
     size_t index;
-    int fd = open(EXEC_CGROUP "/pids.current", O_RDONLY | O_CLOEXEC);
+    int fd;
+    int written = snprintf(file, sizeof(file), "%s/pids.current", path);
 
+    if (written <= 0 || (size_t)written >= sizeof(file)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    fd = open(file, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         return -1;
     }
@@ -1016,13 +1243,16 @@ static int exec_cgroup_has_tasks(void)
 
 /*
  * Reaps exited children without blocking. The agent runs as PID 1, so besides
- * the workload's direct child it inherits every orphaned workload process.
+ * the direct child of each execution it inherits every orphaned workload
+ * process. A reaped child is matched to its slot, which is how the scheduler
+ * learns that an execution has exited.
  */
-static void reap_children(pid_t child, int *child_exited, int *wait_status)
+static void reap_children(struct exec_slot *slots, size_t count)
 {
     for (;;) {
         int status;
         pid_t pid = waitpid(-1, &status, WNOHANG);
+        size_t index;
 
         if (pid < 0 && errno == EINTR) {
             continue;
@@ -1030,66 +1260,68 @@ static void reap_children(pid_t child, int *child_exited, int *wait_status)
         if (pid <= 0) {
             return;
         }
-        if (pid == child && !*child_exited) {
-            *child_exited = 1;
-            *wait_status = status;
+        for (index = 0; index < count; ++index) {
+            struct exec_slot *slot = &slots[index];
+
+            if ((slot->flags & SLOT_USED) != 0 && slot->child == pid &&
+                (slot->flags & SLOT_EXITED) == 0) {
+                slot->flags |= SLOT_EXITED;
+                slot->wait_status = status;
+            }
         }
     }
 }
 
 /*
- * Reaps what the workload left to PID 1, then returns 0 if no task of the
- * exec cgroup remains, 1 if one does, or -1 on failure.
+ * Kills what is left of one execution and waits until it is gone: every process
+ * the execution started has exited and been reaped, so the next execution
+ * cannot find any of them in /proc, and its leaf can be removed.
+ *
+ * The wait is bounded per call: an execution that takes long to die must not
+ * keep the agent from answering control traffic, so the caller passes its
+ * attempt counter in and comes back on the next loop iteration. Returns 0 when
+ * the cgroup is empty, 1 when it is still settling, or -1 on failure.
  */
-static int reap_exec_cgroup(void)
-{
-    int exited = 1;
-    int status = 0;
-
-    reap_children(0, &exited, &status);
-    return exec_cgroup_has_tasks();
-}
-
-/*
- * Kills what is left of a direct-mode workload and waits until it is gone:
- * every process of the workload has exited and been reaped, so the next
- * workload cannot find any of them in /proc.
- */
-static int settle_exec_cgroup(void)
+static int settle_cgroup(const char *path, struct exec_slot *slots, size_t count,
+    unsigned *attempts)
 {
     const struct timespec delay = {
         .tv_sec = 0,
         .tv_nsec = 10U * 1000U * 1000U,
     };
-    unsigned int attempt;
+    unsigned pass;
 
-    if (kill_exec_cgroup() != 0) {
+    if (*attempts == 0 && kill_cgroup(path) != 0) {
         return -1;
     }
-    for (attempt = 0; attempt <= 200; ++attempt) {
-        int remaining = reap_exec_cgroup();
+    for (pass = 0; pass < SETTLE_ATTEMPTS_PER_PASS; ++pass, ++*attempts) {
+        int remaining;
 
+        reap_children(slots, count);
+        remaining = cgroup_has_tasks(path);
         if (remaining < 0) {
             return -1;
         }
         if (remaining == 0) {
             return 0;
         }
-        if (attempt == 200) {
-            break;
+        if (*attempts >= SETTLE_MAX_ATTEMPTS) {
+            errno = ETIMEDOUT;
+            return -1;
         }
         nanosleep(&delay, NULL);
     }
-    errno = ETIMEDOUT;
-    return -1;
+    return 1;
 }
 
-/* Kills the workload: its process group, and in direct mode its whole cgroup. */
-static void terminate_workload(const struct agent_config *config, pid_t child)
+/* Removes an empty leaf. A leaf that still holds tasks stays, and is logged. */
+static void remove_cgroup(const char *path)
 {
-    kill(-child, SIGKILL);
-    if (config->direct) {
-        (void)kill_exec_cgroup();
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+    if (rmdir(path) != 0 && errno != ENOENT) {
+        portb_error("exec-cgroup-remove", errno);
     }
 }
 
@@ -1181,7 +1413,7 @@ static void exec_direct(
     size_t index = 0;
     size_t workload_index = 0;
 
-    if (join_exec_cgroup() != 0) {
+    if (g_child_cgroup != NULL && join_cgroup(g_child_cgroup) != 0) {
         _exit(125);
     }
     if (setenv("HOME", config->home, 1) != 0 ||
@@ -1274,14 +1506,21 @@ static int decode_exec_payload(
     if (argc == 0 || argc > MAX_ARGUMENTS) {
         return -1;
     }
-    if (extension == EXEC_EXTENDED) {
-        if (payload_len < 16) {
+    if (extension == EXEC_EXTENDED || extension == EXEC_EXTENDED_V2) {
+        uint32_t header_len = extension == EXEC_EXTENDED_V2 ? 28U : 16U;
+
+        if (payload_len < header_len) {
             return -1;
         }
         flags = read_u16(payload + 8);
         environment_count = read_u16(payload + 10);
         cwd_len = read_u32(payload + 12);
-        offset = 16;
+        if (extension == EXEC_EXTENDED_V2) {
+            config->mem_mb = read_u32(payload + 16);
+            config->cpu_percent = read_u32(payload + 20);
+            config->pids_max = read_u32(payload + 24);
+        }
+        offset = header_len;
         if ((flags &
              ~(EXEC_CWD_PRESENT | EXEC_ENVIRONMENT_PRESENT |
                EXEC_INHERIT_DEFAULT_ENV)) != 0 ||
@@ -1291,7 +1530,10 @@ static int decode_exec_payload(
             ((flags & EXEC_ENVIRONMENT_PRESENT) == 0 &&
              (environment_count != 0 ||
               (flags & EXEC_INHERIT_DEFAULT_ENV) != 0)) ||
-            environment_count > MAX_ENVIRONMENT) {
+            environment_count > MAX_ENVIRONMENT ||
+            config->mem_mb > MAX_EXEC_MEMORY_MIB ||
+            config->cpu_percent > MAX_EXEC_CPU_PERCENT ||
+            config->pids_max > MAX_EXEC_PIDS) {
             return -1;
         }
     } else if (extension != 0) {
@@ -1325,7 +1567,7 @@ static int decode_exec_payload(
         (extension == 0 && offset != payload_len)) {
         goto fail;
     }
-    if (extension == EXEC_EXTENDED) {
+    if (extension != 0) {
         if (cwd_len != 0) {
             if (cwd_len > payload_len - offset ||
                 memchr(payload + offset, '\0', cwd_len) != NULL ||
@@ -1663,67 +1905,10 @@ static int stream_output(
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return 0;
         } else {
-            return -1;
+            /* The pipe, not the control channel: only this execution is affected. */
+            return -3;
         }
     }
-}
-
-/* Outcome of control traffic observed while a workload runs. */
-enum exec_control {
-    EXEC_CONTROL_NONE,
-    EXEC_CONTROL_CANCEL,
-    EXEC_CONTROL_SESSION_LOST,
-    EXEC_CONTROL_FAILED,
-};
-
-/*
- * Handles one control record that arrives while the workload with request ID
- * `exec_id` runs. CANCEL for that workload asks for its termination. A RESET
- * means the host that could observe the workload is gone: the broker has
- * started a new epoch and drops anything sent for the old one. Other requests
- * are refused, because executions are sequential.
- */
-static enum exec_control handle_exec_control(
-    struct control_session *session,
-    uint64_t exec_id)
-{
-    struct outer_record record;
-    struct app_request request;
-    enum exec_control result = EXEC_CONTROL_NONE;
-
-    if (read_outer_record(session->fd, &record) != 0) {
-        portb_error("exec-outer-read", errno);
-        return EXEC_CONTROL_FAILED;
-    }
-    if (record.type == OUTER_RESET) {
-        result = acknowledge_reset(session, &record) == 0
-                     ? EXEC_CONTROL_SESSION_LOST
-                     : EXEC_CONTROL_FAILED;
-        free_outer_record(&record);
-        return result;
-    }
-    if (record.type != OUTER_DATA || record.sequence != session->host_sequence ||
-        record.epoch != session->epoch ||
-        memcmp(record.instance_id, session->instance_id, 16) != 0 ||
-        parse_app_request(record.payload, record.payload_len, &request) != 0) {
-        portb_error("exec-record", record.type);
-        free_outer_record(&record);
-        return EXEC_CONTROL_FAILED;
-    }
-    ++session->host_sequence;
-    if (send_credit(session, record.payload_len) != 0) {
-        free_outer_record(&record);
-        return EXEC_CONTROL_FAILED;
-    }
-    if (request.kind == APP_CANCEL) {
-        if (request.payload_len == 0 && request.request_id == exec_id) {
-            result = EXEC_CONTROL_CANCEL;
-        }
-    } else if (send_app_error(session, request.request_id, 16, "busy") != 0) {
-        result = EXEC_CONTROL_FAILED;
-    }
-    free_outer_record(&record);
-    return result;
 }
 
 /* Discards output of a workload whose host is gone; returns 1 at end-of-file. */
@@ -1743,7 +1928,8 @@ static int drain_output(int fd)
         if (errno == EINTR) {
             continue;
         }
-        return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
+        /* Nothing consumes this stream any more, so a read error ends it like end-of-file. */
+        return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : 1;
     }
 }
 
@@ -1818,9 +2004,18 @@ static void close_pipe(int pipe_fds[2])
     }
 }
 
-static int run_exec(
+/*
+ * Starts one execution: its cgroup leaf and limits, its output pipes and its
+ * child. Nothing here waits for the workload; the scheduler drives the slot
+ * forward, which is what lets several executions run at once.
+ *
+ * On failure the caller still owns `workload_argv` and `exec_config`, and this
+ * function has already told the host why.
+ */
+static int start_slot(
     struct control_session *session,
     const struct agent_config *config,
+    struct exec_slot *slot,
     uint64_t request_id,
     uint32_t timeout_ms,
     char **workload_argv,
@@ -1831,36 +2026,33 @@ static int run_exec(
     int stderr_pipe[2] = {-1, -1};
     int exec_config_fd = -1;
     int launch_pipe[2] = {-1, -1};
-    struct launch_failure launch_failure = {0};
-    int launch_report = 0;
-    pid_t child;
-    uint64_t started;
-    size_t output_bytes = 0;
-    int stdout_open = 1;
-    int stderr_open = 1;
-    int timed_out = 0;
-    int output_limited = 0;
-    int cancelled = 0;
-    int session_lost = 0;
-    int stragglers_killed = 0;
-    int wait_status = 0;
-    int child_exited = 0;
     int launch_failed = 0;
+    int wants_limits = exec_config->mem_mb != 0 || exec_config->cpu_percent != 0 ||
+                       exec_config->pids_max != 0;
+    pid_t child;
 
-    if (config->direct && prepare_exec_cgroup() != 0) {
-        portb_error("exec-cgroup", errno);
-        return send_app_error(session, request_id, 125, "launch-failed");
-    }
+    memset(slot, 0, sizeof(*slot));
+    slot->stdout_fd = -1;
+    slot->stderr_fd = -1;
+    slot->launch_fd = -1;
+    slot->request_id = request_id;
     if (config->direct) {
-        /* A workload whose settlement timed out may have exited since. */
-        int remaining = reap_exec_cgroup();
-
-        if (remaining != 0) {
-            portb_error("exec-cgroup-verify", remaining < 0 ? errno : EBUSY);
-            return send_app_error(session, request_id, 125, "containment-failed");
+        /*
+         * The limits go on the leaf before the child joins it, so a workload
+         * never runs without the limits the caller asked for.
+         */
+        if (prepare_cgroup_root(exec_config->mem_mb != 0,
+                exec_config->cpu_percent != 0) != 0 ||
+            create_slot_cgroup(
+                slot, exec_config->mem_mb, exec_config->cpu_percent, exec_config->pids_max) !=
+                0) {
+            portb_error("exec-cgroup", errno);
+            remove_cgroup(slot->cgroup);
+            slot->cgroup_ready = 0;
+            return send_app_error(session, request_id, 125,
+                wants_limits ? "limit-unsupported" : "containment-failed");
         }
-    }
-    if (!config->direct) {
+    } else {
         unlink(barrier);
         if (mkfifo(barrier, 0600) != 0) {
             return send_app_error(session, request_id, 125, "launch-failed");
@@ -1871,29 +2063,29 @@ static int run_exec(
         (exec_config_fd = create_exec_config_fd(exec_config, config->direct)) < 0 ||
         (config->direct && pipe2(launch_pipe, O_CLOEXEC) != 0)) {
         unlink(barrier);
-        if (stdout_pipe[0] >= 0) {
-            close(stdout_pipe[0]);
-            close(stdout_pipe[1]);
-        }
-        if (stderr_pipe[0] >= 0) {
-            close(stderr_pipe[0]);
-            close(stderr_pipe[1]);
-        }
+        close_pipe(stdout_pipe);
+        close_pipe(stderr_pipe);
         if (exec_config_fd >= 0) {
             close(exec_config_fd);
         }
+        remove_cgroup(slot->cgroup);
+        slot->cgroup_ready = 0;
         return send_app_error(session, request_id, 125, "launch-failed");
     }
 
+    /* The child reads this across fork(); the parent clears it right after. A
+     * child joins a leaf only when this execution really has one. */
+    g_child_cgroup = (config->direct && slot->cgroup_ready) ? slot->cgroup : NULL;
     child = fork();
     if (child < 0) {
-        close(stdout_pipe[0]);
-        close(stdout_pipe[1]);
-        close(stderr_pipe[0]);
-        close(stderr_pipe[1]);
+        g_child_cgroup = NULL;
+        close_pipe(stdout_pipe);
+        close_pipe(stderr_pipe);
         close(exec_config_fd);
         close_pipe(launch_pipe);
         unlink(barrier);
+        remove_cgroup(slot->cgroup);
+        slot->cgroup_ready = 0;
         return send_app_error(session, request_id, 125, "launch-failed");
     }
     if (child == 0) {
@@ -1938,6 +2130,7 @@ static int run_exec(
         exec_sandbox(config, barrier, config_fd, workload_argv);
     }
 
+    g_child_cgroup = NULL;
     setpgid(child, child);
     close(exec_config_fd);
     close(stdout_pipe[1]);
@@ -1964,173 +2157,216 @@ static int run_exec(
         }
     }
     if (launch_failed) {
-        terminate_workload(config, child);
+        kill(-child, SIGKILL);
+        if (config->direct && slot->cgroup_ready) {
+            (void)kill_cgroup(slot->cgroup);
+        }
         waitpid(child, NULL, 0);
         close(stdout_pipe[0]);
         close(stderr_pipe[0]);
         close_pipe(launch_pipe);
         unlink(barrier);
+        remove_cgroup(slot->cgroup);
+        slot->cgroup_ready = 0;
         return send_app_error(session, request_id, 125, "launch-failed");
     }
     unlink(barrier);
-    started = monotonic_milliseconds();
+    slot->child = child;
+    slot->workload_argv = workload_argv;
+    slot->config = *exec_config;
+    slot->timeout_ms = timeout_ms;
+    slot->started_ms = monotonic_milliseconds();
+    slot->output_bytes = 0;
+    slot->stdout_fd = stdout_pipe[0];
+    slot->stderr_fd = stderr_pipe[0];
+    slot->launch_fd = launch_pipe[0];
+    slot->flags = SLOT_USED | SLOT_STDOUT_OPEN | SLOT_STDERR_OPEN;
+    return 0;
+}
 
-    while (!child_exited || stdout_open || stderr_open) {
-        struct pollfd descriptors[3];
-        int poll_result;
-        int stdout_result = 0;
-        int stderr_result = 0;
+/* The slot of one execution, or NULL when the request is not running here. */
+static struct exec_slot *slot_for_request(
+    struct exec_slot *slots, size_t count, uint64_t request_id)
+{
+    size_t index;
 
-        descriptors[0].fd = stdout_open ? stdout_pipe[0] : -1;
-        descriptors[0].events = POLLIN | POLLHUP;
-        descriptors[0].revents = 0;
-        descriptors[1].fd = stderr_open ? stderr_pipe[0] : -1;
-        descriptors[1].events = POLLIN | POLLHUP;
-        descriptors[1].revents = 0;
-        /* After a reset the old session is gone; later records belong to the main loop. */
-        descriptors[2].fd = session_lost ? -1 : session->fd;
-        descriptors[2].events = POLLIN;
-        descriptors[2].revents = 0;
-        poll_result = poll(descriptors, 3, 25);
-        if (poll_result < 0 && errno != EINTR) {
-            terminate_workload(config, child);
-        }
-        if (!session_lost && descriptors[2].revents != 0) {
-            switch (handle_exec_control(session, request_id)) {
-            case EXEC_CONTROL_NONE:
-                break;
-            case EXEC_CONTROL_CANCEL:
-                if (!child_exited && !cancelled) {
-                    cancelled = 1;
-                    terminate_workload(config, child);
-                }
-                break;
-            case EXEC_CONTROL_SESSION_LOST:
-                session_lost = 1;
-                terminate_workload(config, child);
-                break;
-            case EXEC_CONTROL_FAILED:
-                terminate_workload(config, child);
-                waitpid(child, NULL, 0);
-                if (stdout_open) {
-                    close(stdout_pipe[0]);
-                }
-                if (stderr_open) {
-                    close(stderr_pipe[0]);
-                }
-                close_pipe(launch_pipe);
-                return -1;
-            }
-        }
-        if (stdout_open && descriptors[0].revents != 0) {
-            stdout_result = session_lost
-                                ? drain_output(stdout_pipe[0])
-                                : stream_output(
-                                      session,
-                                      request_id,
-                                      stdout_pipe[0],
-                                      APP_STDOUT,
-                                      &output_bytes);
-        }
-        if (stderr_open && descriptors[1].revents != 0) {
-            stderr_result = session_lost
-                                ? drain_output(stderr_pipe[0])
-                                : stream_output(
-                                      session,
-                                      request_id,
-                                      stderr_pipe[0],
-                                      APP_STDERR,
-                                      &output_bytes);
-        }
-        if (stdout_result == 1) {
-            close(stdout_pipe[0]);
-            stdout_open = 0;
-        }
-        if (stderr_result == 1) {
-            close(stderr_pipe[0]);
-            stderr_open = 0;
-        }
-        if (stdout_result < 0 || stderr_result < 0) {
-            output_limited = stdout_result == -2 || stderr_result == -2;
-            terminate_workload(config, child);
-        }
-        reap_children(child, &child_exited, &wait_status);
-        /* Processes the workload left behind must not hold its output open. */
-        if (child_exited && config->direct && !stragglers_killed &&
-            (stdout_open || stderr_open)) {
-            stragglers_killed = 1;
-            (void)kill_exec_cgroup();
-        }
-        if (!child_exited && timeout_ms != 0 &&
-            monotonic_milliseconds() - started >= timeout_ms) {
-            timed_out = 1;
-            terminate_workload(config, child);
-        }
-        if ((timed_out || output_limited || cancelled || session_lost) && !child_exited) {
-            if (waitpid(child, &wait_status, 0) == child) {
-                child_exited = 1;
-            }
+    for (index = 0; index < count; ++index) {
+        if ((slots[index].flags & SLOT_USED) != 0 && slots[index].request_id == request_id) {
+            return &slots[index];
         }
     }
+    return NULL;
+}
 
-    /* The child has exited, so its launch report, if any, is complete. */
-    if (config->direct) {
-        launch_report = read_launch_failure(launch_pipe[0], &launch_failure);
-        if (launch_report < 0) {
+static struct exec_slot *free_slot(struct exec_slot *slots, size_t count)
+{
+    size_t index;
+
+    for (index = 0; index < count; ++index) {
+        if ((slots[index].flags & SLOT_USED) == 0) {
+            return &slots[index];
+        }
+    }
+    return NULL;
+}
+
+/* Releases everything a slot owns. The caller has already reaped its child. */
+static void release_slot(struct exec_slot *slot)
+{
+    if (slot->stdout_fd >= 0) {
+        close(slot->stdout_fd);
+    }
+    if (slot->stderr_fd >= 0) {
+        close(slot->stderr_fd);
+    }
+    if (slot->launch_fd >= 0) {
+        close(slot->launch_fd);
+    }
+    free_arguments(slot->workload_argv);
+    free_exec_config(&slot->config);
+    if (slot->cgroup_ready) {
+        remove_cgroup(slot->cgroup);
+    }
+    memset(slot, 0, sizeof(*slot));
+    slot->stdout_fd = -1;
+    slot->stderr_fd = -1;
+    slot->launch_fd = -1;
+}
+
+/* Kills one execution and everything it started. */
+static void terminate_slot(const struct agent_config *config, struct exec_slot *slot)
+{
+    if ((slot->flags & SLOT_USED) == 0) {
+        return;
+    }
+    if (slot->child > 0 && (slot->flags & SLOT_EXITED) == 0) {
+        (void)kill(-slot->child, SIGKILL);
+        (void)kill(slot->child, SIGKILL);
+    }
+    if (config->direct && slot->cgroup_ready) {
+        (void)kill_cgroup(slot->cgroup);
+    }
+}
+
+/*
+ * Reports the terminal state of an execution whose child has exited and whose
+ * output pipes have reached end-of-file, then releases it. The execution's
+ * cgroup is settled first, so nothing it left behind survives to be seen by a
+ * later execution.
+ */
+static int finish_slot(
+    struct control_session *session,
+    const struct agent_config *config,
+    struct exec_slot *slots,
+    size_t count,
+    struct exec_slot *slot)
+{
+    const int abandoned = (slot->flags & SLOT_ABANDONED) != 0;
+    int result = 0;
+
+    if (slot->launch_fd >= 0) {
+        slot->launch_report = read_launch_failure(slot->launch_fd, &slot->launch_failure);
+        if (slot->launch_report < 0) {
             portb_error("exec-launch-report", errno);
         }
-        close_pipe(launch_pipe);
+        close(slot->launch_fd);
+        slot->launch_fd = -1;
     }
-    if (config->direct && settle_exec_cgroup() != 0) {
-        portb_error("exec-cgroup-settle", errno);
-        return session_lost
-                   ? 0
-                   : send_app_error(session, request_id, 125, "containment-failed");
+    if (config->direct && slot->cgroup_ready) {
+        int settled = settle_cgroup(
+            slot->cgroup, slots, count, &slot->settle_attempts);
+
+        if (settled > 0) {
+            /* Still emptying: nothing is reported or released yet, and the loop comes back. */
+            return 1;
+        }
+        if (settled < 0) {
+            portb_error("exec-cgroup-settle", errno);
+            if (!abandoned) {
+                result = send_app_error(session, slot->request_id, 125, "containment-failed");
+            }
+            /* The leaf keeps whatever could not be killed; it stays for the
+             * next examination instead of being reported as cleaned. */
+            slot->cgroup_ready = 0;
+            release_slot(slot);
+            return result;
+        }
     }
-    if (session_lost) {
-        /* Nothing may be sent for the abandoned exec once the new epoch is acknowledged. */
-        return 0;
+    if (!abandoned) {
+        if (slot->launch_report > 0 && slot->launch_failure.stage == LAUNCH_STAGE_CWD) {
+            result = refuse_working_directory(session, slot->request_id,
+                slot->config.cwd == NULL ? "/" : slot->config.cwd,
+                slot->launch_failure.error);
+        } else if (slot->launch_report > 0) {
+            portb_error("exec-launch", slot->launch_failure.error);
+            result = send_app_error(session, slot->request_id, 125, "launch-failed");
+        } else if ((slot->flags & SLOT_CANCELLED) != 0) {
+            result = send_app_frame(
+                session, APP_EXIT, slot->request_id, 128 + SIGKILL, "cancelled", 9);
+        } else if ((slot->flags & SLOT_TIMED_OUT) != 0) {
+            result = send_app_frame(
+                session, APP_EXIT, slot->request_id, 124, "timeout", 7);
+        } else if ((slot->flags & SLOT_OUTPUT_LIMITED) != 0) {
+            result = send_app_frame(
+                session, APP_EXIT, slot->request_id, 125, "output-limit", 12);
+        } else if (WIFEXITED(slot->wait_status)) {
+            result = send_app_frame(session, APP_EXIT, slot->request_id,
+                WEXITSTATUS(slot->wait_status), "exit", 4);
+        } else if (WIFSIGNALED(slot->wait_status)) {
+            result = send_app_frame(session, APP_EXIT, slot->request_id,
+                128 + WTERMSIG(slot->wait_status), "signal", 6);
+        } else {
+            result = send_app_frame(
+                session, APP_EXIT, slot->request_id, 125, "failed", 6);
+        }
     }
-    /* A child that reported a launch failure exited without running anything. */
-    if (launch_report > 0 && launch_failure.stage == LAUNCH_STAGE_CWD) {
-        return refuse_working_directory(
-            session,
-            request_id,
-            exec_config->cwd == NULL ? "/" : exec_config->cwd,
-            launch_failure.error);
+    release_slot(slot);
+    return result;
+}
+
+/*
+ * Kills every execution and waits (bounded) until their cgroups are empty.
+ * Used when the agent stops, and when the host that could observe the
+ * executions is gone: in the latter case the slots are marked abandoned first,
+ * so no reply is sent for them in the old epoch.
+ */
+static int terminate_all_slots(
+    const struct agent_config *config, struct exec_slot *slots, size_t count)
+{
+    size_t index;
+    int result = 0;
+
+    for (index = 0; index < count; ++index) {
+        if ((slots[index].flags & SLOT_USED) != 0) {
+            terminate_slot(config, &slots[index]);
+        }
     }
-    if (launch_report > 0) {
-        portb_error("exec-launch", launch_failure.error);
-        return send_app_error(session, request_id, 125, "launch-failed");
+    for (index = 0; index < count; ++index) {
+        struct exec_slot *slot = &slots[index];
+
+        if ((slot->flags & SLOT_USED) == 0) {
+            continue;
+        }
+        if (config->direct && slot->cgroup_ready) {
+            int settled;
+
+            /* Shutting down, so this pass may keep waiting; the bound is per attempt. */
+            do {
+                settled = settle_cgroup(
+                    slot->cgroup, slots, count, &slot->settle_attempts);
+            } while (settled > 0);
+            if (settled < 0) {
+                portb_error("exec-cgroup-settle", errno);
+                result = -1;
+                continue;
+            }
+        }
+        if ((slot->flags & SLOT_EXITED) == 0 && slot->child > 0) {
+            (void)waitpid(slot->child, NULL, 0);
+        }
+        release_slot(slot);
     }
-    if (cancelled) {
-        return send_app_frame(
-            session, APP_EXIT, request_id, 128 + SIGKILL, "cancelled", 9);
-    }
-    if (timed_out) {
-        return send_app_frame(
-            session, APP_EXIT, request_id, 124, "timeout", 7);
-    }
-    if (output_limited) {
-        return send_app_frame(
-            session, APP_EXIT, request_id, 125, "output-limit", 12);
-    }
-    if (WIFEXITED(wait_status)) {
-        return send_app_frame(
-            session,
-            APP_EXIT,
-            request_id,
-            WEXITSTATUS(wait_status),
-            "exit",
-            4);
-    }
-    if (WIFSIGNALED(wait_status)) {
-        int status = 128 + WTERMSIG(wait_status);
-        return send_app_frame(
-            session, APP_EXIT, request_id, status, "signal", 6);
-    }
-    return send_app_frame(
-        session, APP_EXIT, request_id, 125, "failed", 6);
+    return result;
 }
 
 /*
@@ -2144,7 +2380,7 @@ static uint32_t agent_features(const struct agent_config *config)
 
     if (config->direct) {
         features |= FEATURE_HOST_MAPPING_TABLE | FEATURE_RUNTIME_MAPPINGS | FEATURE_EXEC_CGROUP |
-                    FEATURE_EXEC_CWD;
+                    FEATURE_EXEC_CWD | FEATURE_EXEC_SLOTS | FEATURE_EXEC_LIMITS;
     }
     return features;
 }
@@ -2312,6 +2548,8 @@ static int handle_app_request(
     struct control_session *session,
     const struct agent_config *config,
     struct host_mappings *mappings,
+    struct exec_slot *slots,
+    size_t count,
     const struct app_request *request)
 {
     char **workload_argv = NULL;
@@ -2333,7 +2571,12 @@ static int handle_app_request(
             portb_error("ping-ready", errno);
         }
         return result;
-    case APP_EXEC:
+    case APP_EXEC: {
+        struct exec_slot *slot = NULL;
+        size_t capacity = config->direct ? count : 1U;
+        size_t live = 0;
+        size_t index;
+
         /* Workloads must not run without the host paths that they expect. */
         if (mappings->applied != mappings->expected) {
             return send_app_error(
@@ -2348,19 +2591,48 @@ static int handle_app_request(
             return send_app_error(
                 session, request->request_id, 22, "invalid-request");
         }
-        result = run_exec(
-            session,
-            config,
-            request->request_id,
-            timeout_ms,
-            workload_argv,
-            &exec_config);
-        free_arguments(workload_argv);
-        free_exec_config(&exec_config);
+        for (index = 0; index < count; ++index) {
+            live += (slots[index].flags & SLOT_USED) != 0;
+        }
+        if (live < capacity) {
+            slot = free_slot(slots, count);
+        }
+        if (slot == NULL) {
+            /*
+             * The agent is at capacity. Nothing was registered, so the host can
+             * retry once an execution finishes; "busy" says exactly that.
+             */
+            free_arguments(workload_argv);
+            free_exec_config(&exec_config);
+            return send_app_error(session, request->request_id, 16, "busy");
+        }
+        result = start_slot(session, config, slot, request->request_id, timeout_ms,
+            workload_argv, &exec_config);
+        if (result != 0) {
+            /* start_slot told the host why; the caller still owns these. */
+            free_arguments(workload_argv);
+            free_exec_config(&exec_config);
+        }
         return result;
-    case APP_CANCEL:
-        /* The targeted workload already finished and reported its outcome. */
+    }
+    case APP_CANCEL: {
+        struct exec_slot *slot;
+
+        if (request->payload_len != 0) {
+            return send_app_error(
+                session, request->request_id, 22, "invalid-request");
+        }
+        slot = slot_for_request(slots, count, request->request_id);
+        if (slot != NULL && (slot->flags & SLOT_EXITED) == 0) {
+            /* Only the execution named by the request is terminated; its
+             * siblings and the executions of other sessions keep running. */
+            slot->flags |= SLOT_CANCELLED;
+            terminate_slot(config, slot);
+        }
+        /* A cancel for an execution that already finished needs no reply: its
+         * terminal event has been sent and says what happened. */
         return 0;
+    }
     case APP_FEATURES:
         if (request->payload_len != 0) {
             return send_app_error(
@@ -2379,8 +2651,13 @@ static int handle_app_request(
     case APP_UNMAP:
         return handle_unmap(session, mappings, request);
     case APP_STOP:
-        if (request->payload_len != 0 ||
-            send_app_frame(
+        if (request->payload_len != 0) {
+            return -1;
+        }
+        /* Every execution ends before the VM does, so nothing is left to
+         * outlive the acknowledgement. */
+        (void)terminate_all_slots(config, slots, count);
+        if (send_app_frame(
                 session, APP_STOPPED, request->request_id, 0, NULL, 0) != 0) {
             return -1;
         }
@@ -2396,6 +2673,8 @@ static int handle_data_record(
     struct control_session *session,
     const struct agent_config *config,
     struct host_mappings *mappings,
+    struct exec_slot *slots,
+    size_t count,
     const struct outer_record *record)
 {
     struct app_request request;
@@ -2418,48 +2697,197 @@ static int handle_data_record(
         portb_error("data-credit", (int)record->payload_len);
         return -1;
     }
-    return handle_app_request(session, config, mappings, &request);
+    return handle_app_request(session, config, mappings, slots, count, &request);
 }
 
+/*
+ * The agent's event loop. One poll serves the control channel and every running
+ * execution at once, so an execution that takes a long time never keeps the
+ * agent from accepting, cancelling or reporting another one.
+ */
 static int run_agent(
     struct control_session *session,
     const struct agent_config *config,
     struct host_mappings *mappings)
 {
+    struct exec_slot slots[MAX_EXEC_SLOTS];
     struct outer_record record;
+    size_t index;
 
+    memset(slots, 0, sizeof(slots));
+    for (index = 0; index < MAX_EXEC_SLOTS; ++index) {
+        slots[index].stdout_fd = -1;
+        slots[index].stderr_fd = -1;
+        slots[index].launch_fd = -1;
+    }
     if (send_guest_attach(session->fd) != 0) {
         return -1;
     }
     for (;;) {
-        if (read_outer_record(session->fd, &record) != 0) {
-            portb_error("outer-read", errno);
-            return -1;
-        }
-        if (record.type == OUTER_RESET) {
-            if (acknowledge_reset(session, &record) != 0) {
-                portb_error("reset-ack", errno);
-                free_outer_record(&record);
-                return -1;
-            }
-        } else if (record.type == OUTER_DATA) {
-            int result = handle_data_record(session, config, mappings, &record);
+        struct pollfd descriptors[1 + 2 * MAX_EXEC_SLOTS];
+        size_t owners[1 + 2 * MAX_EXEC_SLOTS];
+        unsigned char kinds[1 + 2 * MAX_EXEC_SLOTS];
+        size_t wanted = 1;
+        int poll_result;
+        int channel_failed = 0;
 
-            if (result == AGENT_STOPPED) {
-                free_outer_record(&record);
-                return AGENT_STOPPED;
+        descriptors[0].fd = session->fd;
+        descriptors[0].events = POLLIN;
+        descriptors[0].revents = 0;
+        owners[0] = 0;
+        kinds[0] = 0;
+        for (index = 0; index < MAX_EXEC_SLOTS; ++index) {
+            struct exec_slot *slot = &slots[index];
+
+            if ((slot->flags & SLOT_USED) == 0) {
+                continue;
             }
-            if (result != 0) {
-                portb_error("data", errno);
-                free_outer_record(&record);
-                return -1;
+            if ((slot->flags & SLOT_STDOUT_OPEN) != 0) {
+                descriptors[wanted].fd = slot->stdout_fd;
+                descriptors[wanted].events = POLLIN | POLLHUP;
+                descriptors[wanted].revents = 0;
+                owners[wanted] = index;
+                kinds[wanted] = 1;
+                ++wanted;
             }
-        } else {
-            portb_error("outer-type", record.type);
-            free_outer_record(&record);
+            if ((slot->flags & SLOT_STDERR_OPEN) != 0) {
+                descriptors[wanted].fd = slot->stderr_fd;
+                descriptors[wanted].events = POLLIN | POLLHUP;
+                descriptors[wanted].revents = 0;
+                owners[wanted] = index;
+                kinds[wanted] = 2;
+                ++wanted;
+            }
+        }
+        poll_result = poll(descriptors, (nfds_t)wanted, 25);
+        if (poll_result < 0 && errno != EINTR) {
+            (void)terminate_all_slots(config, slots, MAX_EXEC_SLOTS);
             return -1;
         }
-        free_outer_record(&record);
+        if (descriptors[0].revents != 0) {
+            int result;
+
+            if (read_outer_record(session->fd, &record) != 0) {
+                portb_error("outer-read", errno);
+                (void)terminate_all_slots(config, slots, MAX_EXEC_SLOTS);
+                return -1;
+            }
+            if (record.type == OUTER_RESET) {
+                if (acknowledge_reset(session, &record) != 0) {
+                    portb_error("reset-ack", errno);
+                    free_outer_record(&record);
+                    (void)terminate_all_slots(config, slots, MAX_EXEC_SLOTS);
+                    return -1;
+                }
+                /*
+                 * The host that could observe these executions is gone. They
+                 * are killed, their output is drained, and nothing is sent for
+                 * them again: a reply in the new epoch would be a violation.
+                 */
+                for (index = 0; index < MAX_EXEC_SLOTS; ++index) {
+                    if ((slots[index].flags & SLOT_USED) != 0) {
+                        slots[index].flags |= SLOT_ABANDONED;
+                        terminate_slot(config, &slots[index]);
+                    }
+                }
+            } else if (record.type == OUTER_DATA) {
+                result = handle_data_record(
+                    session, config, mappings, slots, MAX_EXEC_SLOTS, &record);
+                if (result == AGENT_STOPPED) {
+                    free_outer_record(&record);
+                    return AGENT_STOPPED;
+                }
+                if (result != 0) {
+                    portb_error("data", errno);
+                    free_outer_record(&record);
+                    (void)terminate_all_slots(config, slots, MAX_EXEC_SLOTS);
+                    return -1;
+                }
+            } else {
+                portb_error("outer-type", record.type);
+                free_outer_record(&record);
+                (void)terminate_all_slots(config, slots, MAX_EXEC_SLOTS);
+                return -1;
+            }
+            free_outer_record(&record);
+        }
+        /* Relay whatever output is ready, one chunk per open stream. */
+        for (index = 1; index < wanted; ++index) {
+            struct exec_slot *slot = &slots[owners[index]];
+            const int is_stdout = kinds[index] == 1;
+            const uint32_t open_bit = is_stdout ? SLOT_STDOUT_OPEN : SLOT_STDERR_OPEN;
+            int fd = is_stdout ? slot->stdout_fd : slot->stderr_fd;
+            int chunk;
+
+            if (descriptors[index].revents == 0 || (slot->flags & open_bit) == 0) {
+                continue;
+            }
+            chunk = (slot->flags & SLOT_ABANDONED) != 0
+                        ? drain_output(fd)
+                        : stream_output(session, slot->request_id, fd,
+                              is_stdout ? APP_STDOUT : APP_STDERR, &slot->output_bytes);
+            if (chunk == 1) {
+                close(fd);
+                if (is_stdout) {
+                    slot->stdout_fd = -1;
+                } else {
+                    slot->stderr_fd = -1;
+                }
+                slot->flags &= ~open_bit;
+            } else if (chunk < 0) {
+                if (chunk == -2) {
+                    slot->flags |= SLOT_OUTPUT_LIMITED;
+                } else if (chunk == -3) {
+                    /* One execution's pipe failed: end that execution, not the agent. */
+                    portb_error("exec-pipe-read", errno);
+                } else {
+                    /* The control channel itself failed. */
+                    channel_failed = 1;
+                }
+                terminate_slot(config, slot);
+            }
+        }
+        if (channel_failed) {
+            (void)terminate_all_slots(config, slots, MAX_EXEC_SLOTS);
+            return -1;
+        }
+        reap_children(slots, MAX_EXEC_SLOTS);
+        for (index = 0; index < MAX_EXEC_SLOTS; ++index) {
+            struct exec_slot *slot = &slots[index];
+
+            if ((slot->flags & SLOT_USED) == 0) {
+                continue;
+            }
+            /*
+             * A process the execution left behind must not hold its output
+             * open, or the terminal event would wait for something the caller
+             * no longer needs.
+             */
+            if ((slot->flags & (SLOT_EXITED | SLOT_STRAGGLERS_KILLED)) == SLOT_EXITED &&
+                (slot->flags & (SLOT_STDOUT_OPEN | SLOT_STDERR_OPEN)) != 0) {
+                slot->flags |= SLOT_STRAGGLERS_KILLED;
+                if (config->direct && slot->cgroup_ready) {
+                    (void)kill_cgroup(slot->cgroup);
+                }
+            }
+            if ((slot->flags & SLOT_EXITED) == 0 && slot->timeout_ms != 0 &&
+                monotonic_milliseconds() - slot->started_ms >= slot->timeout_ms) {
+                slot->flags |= SLOT_TIMED_OUT;
+                terminate_slot(config, slot);
+            }
+            if ((slot->flags & (SLOT_EXITED | SLOT_STDOUT_OPEN | SLOT_STDERR_OPEN)) ==
+                SLOT_EXITED) {
+                int finished =
+                    finish_slot(session, config, slots, MAX_EXEC_SLOTS, slot);
+
+                /* 1 means the execution's cgroup is still emptying: it is retried on the next
+                 * loop iteration, so control traffic keeps being served in the meantime. */
+                if (finished < 0) {
+                    (void)terminate_all_slots(config, slots, MAX_EXEC_SLOTS);
+                    return -1;
+                }
+            }
+        }
     }
 }
 

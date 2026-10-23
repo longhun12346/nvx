@@ -9,10 +9,11 @@
 //! caller must keep private to the VMM's user, and nothing here removes a share again.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::instance::{Instance, RuntimeRecord};
-use super::session::{self, ControlSession};
+use super::session::SharedSession;
 use crate::error::{Error, Result};
 use crate::protocol::{CAPABILITY_LEN, GuestFeatures, HostMap};
 
@@ -36,22 +37,36 @@ impl Instance {
         runtime: &RuntimeRecord,
         capability: &[u8; CAPABILITY_LEN],
         deadline: Instant,
-    ) -> Result<ControlSession> {
-        let fail = |error: session::SessionError| {
-            Error::protocol(format!(
-                "sandbox {}: cannot open a control session: {error:?}",
+    ) -> Result<Arc<SharedSession>> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::timed_out(format!(
+                "sandbox {}: no time left to reach the guest",
                 self.name()
-            ))
+            )));
+        }
+        // The VM serves one control session, which its executions use as well: a session of our
+        // own would wait for that one to end instead of reaching the guest.
+        let guest = self
+            .control_session(runtime, capability, remaining)
+            .map_err(|error| {
+                Error::protocol(format!(
+                    "sandbox {}: cannot open a control session: {error}",
+                    self.name()
+                ))
+            })?;
+        let features = match guest.features(deadline) {
+            Ok(features) => features,
+            Err(error) => {
+                // The session is unusable; a later call attaches a new one, which then reports a
+                // VM that stopped as such instead of as a protocol failure.
+                self.forget_control_session(runtime);
+                return Err(Error::protocol(format!(
+                    "sandbox {}: cannot read the guest features: {error:?}",
+                    self.name()
+                )));
+            }
         };
-        let mut guest = session::connect(&runtime.endpoint, runtime.pid, runtime.start_time, deadline)
-            .and_then(|transport| ControlSession::attach(transport, capability, deadline))
-            .map_err(fail)?;
-        let features = guest.features(deadline).map_err(|error| {
-            Error::protocol(format!(
-                "sandbox {}: cannot read the guest features: {error:?}",
-                self.name()
-            ))
-        })?;
         if !features.contains(GuestFeatures::RUNTIME_MAPPINGS) {
             return Err(Error::unsupported(format!(
                 "the guest image of sandbox {} does not accept runtime host mappings",
@@ -101,7 +116,7 @@ impl Instance {
             self.name(),
             share,
             || {
-                let mut guest = self.live_session(runtime, capability, deadline)?;
+                let guest = self.live_session(runtime, capability, deadline)?;
                 let map = HostMap {
                     source: share.child.to_owned(),
                     target: share.target.to_owned(),
@@ -133,7 +148,7 @@ impl Instance {
         timeout: Duration,
     ) -> Result<()> {
         let deadline = Instant::now() + timeout;
-        let mut guest = self.live_session(runtime, capability, deadline)?;
+        let guest = self.live_session(runtime, capability, deadline)?;
         guest.unmap_host_path(target, deadline).map_err(|error| {
             Error::protocol(format!(
                 "sandbox {}: the guest did not unmount the share: {error:?}",

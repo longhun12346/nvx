@@ -217,6 +217,8 @@ def main() -> int:
                 if sidecar.exits[one].get("outcome") != "exited":
                     raise RuntimeError(f"{one} did not exit cleanly: {sidecar.exits[one]}")
             print("two executions of one session met each other")
+            # Case ids are the contract with `verify-nvx-vm.ps1 -Stage P7`.
+            print("CASE p7.same_session.overlap PASS", flush=True)
 
             # Cancelling one execution must leave its sibling alone.
             sidecar.ok(
@@ -249,6 +251,7 @@ def main() -> int:
             if b"sibling" not in sidecar.stdout_of("C2"):
                 raise RuntimeError("the sibling's output was lost")
             print("cancelling one execution left its sibling running")
+            print("CASE p7.same_session.cancel_isolation PASS", flush=True)
 
             # A timeout belongs to one execution: the one that runs out of time ends as timedOut
             # while its sibling finishes normally.
@@ -520,6 +523,9 @@ def main() -> int:
                 except subprocess.TimeoutExpired:
                     limited.kill()
             print("nvxd parallel execution passed")
+            # Case ids are the contract with `verify-nvx-vm.ps1 -Stage P7`, so they are reported
+            # only once the whole entry has actually reached its end.
+            print("CASE p7.limits.exec_oom_keeps_vm PASS", flush=True)
         finally:
             try:
                 send_frame(process.stdin, {"op": "shutdown"})

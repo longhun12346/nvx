@@ -106,7 +106,11 @@ fn parse_args() -> Result<Args, String> {
         session_ttl_secs: 0,
         max_sessions: 0,
         max_queue: crate::registry::DEFAULT_QUEUE_DEPTH,
-        max_running: 1,
+        // Concurrent executions are on by default, up to what the guest agent can supervise:
+        // the run slots are the only concurrency limit and sessions are counted per VM. An image
+        // that does not advertise EXEC_SLOTS is refused at startup rather than run serially
+        // while claiming otherwise.
+        max_running: MAX_RUNNING,
         max_pending: DEFAULT_MAX_PENDING,
         work_workers: DEFAULT_WORK_WORKERS,
         outbound_capacity: outbound::DEFAULT_CAPACITY,

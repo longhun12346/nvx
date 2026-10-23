@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use aci_edge_sandboxes::nvx::host::filesystem::resolve_guest_path;
 use aci_edge_sandboxes::nvx::host::poc_live::LiveShare;
+use aci_edge_sandboxes::nvx::protocol::ExecLimits;
 use aci_edge_sandboxes::openvmm::OpenVmmBackend;
 use aci_edge_sandboxes::{
     AciEdgeSandbox, Canceller, ExecOutcome, ExecRequest, ProvisionRequest, SandboxId,
@@ -134,6 +135,9 @@ struct Spec {
     cwd_host: Option<String>,
     env: Vec<(String, String)>,
     timeout: Option<Duration>,
+    /// Per-execution limits this request asked for, if any. Zero fields keep the deployment's
+    /// configured value; a request that names none sends none.
+    limits: Option<ExecLimits>,
     /// The mounts this execution asked for, applied in the idle gap just before it runs.
     mounts: Vec<Mount>,
 }
@@ -168,6 +172,11 @@ struct Inner {
     /// Set while a fresh VM must be created; executions are refused rather than queued
     /// behind a boot that may fail.
     vm_present: bool,
+    /// Control features the running guest advertised at boot (0 when no VM is up).
+    ///
+    /// Kept so `probe` can answer truthfully about concurrency and per-execution limits
+    /// instead of having the caller assume what the image can do.
+    guest_features: u64,
 }
 
 /// Counters of what this sidecar has done since it started.
@@ -200,6 +209,9 @@ const GUEST_FEATURES_KEY: &str = "guestFeatures";
 /// Guest feature bit `EXEC_SLOTS`: the agent serves several executions at once
 /// (`guest/common/nvx-managed-agent.c`, `FEATURE_EXEC_SLOTS`).
 const GUEST_FEATURE_EXEC_SLOTS: u64 = 1 << 8;
+/// Guest feature bit `EXEC_LIMITS`: the agent enforces per-execution memory/CPU/pids limits on
+/// the execution's own cgroup, and refuses an execution whose limit it cannot write.
+const GUEST_FEATURE_EXEC_LIMITS: u64 = 1 << 9;
 
 pub struct Context {
     backend: Arc<OpenVmmBackend>,
@@ -265,6 +277,7 @@ impl Context {
                 cancels: HashMap::new(),
                 removals: Vec::new(),
                 vm_present: false,
+                guest_features: 0,
             }),
             wake: Condvar::new(),
             worker_running: AtomicBool::new(false),
@@ -308,16 +321,26 @@ impl Context {
                 .client
                 .probe()
                 .map(|()| {
-                    let generation = self.inner.lock().unwrap().registry.generation();
+                    let inner = self.inner.lock().unwrap();
+                    let generation = inner.registry.generation();
+                    let features = inner.guest_features;
                     json!({"backend": "nvx-whp", "provenance": self.provenance,
                            "vmGeneration": generation,
                            "capabilities": {
                                "sharedVm": true,
-                               // Concurrent executions are claimed only when this sidecar was
-                               // configured for them and the guest advertises them; the caller
-                               // reads maxRunningPerVm for the real limit.
+                               // Configured, not guessed: a guest without concurrent executions
+                               // is refused at startup (E_NVX_GUEST_NO_SLOTS), so once a VM is
+                               // up this claim is true. The caller reads maxRunningPerVm.
                                "parallelExec": self.max_running > 1,
                                "maxRunningPerVm": self.max_running,
+                               // Slots are counted per VM: a single session may use every one
+                               // of them while the other sessions are idle.
+                               "maxRunningPerSession": self.max_running,
+                               // Diagnostic, not a gate: the guest's own control feature bits, 0
+                               // before the first session opens a VM. An image that cannot enforce
+                               // per-execution limits refuses such an execution explicitly rather
+                               // than accepting it and ignoring the limit.
+                               "guestFeatures": features,
                                "sessionIsolation": false,
                            }})
                 })
@@ -420,6 +443,10 @@ impl Context {
                         .into_iter()
                         .filter(|view| view.session == *name)
                         .count(),
+                    // Per-session load. Slots are counted per VM and a session may hold all of
+                    // them, so these two numbers plus maxRunning are the whole concurrency story.
+                    "running": inner.registry.running_for_session(name),
+                    "queued": inner.registry.queued_for_session(name),
                     "busy": inner
                         .registry
                         .views()
@@ -456,6 +483,7 @@ impl Context {
             "execs": execs,
             "running": inner.registry.running_ids(),
             "maxRunning": inner.registry.max_running(),
+            "maxRunningPerSession": inner.registry.max_running_per_session(),
             "queued": inner.registry.queued_len(),
             "cleanupPending": inner.removals.len(),
             // How long the oldest unremoved export has been waiting. A number that keeps
@@ -770,26 +798,26 @@ impl Context {
                 return Err(fail("E_BACKEND_START", error));
             }
         };
+        // What this image can actually do, remembered for `probe`: a caller must not have to
+        // guess whether concurrency and per-execution limits are enforced.
+        let features = started
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(GUEST_FEATURES_KEY))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         // Concurrent executions need a guest that serves them; an image without the feature
         // would queue every execution behind one anyway, so claiming parallelism would be a lie.
-        if self.max_running > 1 {
-            let features = started
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get(GUEST_FEATURES_KEY))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if features & GUEST_FEATURE_EXEC_SLOTS == 0 {
-                let _ = self.client.deprovision(&sandbox);
-                return Err(fail(
-                    "E_NVX_GUEST_NO_SLOTS",
-                    format!(
-                        "the guest image does not advertise concurrent executions, but \\
-                         --max-running is {}; install the matching runtime or lower the limit",
-                        self.max_running
-                    ),
-                ));
-            }
+        if self.max_running > 1 && features & GUEST_FEATURE_EXEC_SLOTS == 0 {
+            let _ = self.client.deprovision(&sandbox);
+            return Err(fail(
+                "E_NVX_GUEST_NO_SLOTS",
+                format!(
+                    "the guest image does not advertise concurrent executions, but \
+                     --max-running is {}; install the matching runtime or lower the limit",
+                    self.max_running
+                ),
+            ));
         }
         let memory = match self.backend.vmm_process(&sandbox) {
             Ok((pid, start_time)) => Some(VmmMemory::new(pid, start_time)),
@@ -815,6 +843,7 @@ impl Context {
             }),
         });
         inner.vm_present = true;
+        inner.guest_features = features;
         drop(inner);
         self.retiring.store(false, Ordering::SeqCst);
         *self.vm.lock().unwrap() = Some(Arc::clone(&vm));
@@ -1016,6 +1045,12 @@ impl Context {
         }
         if let Some(timeout) = spec.timeout {
             request = request.with_timeout(timeout);
+        }
+        // Per-execution limits travel with this request alone. The backend keeps its configured
+        // values for whatever the caller left at zero, and the guest refuses an execution whose
+        // limit it cannot write into the execution's own cgroup.
+        if let Some(limits) = spec.limits {
+            request = request.with_limits(limits);
         }
         vm.touch();
         let mut execution = match self.client.exec(&vm.sandbox, &request) {
@@ -1460,7 +1495,24 @@ impl Context {
             Some(id) if !id.is_empty() => id.to_owned(),
             _ => format!("ex-{}-{:08x}", self.runtime_prefix, self.next_id()),
         };
-        let digest = digest_of(&argv, cwd_host.as_deref(), &env, timeout, &desired);
+        // What this execution may charge, taken from the request. Validated at the entry point,
+        // so anything non-zero here is inside what the guest agent can enforce. An image that
+        // cannot enforce limits is refused here, not left to run without them.
+        let exec_limits = head
+            .get("limits")
+            .and_then(Value::as_object)
+            .and_then(protocol::request_exec_limits);
+        if exec_limits.is_some() {
+            let features = self.inner.lock().unwrap().guest_features;
+            if features & GUEST_FEATURE_EXEC_LIMITS == 0 {
+                return Err(fail(
+                    protocol::REASON_GUEST_NO_LIMITS,
+                    "the guest image does not enforce per-execution limits; install the \
+                     matching runtime or drop the limits from this request",
+                ));
+            }
+        }
+        let digest = digest_of(&argv, cwd_host.as_deref(), &env, timeout, exec_limits, &desired);
         let generation = head.get("generation").and_then(|value| number(Some(value))).unwrap_or(0);
         let accepted = {
             let mut inner = self.inner.lock().unwrap();
@@ -1496,6 +1548,7 @@ impl Context {
                         cwd_host,
                         env,
                         timeout,
+                        limits: exec_limits,
                         mounts: desired,
                     },
                 );
@@ -1797,6 +1850,7 @@ impl Context {
         let vm = {
             let mut inner = self.inner.lock().unwrap();
             inner.vm_present = false;
+            inner.guest_features = 0;
             inner.removals.clear();
             inner.guest_targets.clear();
             inner.next_sequence = 0;
@@ -2078,6 +2132,7 @@ fn digest_of(
     cwd: Option<&str>,
     env: &[(String, String)],
     timeout: Option<Duration>,
+    limits: Option<ExecLimits>,
     mounts: &[Mount],
 ) -> u64 {
     let mut parts: Vec<String> = argv.to_vec();
@@ -2089,6 +2144,15 @@ fn digest_of(
         "timeout={}",
         timeout.map(|value| value.as_millis() as u64).unwrap_or(0)
     ));
+    // Limits belong to the request digest: reusing an exec id with a different memory or CPU
+    // bound is a different command, and must be refused as a conflict rather than silently
+    // keeping the first one's limits.
+    if let Some(limits) = limits {
+        parts.push(format!(
+            "limits={}:{}:{}",
+            limits.mem_mb, limits.cpu_percent, limits.pids_max
+        ));
+    }
     for mount in mounts {
         parts.push(format!(
             "mount={}:{}:{}:{}",

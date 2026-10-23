@@ -728,7 +728,24 @@ impl Backend for OpenVmmBackend {
         let mut workload = prepare_exec(&request.process)?;
         // The backend's configured per-execution limits travel with every request: the guest
         // enforces them on the execution's own cgroup, and refuses an execution it cannot.
-        workload.limits = self.config.exec_limits;
+        // A request that named its own limits overrides the configured value per field, so a
+        // caller can tighten one resource without silently dropping the deployment's others.
+        workload.limits = match request.limits {
+            None => self.config.exec_limits,
+            Some(wanted) => {
+                let mut merged = self.config.exec_limits;
+                if wanted.mem_mb > 0 {
+                    merged.mem_mb = wanted.mem_mb;
+                }
+                if wanted.cpu_percent > 0 {
+                    merged.cpu_percent = wanted.cpu_percent;
+                }
+                if wanted.pids_max > 0 {
+                    merged.pids_max = wanted.pids_max;
+                }
+                merged
+            }
+        };
         let instance = self.store.instance(sandbox_id);
         let (runtime, capability) = {
             let (_guard, _) = self.store.lock_and_load(sandbox_id)?;

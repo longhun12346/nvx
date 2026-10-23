@@ -152,6 +152,14 @@ struct SessionEntry {
     closing: bool,
     /// Every id this session was given, so closing it can find them all.
     execs: Vec<String>,
+    /// This session's own waiting executions, in submission order.
+    ///
+    /// Kept per session, not in one global FIFO: with several run slots a single session that
+    /// queued a burst would otherwise fill every freed slot and starve the others. Dispatch
+    /// walks the sessions in turn (see [`Registry::dispatch`]).
+    queue: VecDeque<String>,
+    /// Executions of this session holding a run slot right now.
+    running: usize,
 }
 
 /// Lifecycle of one VM instance and everything registered against it.
@@ -161,7 +169,11 @@ pub struct Registry {
     /// How many executions may run at the same time. One until the guest image and the product
     /// configuration both accept more.
     max_running: usize,
-    queue: VecDeque<String>,
+    /// Total queued executions, across sessions. The admission ceiling is per VM, so one
+    /// session's burst cannot push the VM past it either.
+    queued: usize,
+    /// Sessions with waiting work, in the order they are next to be served.
+    rotation: VecDeque<String>,
     /// Executions that hold a run slot, in dispatch order.
     running: Vec<String>,
     execs: HashMap<String, Exec>,
@@ -182,7 +194,8 @@ impl Registry {
             generation,
             max_queue: max_queue.max(1),
             max_running: max_running.max(1),
-            queue: VecDeque::new(),
+            queued: 0,
+            rotation: VecDeque::new(),
             running: Vec::new(),
             execs: HashMap::new(),
             finished: HashMap::new(),
@@ -202,7 +215,8 @@ impl Registry {
     /// ids must never resolve again.
     pub fn new_generation(&mut self) -> u64 {
         self.generation += 1;
-        self.queue.clear();
+        self.queued = 0;
+        self.rotation.clear();
         self.running.clear();
         self.execs.clear();
         self.finished.clear();
@@ -224,6 +238,8 @@ impl Registry {
             SessionEntry {
                 closing: false,
                 execs: Vec::new(),
+                queue: VecDeque::new(),
+                running: 0,
             },
         );
         true
@@ -271,10 +287,10 @@ impl Registry {
         if self.cancel_tombstone(id, Instant::now()) {
             return Accept::Cancelled;
         }
-        if self.queue.len() >= self.max_queue {
+        if self.queued >= self.max_queue {
             return Accept::QueueFull;
         }
-        let position = self.queue.len();
+        let position = self.queued;
         self.execs.insert(
             id.to_owned(),
             Exec {
@@ -288,9 +304,13 @@ impl Registry {
                 released: false,
             },
         );
-        self.queue.push_back(id.to_owned());
         if let Some(entry) = self.sessions.get_mut(session) {
             entry.execs.push(id.to_owned());
+            entry.queue.push_back(id.to_owned());
+        }
+        self.queued += 1;
+        if !self.rotation.iter().any(|known| known == session) {
+            self.rotation.push_back(session.to_owned());
         }
         Accept::Queued { position }
     }
@@ -298,23 +318,55 @@ impl Registry {
     /// Hands out the next executions that may start while run slots are free.
     ///
     /// Each returned id is now `Running` but not yet released: the caller answers its start
-    /// request, then calls [`Self::release`], and only then may events be emitted. The executions
-    /// are taken in queue order, so a session that queued first is served first; the caller
-    /// starts them concurrently.
+    /// request, then calls [`Self::release`], and only then may events be emitted. Sessions with
+    /// waiting work are served in turn (round robin), so one session's burst cannot take every
+    /// freed slot while another session waits; inside a session the order is submission order.
+    /// The caller starts the returned executions concurrently.
     pub fn dispatch(&mut self) -> Vec<String> {
         let mut started = Vec::new();
         while self.running.len() < self.max_running {
-            let Some(id) = self.queue.pop_front() else {
+            let Some(session) = self.next_ready_session() else {
+                break;
+            };
+            let mut popped = None;
+            if let Some(entry) = self.sessions.get_mut(&session) {
+                popped = entry.queue.pop_front();
+            }
+            let Some(id) = popped else {
                 break;
             };
             let Some(exec) = self.execs.get_mut(&id) else {
+                self.queued = self.queued.saturating_sub(1);
                 continue;
             };
             exec.phase = Phase::Running;
+            if let Some(entry) = self.sessions.get_mut(&session) {
+                entry.running += 1;
+            }
+            self.queued = self.queued.saturating_sub(1);
             self.running.push(id.clone());
             started.push(id);
         }
         started
+    }
+
+    /// Takes the next session with waiting work from the rotation, or `None` when none is left.
+    fn next_ready_session(&mut self) -> Option<String> {
+        for _ in 0..self.rotation.len() {
+            let session = self.rotation.pop_front()?;
+            let ready = self
+                .sessions
+                .get(&session)
+                .is_some_and(|entry| !entry.queue.is_empty());
+            if !ready {
+                // Closed, or it has nothing left to run: it leaves the rotation until it
+                // queues again.
+                continue;
+            }
+            self.rotation.push_back(session.clone());
+            return Some(session);
+        }
+        None
     }
 
     /// Opens the start gate for `id` once its reply has been written.
@@ -352,7 +404,32 @@ impl Registry {
     }
 
     pub fn queued_len(&self) -> usize {
-        self.queue.len()
+        self.queued
+    }
+
+    /// Executions of `session` holding a run slot right now.
+    pub fn running_for_session(&self, session: &str) -> usize {
+        self.sessions
+            .get(session)
+            .map(|entry| entry.running)
+            .unwrap_or(0)
+    }
+
+    /// Executions of `session` waiting for a slot right now.
+    pub fn queued_for_session(&self, session: &str) -> usize {
+        self.sessions
+            .get(session)
+            .map(|entry| entry.queue.len())
+            .unwrap_or(0)
+    }
+
+    /// The per-session ceiling this registry enforces.
+    ///
+    /// Slots are counted per VM, and a session may use all of them: concurrency is bounded by
+    /// the VM's run slots, not by a separate per-session quota. A single active session is
+    /// therefore never throttled below the VM's capacity while the other sessions are idle.
+    pub fn max_running_per_session(&self) -> usize {
+        self.max_running
     }
 
     /// Whether this session has an execution that has not finished yet.
@@ -378,10 +455,19 @@ impl Registry {
         if let Some(entry) = self.sessions.get_mut(&session) {
             entry.execs.retain(|known| known != id);
         }
-        if let Some(position) = self.running.iter().position(|running| running == id) {
-            self.running.remove(position);
+        if exec.phase == Phase::Running {
+            if let Some(position) = self.running.iter().position(|running| running == id) {
+                self.running.remove(position);
+            }
+            if let Some(entry) = self.sessions.get_mut(&session) {
+                entry.running = entry.running.saturating_sub(1);
+            }
         } else {
-            self.queue.retain(|queued| queued != id);
+            // Queued: it never held a slot, so only its queue entry and the VM-wide count go.
+            self.queued = self.queued.saturating_sub(1);
+            if let Some(entry) = self.sessions.get_mut(&session) {
+                entry.queue.retain(|queued| queued != id);
+            }
         }
         self.remember_finished(id, terminal, exec.digest);
         Some(session)
@@ -430,21 +516,19 @@ impl Registry {
     /// unbounded time behind somebody else's long task. Returns `(id, session)` pairs, so the
     /// caller can report each terminal state to the right stream.
     pub fn expire_queued(&mut self, now: Instant) -> Vec<(String, String)> {
-        let expired: Vec<(String, String)> = self
-            .queue
-            .iter()
-            .filter(|id| {
-                self.execs
-                    .get(*id)
-                    .and_then(|exec| exec.queue_deadline)
-                    .is_some_and(|deadline| deadline <= now)
-            })
-            .filter_map(|id| {
-                self.execs
+        let mut expired: Vec<(String, String)> = Vec::new();
+        for (session, entry) in self.sessions.iter() {
+            for id in entry.queue.iter() {
+                let due = self
+                    .execs
                     .get(id)
-                    .map(|exec| (id.clone(), exec.session.clone()))
-            })
-            .collect();
+                    .and_then(|exec| exec.queue_deadline)
+                    .is_some_and(|deadline| deadline <= now);
+                if due {
+                    expired.push((id.clone(), session.clone()));
+                }
+            }
+        }
         for (id, _) in &expired {
             let _ = self.finish(id, Terminal::timed_out("queue deadline expired"));
         }
@@ -478,7 +562,7 @@ impl Registry {
     pub fn is_idle(&self) -> bool {
         self.sessions.is_empty()
             && self.running.is_empty()
-            && self.queue.is_empty()
+            && self.queued == 0
             && self.execs.is_empty()
     }
 
@@ -605,7 +689,7 @@ mod tests {
         assert!(registry.is_released(&id));
     }
 
-    /// With more than one run slot, dispatch fills them in queue order.
+    /// With more than one run slot, dispatch fills them in turn across sessions.
     #[test]
     fn several_executions_run_at_once_when_the_slots_allow_it() {
         let mut registry = Registry::new(DEFAULT_QUEUE_DEPTH, 2, 1);
@@ -615,16 +699,43 @@ mod tests {
         accept(&mut registry, "A", "A2");
         accept(&mut registry, "B", "B1");
 
-        // One call fills both slots: two executions start together, the third waits.
-        assert_eq!(registry.dispatch(), ["A1", "A2"]);
-        assert_eq!(registry.running_ids(), ["A1", "A2"]);
+        // One call fills both slots: two executions start together, the third waits. The two
+        // slots go to different sessions, not both to the session that queued first.
+        assert_eq!(registry.dispatch(), ["A1", "B1"]);
+        assert_eq!(registry.running_ids(), ["A1", "B1"]);
         assert!(registry.dispatch().is_empty(), "both slots are taken");
 
         // Releasing one slot admits exactly one more, and leaves the other running.
         registry.finish("A1", Terminal::new("exited", Some(0), ""));
-        assert_eq!(registry.running_ids(), ["A2"], "A2 is untouched");
-        assert_eq!(registry.dispatch(), ["B1"]);
-        assert_eq!(registry.running_ids(), ["A2", "B1"]);
+        assert_eq!(registry.running_ids(), ["B1"], "B1 is untouched");
+        assert_eq!(registry.dispatch(), ["A2"]);
+        assert_eq!(registry.running_ids(), ["B1", "A2"]);
+    }
+
+    /// A burst from one session must not take every slot while another session waits.
+    #[test]
+    fn a_burst_from_one_session_does_not_starve_another() {
+        let mut registry = Registry::new(DEFAULT_QUEUE_DEPTH, 2, 1);
+        open(&mut registry, "A");
+        open(&mut registry, "B");
+        accept(&mut registry, "A", "A1");
+        accept(&mut registry, "A", "A2");
+        accept(&mut registry, "A", "A3");
+        accept(&mut registry, "B", "B1");
+
+        assert_eq!(registry.dispatch(), ["A1", "B1"], "B is served before A2");
+        assert_eq!(registry.running_for_session("A"), 1);
+        assert_eq!(registry.running_for_session("B"), 1);
+        assert_eq!(registry.queued_for_session("A"), 2);
+        assert_eq!(registry.queued_for_session("B"), 0);
+
+        // Slots are the only limit: one session may still hold both of them.
+        registry.finish("B1", Terminal::new("exited", Some(0), ""));
+        assert_eq!(registry.dispatch(), ["A2"]);
+        registry.finish("A1", Terminal::new("exited", Some(0), ""));
+        assert_eq!(registry.dispatch(), ["A3"]);
+        assert_eq!(registry.running_for_session("A"), 2, "one session may use every slot");
+        assert_eq!(registry.max_running_per_session(), 2, "counted per VM, not per session");
     }
 
     /// Closing a session stops every execution of it that holds a slot, not just one.
@@ -635,8 +746,8 @@ mod tests {
         open(&mut registry, "B");
         accept(&mut registry, "A", "A1");
         accept(&mut registry, "A", "A2");
-        accept(&mut registry, "B", "B1");
         assert_eq!(registry.dispatch(), ["A1", "A2"]);
+        accept(&mut registry, "B", "B1");
 
         let closed = registry.close_session("A");
 

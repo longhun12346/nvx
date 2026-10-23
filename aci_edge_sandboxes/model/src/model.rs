@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use nvx::protocol::ExecLimits;
+
 use crate::id::SandboxId;
 
 /// Backend-defined metadata returned by lifecycle operations.
@@ -424,6 +426,12 @@ pub struct ExecRequest {
     /// request.
     #[serde(skip)]
     pub stdin: StdinMode,
+    /// Per-execution resource limits asked for by this caller alone.
+    ///
+    /// Also a transport option, not part of the serialized request: each backend decides how to
+    /// enforce it, and whatever the caller leaves at zero keeps the backend's configured value.
+    #[serde(skip)]
+    pub limits: Option<ExecLimits>,
 }
 
 impl ExecRequest {
@@ -453,7 +461,19 @@ impl ExecRequest {
                 timeout: None,
             },
             stdin: StdinMode::Null,
+            limits: None,
         }
+    }
+
+    /// Asks for per-execution limits of this execution alone.
+    ///
+    /// A zero field keeps the backend's configured limit for that resource, so a caller can
+    /// tighten memory without touching the CPU budget. A request outside what the guest can
+    /// enforce is refused rather than silently clamped.
+    #[must_use]
+    pub fn with_limits(mut self, limits: ExecLimits) -> Self {
+        self.limits = Some(limits);
+        self
     }
 
     /// Sets the workload timeout.

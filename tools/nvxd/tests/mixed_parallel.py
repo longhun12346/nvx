@@ -311,8 +311,14 @@ def main() -> int:
         case("p7.cross_session.two_by_two")
 
         # --- fairness: one session's burst must not keep the other waiting ------------------
-        # A queues six short executions, then B queues one. With a per-VM round robin B is served
-        # in the first wave; a first-come-first-served dispatcher would run all six first.
+        # A queues six long executions (four fill the slots), then B queues one short one. With a
+        # per-VM round robin B is admitted as soon as the first slot frees, so it finishes about
+        # one wave later. A dispatcher that drains the burst first would only admit B two waves
+        # later. The bound is measured from submission, and the margin (one wave) is wide enough
+        # that guest start-up jitter inside a wave cannot decide the result -- comparing the exit
+        # order of tasks admitted in the same wave would measure that jitter, not fairness.
+        wave = 4
+        queued_at = time.monotonic()
         for index in range(6):
             sidecar.ok(
                 {
@@ -320,7 +326,7 @@ def main() -> int:
                     "op": "exec",
                     "session": "A",
                     "execId": f"F{index + 1}",
-                    "argv": ["sh", "-c", "sleep 1; echo done"],
+                    "argv": ["sh", "-c", f"sleep {wave}; echo done"],
                     "cwd": str(workspace_a),
                 },
                 120,
@@ -331,20 +337,24 @@ def main() -> int:
                 "op": "exec",
                 "session": "B",
                 "execId": "FB1",
-                "argv": ["sh", "-c", "sleep 1; echo done"],
+                "argv": ["sh", "-c", "echo quick"],
                 "cwd": str(workspace_b),
             },
             120,
         )
         burst = [f"F{index + 1}" for index in range(6)] + ["FB1"]
-        sidecar.await_exits(burst, time.monotonic() + 240)
+        # Only B's execution is timed: waiting for the burst too would measure A's second wave.
+        sidecar.await_exits(["FB1"], time.monotonic() + 120)
+        waited = time.monotonic() - queued_at
         if "FB1" not in sidecar.exit_order:
             raise RuntimeError(f"the other session's execution never finished: {sidecar.exit_order}")
-        if sidecar.exit_order.index("FB1") >= sidecar.exit_order.index("F6"):
+        # Two waves is what a first-come-first-served dispatcher costs; fair service is one.
+        if waited > wave * 2:
             raise RuntimeError(
-                "the burst was served before the other session was: "
+                f"the other session waited {waited:.1f}s, about two waves: exit order "
                 f"{sidecar.exit_order}"
             )
+        sidecar.await_exits(burst, time.monotonic() + 300)
         case("p7.fairness.a_burst_does_not_starve_another_session")
 
         # --- per-execution limits, scoped to the execution that asked for them --------------

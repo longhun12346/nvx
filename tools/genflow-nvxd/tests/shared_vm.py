@@ -114,6 +114,10 @@ def main():
     parser.add_argument("--repo", required=True, type=pathlib.Path)
     parser.add_argument("--initrd", required=True, type=pathlib.Path)
     parser.add_argument("--memory-mib", type=int, default=1024)
+    # This entry covers the serial shared-VM behaviour (queueing, ordering, close, revocation),
+    # so it stays at one run slot: with several slots the same three executions would overlap
+    # and their order would stop meaning anything.
+    parser.add_argument("--max-running", type=int, default=1)
     parser.add_argument(
         "--timeout",
         type=int,
@@ -153,6 +157,8 @@ def main():
                 str(args.initrd),
                 "--cpu-profile",
                 "host",
+                "--max-running",
+                str(args.max_running),
                 "--state-dir",
                 str(state),
             ],

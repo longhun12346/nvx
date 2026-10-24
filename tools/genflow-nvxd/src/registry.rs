@@ -738,6 +738,34 @@ mod tests {
         assert_eq!(registry.max_running_per_session(), 2, "counted per VM, not per session");
     }
 
+    /// The real interleaving: accepts and dispatches alternate while four slots are in flight,
+    /// then the slots are freed one at a time. This is the shape the session-fairness case in
+    /// `tests/mixed_parallel.py` produces, and the one round robin has to survive.
+    #[test]
+    fn a_burst_queued_while_the_vm_is_full_is_served_in_turn() {
+        let mut registry = Registry::new(DEFAULT_QUEUE_DEPTH, 4, 1);
+        open(&mut registry, "A");
+        open(&mut registry, "B");
+        for index in 1..=6 {
+            accept(&mut registry, "A", &format!("F{index}"));
+            // The dispatcher runs between accepts, exactly as the worker does.
+            let _ = registry.dispatch();
+        }
+        accept(&mut registry, "B", "FB1");
+        let _ = registry.dispatch();
+        assert_eq!(
+            registry.running_ids(),
+            ["F1", "F2", "F3", "F4"],
+            "the first four fills of one session take the slots"
+        );
+
+        // Two slots free together: one each, not two for the session that queued first.
+        registry.finish("F1", Terminal::new("exited", Some(0), ""));
+        registry.finish("F2", Terminal::new("exited", Some(0), ""));
+        let started = registry.dispatch();
+        assert_eq!(started, ["F5", "FB1"], "the other session is served in the same wave");
+    }
+
     /// Closing a session stops every execution of it that holds a slot, not just one.
     #[test]
     fn closing_a_session_frees_all_of_its_run_slots() {

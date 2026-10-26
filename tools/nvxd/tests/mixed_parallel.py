@@ -28,6 +28,7 @@ CASES = (
     "p7.cross_session.two_by_two",
     "p7.fairness.a_burst_does_not_starve_another_session",
     "p7.limits.cross_session_isolation",
+    "p7.parallel.eight_at_once",
 )
 
 _reported: list[str] = []
@@ -157,6 +158,27 @@ def start(nvxd, repo, initrd, state, max_running):
     return process
 
 
+def stop(process):
+    """Asks the sidecar to shut down, and only kills it when that does not finish.
+
+    Killing it outright leaves the VMM child running; one orphan per run accumulates into the
+    memory and WHP contention that makes later suites' timings meaningless.
+    """
+    try:
+        send_frame(process.stdin, {"op": "shutdown"})
+        process.stdin.close()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=90)
+    except Exception:
+        try:
+            process.kill()
+            process.wait(timeout=60)
+        except Exception:
+            pass
+
+
 def _drain(stream):
     try:
         for _ in stream:
@@ -184,6 +206,89 @@ def rendezvous(need_markers):
         "if [ $missing -eq 0 ]; then echo met; else echo missed; fi"
     )
     return template
+
+
+def phase_eight_at_once(args, root, environment):
+    """Eight executions at one time on one VM: the product's default concurrency.
+
+    The default `--max-running` is `MAX_RUNNING` (8), so the number the product actually runs
+    with has to be the number that was proven, not a smaller one that happened to work. This
+    phase gets its own sidecar and VM so the rest of the entry keeps the four slots its fairness
+    case is calibrated for.
+    """
+    workspace_a = root / "eight-a"
+    workspace_b = root / "eight-b"
+    for workspace in (workspace_a, workspace_b):
+        workspace.mkdir()
+    process = start(args.nvxd, args.repo, args.initrd, root / "state-eight", 8)
+    try:
+        sidecar = Sidecar(process)
+        probe = sidecar.ok({"id": 1, "op": "probe"}, 120)
+        capabilities = probe.get("capabilities") or {}
+        if capabilities.get("maxRunningPerVm") != 8:
+            raise RuntimeError(f"the sidecar was not started with eight slots: {capabilities}")
+        if capabilities.get("parallelExec") is not True:
+            raise RuntimeError(f"parallelExec was not announced: {capabilities}")
+
+        for index, (name, workspace) in enumerate(
+            (("E1", workspace_a), ("E2", workspace_b))
+        ):
+            sidecar.ok(
+                {
+                    "id": 2 + index,
+                    "op": "session.open",
+                    "session": name,
+                    "workspace": str(workspace),
+                    "memoryMiB": 1024,
+                },
+                300,
+            )
+
+        members = [("e1", "E1"), ("e2", "E1"), ("e3", "E1"), ("e4", "E1"),
+                   ("e5", "E2"), ("e6", "E2"), ("e7", "E2"), ("e8", "E2")]
+        for index, (marker, session) in enumerate(members):
+            others = tuple(other for other, _ in members if other != marker)
+            sidecar.ok(
+                {
+                    "id": 10 + index,
+                    "op": "exec",
+                    "session": session,
+                    "execId": marker,
+                    "argv": ["sh", "-c", rendezvous(8).format(
+                        mine=marker, others=" ".join(others))],
+                    "cwd": str(workspace_a if session == "E1" else workspace_b),
+                },
+                180,
+            )
+
+        # All eight must be running at the same time, which is what the rendezvous proves; the
+        # sidecar's own view is checked too, so a queued execution cannot pass for a running one.
+        deadline = time.monotonic() + 60
+        while True:
+            running = sidecar.diagnostics().get("running") or []
+            if len(running) == 8:
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"only {len(running)} of 8 executions were running: {running}"
+                )
+            time.sleep(0.2)
+
+        ids = [marker for marker, _ in members]
+        sidecar.await_exits(ids, time.monotonic() + 240)
+        for marker in ids:
+            if b"met" not in sidecar.stdout_of(marker):
+                raise RuntimeError(
+                    f"{marker} did not overlap the other seven: "
+                    f"{sidecar.stdout_of(marker)!r} {sidecar.stderr_of(marker)!r}"
+                )
+            exit_event = sidecar.exits[marker]
+            if exit_event.get("outcome") != "exited" or exit_event.get("code") != 0:
+                raise RuntimeError(f"{marker} did not exit cleanly: {exit_event}")
+        environment["maxRunningVerified"] = 8
+        case("p7.parallel.eight_at_once")
+    finally:
+        stop(process)
 
 
 def main() -> int:
@@ -394,6 +499,9 @@ def main() -> int:
             raise RuntimeError("the unlimited execution produced no output")
         case("p7.limits.cross_session_isolation")
 
+        # Last, and on its own VM: the four-slot sidecar above cannot show eight at once.
+        phase_eight_at_once(args, root, environment)
+
         missing = [case_id for case_id in CASES if case_id not in _reported]
         if missing:
             raise RuntimeError(f"cases did not run: {missing}")
@@ -409,19 +517,7 @@ def main() -> int:
         }
         if args.report:
             args.report.write_text(json.dumps(report, indent=2), encoding="utf-8")
-        # Ask the sidecar to stop before killing it: killing it outright leaves the VMM child
-        # running, and one orphan per run accumulates into the memory and WHP contention that
-        # makes the next suite's timings meaningless.
-        try:
-            send_frame(process.stdin, {"op": "shutdown"})
-            process.stdin.close()
-        except Exception:
-            pass
-        try:
-            process.wait(timeout=90)
-        except Exception:
-            process.kill()
-            process.wait(timeout=60)
+        stop(process)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,22 @@ static int run_in_session(uint64_t id, const char *command)
     return -1;
 }
 
+static pid_t hold_session_mount(struct guest_session *context, const char *target)
+{
+    pid_t child = fork();
+    if (child == 0) {
+        for (size_t i = 0; i < GUEST_SESSION_NS_COUNT; ++i) {
+            if (setns(context->namespace_fds[i], guest_session_ns_flags[i]) != 0)
+                _exit(125);
+        }
+        if (fchdir(context->root_fd) != 0 || chroot(".") != 0 ||
+            chdir(target) != 0) _exit(125);
+        raise(SIGSTOP);
+        _exit(0);
+    }
+    return child;
+}
+
 #define CHECK(condition, label) do { \
     if (!(condition)) { \
         fprintf(stderr, "P8-PROBE-FAIL %s errno=%d (%s)\n", label, errno, strerror(errno)); \
@@ -182,6 +198,20 @@ static int probe_scoped_mounts(void)
           run_in_session(1, "test \"$(cat /workspace/mounts/file)\" = file") == 0 &&
           guest_session_change_mount(a, NULL, "/workspace/mounts/file", 0) == 0,
           "file-bind-and-strict-unmount");
+    CHECK(guest_session_change_mount(a, "/sessions/a/mounts/data",
+                                    "/workspace/mounts/busy", 0) == 0,
+          "busy-revoke-fixture");
+    {
+        pid_t holder = hold_session_mount(a, "/workspace/mounts/busy");
+        int status;
+        CHECK(holder > 0 && waitpid(holder, &status, WUNTRACED) == holder &&
+              WIFSTOPPED(status), "busy-revoke-holder");
+        CHECK(guest_session_change_mount(a, NULL, "/workspace/mounts/busy", 0) < 0 &&
+              guest_session_broken, "busy-revoke-escalates-group-failure");
+        kill(holder, SIGKILL);
+        waitpid(holder, &status, 0);
+        guest_session_broken = 0;
+    }
     return 0;
 }
 

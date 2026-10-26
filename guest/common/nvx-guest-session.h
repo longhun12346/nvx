@@ -780,6 +780,10 @@ static int guest_session_change_mount(
         guest_session_broken = 1;
     }
     if (result != 0) {
+        if (source == NULL) {
+            /* An unmount that cannot be proven complete is an isolation fault. */
+            guest_session_broken = 1;
+        }
         free(copy);
         errno = result;
         return -1;

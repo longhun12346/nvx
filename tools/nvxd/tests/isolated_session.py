@@ -58,6 +58,7 @@ def main() -> int:
         active_probe = sidecar.ok({"id": 4, "op": "probe"}, deadline)
         if active_probe.get("capabilities", {}).get("sessionIsolation") is not True:
             raise RuntimeError(f"active VM did not report isolation: {active_probe}")
+        print("CASE p8.sidecar.capability PASS")
         first = sidecar.ok({
             "id": 10, "op": "exec", "session": "a", "execId": "a1",
             "argv": ["sh", "-c", "echo secret >/tmp/private; echo a >/workspace/mounts/data/marker"],
@@ -85,6 +86,7 @@ def main() -> int:
                 raise RuntimeError(f"{key} failed: {exits[key]}")
         if sidecar.stdout_of("a1") or sidecar.stdout_of("b1"):
             raise RuntimeError("unexpected diagnostic output")
+        print("CASE p8.sidecar.cross_session_private_state PASS")
         # A second execution in A sees its private /tmp and its scoped mount; B cannot.
         sidecar.ok({
             "id": 12, "op": "exec", "session": "a", "execId": "a2",
@@ -93,6 +95,7 @@ def main() -> int:
             "cwd": str(workspaces["a"]),
         }, deadline)
         sidecar.await_exits(["a2"], deadline)
+        print("CASE p8.sidecar.same_session_state PASS")
         sidecar.ok({"id": 13, "op": "session.close", "session": "a"}, deadline)
         sidecar.ok({
             "id": 14, "op": "exec", "session": "b", "execId": "b2",
@@ -101,7 +104,7 @@ def main() -> int:
         }, deadline)
         sidecar.await_exits(["b2"], deadline)
         sidecar.ok({"id": 15, "op": "session.close", "session": "b"}, deadline)
-        print("CASE p8.sidecar.session_isolation PASS")
+        print("CASE p8.sidecar.close_preserves_peer PASS")
         return 0
     except Exception:
         print("\n".join(stderr_lines[-40:]))

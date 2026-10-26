@@ -93,22 +93,29 @@ def main() -> int:
             "argv": ["sh", "-c", "test \"$(cat /tmp/private)\" = secret; "
                      "test \"$(cat /workspace/mounts/data/marker)\" = a"],
             "cwd": str(workspaces["a"]),
+            "mounts": [{"mountId": "data", "hostPath": str(mounts["a"]), "mode": "rw"}],
         }, deadline)
         sidecar.await_exits(["a2"], deadline)
         print("CASE p8.sidecar.same_session_state PASS")
-        overlap_started = time.monotonic()
+        markers = {"a3": workspaces["a"] / "a3-times", "a4": workspaces["a"] / "a4-times"}
         for request_id, exec_id in ((16, "a3"), (17, "a4")):
             sidecar.ok({
                 "id": request_id, "op": "exec", "session": "a", "execId": exec_id,
-                "argv": ["sh", "-c", "sleep 2"],
+                "argv": [
+                    "sh", "-c",
+                    f"date +%s%N >/workspace/{exec_id}-times; sleep 2; "
+                    f"date +%s%N >>/workspace/{exec_id}-times",
+                ],
                 "cwd": str(workspaces["a"]),
+                    "mounts": [{"mountId": "data", "hostPath": str(mounts["a"]), "mode": "rw"}],
             }, deadline)
         sidecar.await_exits(["a3", "a4"], deadline)
-        overlap_elapsed = time.monotonic() - overlap_started
-        if overlap_elapsed > 3.8:
-            raise RuntimeError(
-                f"same-session isolated executions did not overlap: {overlap_elapsed:.3f}s"
-            )
+        intervals = []
+        for exec_id in ("a3", "a4"):
+            values = [int(value) for value in markers[exec_id].read_text().splitlines()]
+            intervals.append((values[0], values[-1]))
+        if max(interval[0] for interval in intervals) >= min(interval[1] for interval in intervals):
+            raise RuntimeError(f"same-session isolated executions did not overlap: {intervals}")
         print("CASE p8.sidecar.same_session_concurrency PASS")
         sidecar.ok({"id": 13, "op": "session.close", "session": "a"}, deadline)
         sidecar.ok({

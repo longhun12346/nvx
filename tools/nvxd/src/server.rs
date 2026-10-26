@@ -238,6 +238,7 @@ pub struct Context {
     /// Serialises VM creation and retirement against session open and close, so two opens
     /// cannot both decide to boot a VM.
     lifecycle: Mutex<()>,
+    removals_lock: Mutex<()>,
     vm: Mutex<Option<Arc<Vm>>>,
     inner: Mutex<Inner>,
     /// Wakes the worker when there is work, when a gate opens, or when the VM changes.
@@ -278,6 +279,7 @@ impl Context {
             session_isolation,
             export_anchor,
             lifecycle: Mutex::new(()),
+            removals_lock: Mutex::new(()),
             vm: Mutex::new(None),
             inner: Mutex::new(Inner {
                 registry: Registry::new(max_queue.max(1), max_running.max(1), 0),
@@ -542,6 +544,9 @@ impl Context {
         }
         // The VM is created once and shared; the lock only covers the decision, never a run.
         let _lifecycle = self.lifecycle.lock().unwrap();
+        // Finish retired exports before a reopened workspace is exported again.
+        // Otherwise its old VMM child can still own the same host directory.
+        self.try_removals(true);
         {
             let inner = self.inner.lock().unwrap();
             if inner.sessions.contains_key(name) {
@@ -1296,7 +1301,10 @@ impl Context {
     /// exactly what let a revoked session's directory stay reachable while other sessions kept
     /// the queue busy.
     fn try_removals(&self, slot_is_free: bool) {
-        if slot_is_free {
+        let _removals = self.removals_lock.lock().unwrap();
+        // Isolated close destroys the namespace before enqueuing these sources.
+        // Peers cannot reference them, so cleanup must not wait for peers to idle.
+        if slot_is_free && !self.session_isolation {
             let ready = {
                 let inner = self.inner.lock().unwrap();
                 inner.registry.running_ids().is_empty() && inner.registry.queued_len() == 0
@@ -1347,6 +1355,13 @@ impl Context {
                     eprintln!("nvxd: deferred export {child} removed in an idle gap");
                 }
                 Err(error) => {
+                    if self.session_isolation {
+                        self.stats.lock().unwrap().shares_remove_failed += 1;
+                        self.mark_vm_lost(format!(
+                            "isolated export {child} cleanup failed: {error}"
+                        ));
+                        return;
+                    }
                     // Removal is two steps: unmount in the guest, then stop the VMM export.
                     // Only the first is observable by the caller, so "the guest no longer
                     // knows this path" means the revocation already took effect — a retry
@@ -1432,6 +1447,14 @@ impl Context {
                             self.stats.lock().unwrap().shares_removed += 1;
                         }
                         Err(error) => {
+                            if guest_session.is_some() {
+                                self.stats.lock().unwrap().shares_remove_failed += 1;
+                                self.mark_vm_lost(format!(
+                                    "isolated source export {} cleanup failed: {error}",
+                                    share.child
+                                ));
+                                return Err(fail("E_SESSION_UNMOUNT_FAILED", error));
+                            }
                             // Revoking a path must not fail the command that happened to
                             // trigger the reconcile, and it must not destroy the VM: the VM is
                             // shared, so destroying it would end every other session's work
@@ -2021,6 +2044,14 @@ impl Context {
         // Removing exports is only possible in an idle gap; when this was the last session,
         // retiring the VM does the whole cleanup at once.
         self.try_removals(true);
+        if guest_session.is_some()
+            && self.inner.lock().unwrap().registry.generation() != generation
+        {
+            return Err(fail(
+                "E_SESSION_CLOSE_FAILED",
+                "isolated export cleanup retired the failed group",
+            ));
+        }
         self.retire_if_idle();
         Ok(json!({
             "closed": true,

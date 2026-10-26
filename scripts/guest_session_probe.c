@@ -291,6 +291,18 @@ int main(int argc, char **argv)
     CHECK(access(command, F_OK) < 0 && errno == ENOENT, "session-directories-removed");
     guest_session_legacy_used = 1;
     CHECK(guest_session_create(4, source) < 0 && errno == EXDEV, "legacy-migration-refused");
+    guest_session_legacy_used = 0;
+    CHECK(guest_session_create(4, source) == 0, "fault-injection-session");
+    {
+        struct guest_session *faulted = guest_session_find(4);
+        pid_t keeper = faulted->keeper;
+        CHECK(kill(keeper, SIGKILL) == 0, "fault-injection-kill-keeper");
+        CHECK(waitpid(keeper, NULL, 0) == keeper, "fault-injection-reap-keeper");
+        guest_session_reaped(keeper);
+        CHECK(guest_session_broken && guest_session_find(4)->keeper == 0,
+              "keeper-loss-escalates-group-failure");
+        guest_session_destroy_all();
+    }
     puts("P8-PROBE-COMPLETE");
     return 0;
 }

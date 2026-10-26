@@ -245,6 +245,18 @@ int main(int argc, char **argv)
           "test ! -e /home/session/credentials; test ! -e /dev/shm/private; "
           "test ! -e /workspace/owner; "
           "test ! -e /workspace/../a/workspace/owner") == 0, "cross-session-state");
+    CHECK(run_in_session(1,
+          "python3 -c 'import ctypes; l=ctypes.CDLL(None,use_errno=True); "
+          "assert l.shmget(0x4e565841,1,0o600|0o1000)>=0; "
+          "assert l.semget(0x4e565842,1,0o600|0o1000)>=0; "
+          "assert l.msgget(0x4e565843,0o600|0o1000)>=0'") == 0,
+          "same-session-sysv-ipc");
+    CHECK(run_in_session(2,
+          "python3 -c 'import ctypes; l=ctypes.CDLL(None,use_errno=True); "
+          "assert all(fn(key,*args)<0 and ctypes.get_errno()==2 for key,fn,args in "
+          "[(0x4e565841,l.shmget,(1,0o600)),(0x4e565842,l.semget,(1,0o600)),"
+          "(0x4e565843,l.msgget,(0o600,))])'") == 0,
+          "cross-session-sysv-ipc-denied");
     CHECK(probe_scoped_mounts() == 0, "scoped-mount-matrix");
     /* A daemon survives between calls in this direct lifecycle probe. The
      * production exec cgroup additionally removes such descendants per exec. */

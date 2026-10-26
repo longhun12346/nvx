@@ -25,6 +25,7 @@ pub struct Share {
     pub mount: Mount,
     /// VMM export name; never reused within a sandbox.
     pub child: String,
+    pub source_target: String,
     pub target: String,
 }
 
@@ -121,6 +122,7 @@ mod tests {
         Share {
             mount,
             child: child.into(),
+            source_target: target.clone(),
             target,
         }
     }
@@ -180,6 +182,7 @@ mod tests {
         let shares = [Share {
             mount: mount("same", "C:\\m", true),
             child: "B-m0".into(),
+            source_target: "/sessions/B/mounts/same".into(),
             target: "/sessions/B/mounts/same".into(),
         }];        assert_eq!(
             translate_cwd_shares("C:\\m\\sub", &shares).as_deref(),

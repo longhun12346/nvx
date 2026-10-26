@@ -869,11 +869,24 @@ impl Instance {
         control_timeout: Duration,
         response_grace: Duration,
     ) -> Result<SharedExecution> {
+        self.exec_shared_in_session(shared, None, workload, control_timeout, response_grace)
+    }
+
+    /// Start in an isolated guest context when `guest_session` is present.
+    /// Absence keeps the legacy trusted-shared mode, never an automatic fallback.
+    pub fn exec_shared_in_session(
+        &self,
+        shared: &Arc<SharedSession>,
+        guest_session: Option<u64>,
+        workload: &Workload<'_>,
+        control_timeout: Duration,
+        response_grace: Duration,
+    ) -> Result<SharedExecution> {
         check_timeout("control timeout", control_timeout, true)?;
         check_timeout("response grace", response_grace, false)?;
         let deadline = Instant::now() + control_timeout;
         let (request_id, events) = shared
-            .start_exec(workload, deadline)
+            .start_scoped_exec(guest_session, workload, deadline)
             .map_err(|error| self.session_error(error, control_timeout))?;
         let timeout_ms = workload.timeout_ms;
         let response_deadline = (timeout_ms > 0)

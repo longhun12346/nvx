@@ -76,6 +76,8 @@ struct Args {
     /// image that advertises concurrent executions, and the sidecar refuses to boot a VM whose
     /// image does not when this is above one.
     max_running: usize,
+    /// Explicitly use guest session namespaces; unsupported images are rejected.
+    session_isolation: bool,
     /// Requests that may wait for a worker before the caller is refused.
     max_pending: usize,
     /// Workers that run the slow requests (open a session, start an execution).
@@ -111,6 +113,7 @@ fn parse_args() -> Result<Args, String> {
         // that does not advertise EXEC_SLOTS is refused at startup rather than run serially
         // while claiming otherwise.
         max_running: MAX_RUNNING,
+        session_isolation: false,
         max_pending: DEFAULT_MAX_PENDING,
         work_workers: DEFAULT_WORK_WORKERS,
         outbound_capacity: outbound::DEFAULT_CAPACITY,
@@ -143,6 +146,7 @@ fn parse_args() -> Result<Args, String> {
             "--max-running" => {
                 args.max_running = value()?.parse().map_err(|e| format!("{e}"))?
             }
+            "--session-isolation" => args.session_isolation = true,
             "--exec-memory-mb" => {
                 args.exec_memory_mb = value()?.parse().map_err(|e| format!("{e}"))?
             }
@@ -245,6 +249,7 @@ fn run() -> Result<(), String> {
         "maxSessions": args.max_sessions,
         "maxQueue": args.max_queue,
         "maxRunning": args.max_running,
+        "sessionIsolation": args.session_isolation,
         "execLimits": {
             "memMb": args.exec_memory_mb,
             "cpuPercent": args.exec_cpu_percent,
@@ -284,6 +289,7 @@ fn run() -> Result<(), String> {
         args.max_queue,
         args.max_sessions,
         args.max_running,
+        args.session_isolation,
         state_dir.join("export-anchor"),
     ));
 

@@ -26,6 +26,11 @@ mod app;
 mod boot;
 mod exec;
 mod features;
+mod guest_session;
+pub use guest_session::{
+    APP_SESSION_BIND, APP_SESSION_UNBIND, SessionMount, encode_session_mount,
+    encode_session_unmount, valid_session_mount_target,
+};
 mod maps;
 mod outer;
 #[cfg(test)]
@@ -47,6 +52,11 @@ pub use exec::{
     encode_exec_payload,
 };
 pub use features::GuestFeatures;
+pub use guest_session::{
+    APP_SESSION_CLOSE, APP_SESSION_EXEC, APP_SESSION_OPEN, GuestSessionSpec,
+    MAX_GUEST_SESSIONS, MAX_SESSION_PATH, SESSION_VERSION, SessionNetwork,
+    decode_session_open, encode_session_open, encode_session_request,
+};
 pub use maps::{
     HostMap, MAP_ENTRY_HEADER_LEN, MAP_READ_ONLY, MAPS_HEADER_LEN, MAX_HOST_MAPPINGS,
     MAX_MAP_PATH_BYTES, MapsPayload, decode_maps_payload, encode_maps_payloads,

@@ -869,6 +869,12 @@ def _install_guest_files(
             common / f"{name}.c",
             root / "sbin" / name,
         )
+        if name == "nvx-managed-agent":
+            # The lifecycle implementation is compiled through a local include.
+            # Record it too: the .c digest alone no longer identifies this binary.
+            helpers[name]["session_source_sha256"] = sha256_file(
+                common / "nvx-guest-session.h"
+            )
     for name in InitramfsBuildConstants.MUSL_STATIC_HELPERS:
         helpers[name] = _build_static_helper(
             config.work,

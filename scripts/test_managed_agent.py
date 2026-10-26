@@ -918,7 +918,7 @@ int main(int argc, char **argv) {
         self.assertEqual((kind, status), (APP_READY, 0))
         (features,) = struct.unpack("<I", payload)
         # P6 added execution slots (bit 8) and execution limits (bit 9).
-        self.assertEqual(features, 0b11_1111_1101)
+        self.assertEqual(features, 0b11111111101)
 
 
 if __name__ == "__main__":

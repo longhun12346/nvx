@@ -313,6 +313,11 @@ impl Backend for AgentBackend {
         request: &ExecRequest,
         io: ExecIo,
     ) -> Result<Box<dyn ExecControl>> {
+        if request.guest_session.is_some() {
+            return Err(Error::backend_error(
+                "the agent backend does not support isolated guest sessions",
+            ));
+        }
         let exec = self.library.exec(
             self.host,
             sandbox_id.token(),

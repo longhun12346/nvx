@@ -432,6 +432,9 @@ pub struct ExecRequest {
     /// enforce it, and whatever the caller leaves at zero keeps the backend's configured value.
     #[serde(skip)]
     pub limits: Option<ExecLimits>,
+    /// Host-owned isolated guest context. Not caller JSON and never an environment hint.
+    #[serde(skip)]
+    pub guest_session: Option<u64>,
 }
 
 impl ExecRequest {
@@ -462,6 +465,7 @@ impl ExecRequest {
             },
             stdin: StdinMode::Null,
             limits: None,
+            guest_session: None,
         }
     }
 
@@ -473,6 +477,13 @@ impl ExecRequest {
     #[must_use]
     pub fn with_limits(mut self, limits: ExecLimits) -> Self {
         self.limits = Some(limits);
+        self
+    }
+
+    /// Target a context that the OpenVMM backend has explicitly created.
+    #[must_use]
+    pub fn with_guest_session(mut self, id: u64) -> Self {
+        self.guest_session = Some(id);
         self
     }
 

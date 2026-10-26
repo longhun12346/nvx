@@ -621,20 +621,38 @@ impl SharedSession {
         workload: &Workload<'_>,
         deadline: Instant,
     ) -> Result<(u64, Receiver<Delivery>), SessionError> {
+        self.start_scoped_exec(None, workload, deadline)
+    }
+
+    /// Start in a previously created isolated guest session. No legacy fallback:
+    /// a guest without the feature refuses before user code can run.
+    pub fn start_scoped_exec(
+        &self,
+        guest_session: Option<u64>,
+        workload: &Workload<'_>,
+        deadline: Instant,
+    ) -> Result<(u64, Receiver<Delivery>), SessionError> {
         // A session whose reader has stopped cannot deliver anything. Failing here keeps a dead
         // VM from looking like a slow one: a request registered after the reader drained its
         // waiters would otherwise wait for its whole deadline.
         if !self.is_running() {
             return Err(SessionError::Closed);
         }
-        let payload = protocol::encode_exec_payload(workload)?;
+        let mut payload = protocol::encode_exec_payload(workload)?;
+        let kind = if let Some(session_id) = guest_session {
+            payload = protocol::encode_session_request(session_id, &payload)?;
+            self.require_session_isolation(deadline)?;
+            protocol::APP_SESSION_EXEC
+        } else {
+            APP_EXEC
+        };
         let id = request_id()?;
         let (sender, receiver) = mpsc::channel();
         self.waiters
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, sender);
-        let sent = self.send_or_gone(APP_EXEC, id, &payload, deadline);
+        let sent = self.send_or_gone(kind, id, &payload, deadline);
         if let Err(error) = sent {
             self.waiters
                 .lock()
@@ -764,6 +782,61 @@ impl SharedSession {
             ));
         }
         GuestFeatures::decode(&payload).map_err(|error| SessionError::Protocol(error.to_string()))
+    }
+
+    fn require_session_isolation(&self, deadline: Instant) -> Result<(), SessionError> {
+        if !self.features(deadline)?.contains(GuestFeatures::SESSION_ISOLATION) {
+            return Err(SessionError::Protocol(
+                "the guest does not support isolated sessions".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Create a guest isolation context; a failed acknowledgement is never treated as success.
+    pub fn open_guest_session(
+        &self,
+        spec: &protocol::GuestSessionSpec,
+        deadline: Instant,
+    ) -> Result<(), SessionError> {
+        let payload = protocol::encode_session_open(spec)?;
+        self.require_session_isolation(deadline)?;
+        let (kind, status, reply) = self.call(protocol::APP_SESSION_OPEN, &payload, deadline)?;
+        if kind != APP_READY || status != 0 || !reply.is_empty() {
+            return Err(SessionError::Protocol("guest session creation was not acknowledged".into()));
+        }
+        Ok(())
+    }
+
+    /// Destroy an idle guest context. Outstanding work must be cancelled and reaped first.
+    pub fn close_guest_session(&self, id: u64, deadline: Instant) -> Result<(), SessionError> {
+        let payload = protocol::encode_session_request(id, &[])?;
+        self.require_session_isolation(deadline)?;
+        let (kind, status, reply) = self.call(protocol::APP_SESSION_CLOSE, &payload, deadline)?;
+        if kind != APP_READY || status != 0 || !reply.is_empty() {
+            return Err(SessionError::Protocol("guest session cleanup was not acknowledged".into()));
+        }
+        Ok(())
+    }
+
+    /// Attach an authorized source mapping to an idle isolated session.
+    pub fn bind_guest_session(
+        &self, id: u64, mount: &protocol::SessionMount, deadline: Instant,
+    ) -> Result<(), SessionError> {
+        let payload = protocol::encode_session_mount(id, mount)?;
+        self.require_session_isolation(deadline)?;
+        let (kind, status, reply) = self.call(protocol::APP_SESSION_BIND, &payload, deadline)?;
+        check_maps_reply(kind, status, &reply)
+    }
+
+    /// Revoke a private mapping; a busy mount is an isolation failure, never a lazy detach.
+    pub fn unbind_guest_session(
+        &self, id: u64, target: &str, deadline: Instant,
+    ) -> Result<(), SessionError> {
+        let payload = protocol::encode_session_unmount(id, target)?;
+        self.require_session_isolation(deadline)?;
+        let (kind, status, reply) = self.call(protocol::APP_SESSION_UNBIND, &payload, deadline)?;
+        check_unmap_reply(kind, status, &reply)
     }
 
     /// Hands the guest agent entries that continue its host mapping table at index `first`, and
@@ -1320,6 +1393,123 @@ mod tests {
             environment: crate::protocol::WorkloadEnvironment::Default,
             limits: crate::protocol::ExecLimits::default(),
         }
+    }
+
+    /// Exercise synchronous calls through the shared dispatcher without leaving a reader
+    /// thread behind. Every operation supplied by a test uses a bounded deadline.
+    fn with_shared_responder<T: Send>(
+        answer: fn(u8, u64) -> Vec<u8>,
+        operation: impl FnOnce(&SharedSession) -> T + Send,
+    ) -> (T, Vec<(u8, Vec<u8>)>) {
+        let (session, requests) = attached_recording(answer);
+        let shared = SharedSession {
+            session: Mutex::new(session),
+            waiters: Mutex::new(HashMap::new()),
+            running: AtomicBool::new(true),
+        };
+        let result = thread::scope(|scope| {
+            let worker = scope.spawn(|| operation(&shared));
+            while !worker.is_finished() {
+                let reply = shared.session.lock().unwrap().read_app(Some(deadline()));
+                match reply {
+                    Ok((kind, id, status, payload)) => {
+                        assert!(shared.deliver(kind, id, status, &payload));
+                    }
+                    Err(SessionError::TimedOut) => thread::sleep(Duration::from_millis(1)),
+                    Err(error) => panic!("test transport failed: {error}"),
+                }
+            }
+            worker.join().unwrap()
+        });
+        let recorded = requests.lock().unwrap().clone();
+        (result, recorded)
+    }
+
+    #[test]
+    fn unsupported_guest_sessions_never_fall_back_to_legacy_exec() {
+        let (_, requests) = with_shared_responder(
+            |kind, id| {
+                assert_eq!(kind, APP_FEATURES);
+                encode_app(APP_READY, id, 0, &GuestFeatures::REQUIRED.encode())
+            },
+            |shared| {
+                let spec = protocol::GuestSessionSpec {
+                    id: 1,
+                    workspace: "/sessions/a/workspace".into(),
+                    network: protocol::SessionNetwork::Deny,
+                };
+                assert!(shared.open_guest_session(&spec, deadline()).is_err());
+                assert!(shared.close_guest_session(1, deadline()).is_err());
+                assert!(shared.start_scoped_exec(Some(1), &true_workload(), deadline()).is_err());
+                assert!(shared.waiters.lock().unwrap().is_empty());
+            },
+        );
+        assert_eq!(requests.iter().map(|r| r.0).collect::<Vec<_>>(), vec![APP_FEATURES; 3]);
+    }
+
+    #[test]
+    fn scoped_execution_carries_an_authenticated_session_identity() {
+        let (_, requests) = with_shared_responder(
+            |kind, id| match kind {
+                APP_FEATURES => encode_app(APP_READY, id, 0, &GuestFeatures::SESSION_ISOLATION.encode()),
+                protocol::APP_SESSION_EXEC => encode_app(APP_EXIT, id, 0, b"exit"),
+                _ => encode_app(APP_READY, id, 0, &[]),
+            },
+            |shared| {
+                let spec = protocol::GuestSessionSpec {
+                    id: 17,
+                    workspace: "/sessions/a/workspace".into(),
+                    network: protocol::SessionNetwork::Deny,
+                };
+                shared.open_guest_session(&spec, deadline()).unwrap();
+                let (_, events) = shared.start_scoped_exec(Some(17), &true_workload(), deadline()).unwrap();
+                assert!(matches!(
+                    events.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    Delivery::Event(ExecEvent::Exit { status: 0, .. })
+                ));
+                shared.close_guest_session(17, deadline()).unwrap();
+            },
+        );
+        assert_eq!(requests.iter().map(|r| r.0).collect::<Vec<_>>(), [
+            APP_FEATURES, protocol::APP_SESSION_OPEN,
+            APP_FEATURES, protocol::APP_SESSION_EXEC,
+            APP_FEATURES, protocol::APP_SESSION_CLOSE,
+        ]);
+        assert_eq!(protocol::decode_session_open(&requests[1].1).unwrap().id, 17);
+        assert_eq!(&requests[3].1[..8], &17u64.to_le_bytes());
+        assert_eq!(&requests[3].1[8..], protocol::encode_exec_payload(&true_workload()).unwrap());
+        assert_eq!(requests[5].1, 17u64.to_le_bytes());
+    }
+
+    #[test]
+    fn guest_session_lifecycle_refuses_nonempty_acknowledgements() {
+        with_shared_responder(
+            |kind, id| {
+                if kind == APP_FEATURES {
+                    encode_app(APP_READY, id, 0, &GuestFeatures::SESSION_ISOLATION.encode())
+                } else {
+                    encode_app(APP_READY, id, 0, b"unexpected")
+                }
+            },
+            |shared| {
+                let spec = protocol::GuestSessionSpec {
+                    id: 1,
+                    workspace: "/sessions/a/workspace".into(),
+                    network: protocol::SessionNetwork::Deny,
+                };
+                assert!(shared.open_guest_session(&spec, deadline()).is_err());
+                assert!(shared.close_guest_session(1, deadline()).is_err());
+            },
+        );
+    }
+
+    #[test]
+    fn zero_guest_identity_is_rejected_without_control_traffic() {
+        let (shared, written) = shared_over_ready(&[outer(OUTER_READY, 1, 0, &[])]);
+        let before = written.lock().unwrap().len();
+        assert!(shared.start_scoped_exec(Some(0), &true_workload(), deadline()).is_err());
+        assert!(shared.close_guest_session(0, deadline()).is_err());
+        assert_eq!(written.lock().unwrap().len(), before);
     }
 
     /// One session carries several executions: each frame reaches the execution whose request id

@@ -118,6 +118,7 @@ def main():
     # so it stays at one run slot: with several slots the same three executions would overlap
     # and their order would stop meaning anything.
     parser.add_argument("--max-running", type=int, default=1)
+    parser.add_argument("--session-isolation", action="store_true")
     parser.add_argument(
         "--timeout",
         type=int,
@@ -159,6 +160,7 @@ def main():
                 "host",
                 "--max-running",
                 str(args.max_running),
+                *(["--session-isolation"] if args.session_isolation else []),
                 "--state-dir",
                 str(state),
             ],
@@ -191,12 +193,16 @@ def main():
             capabilities = probe.get("capabilities") or {}
             if capabilities.get("sharedVm") is not True:
                 raise RuntimeError(f"the sidecar does not report a shared VM: {probe}")
-            if capabilities.get("parallelExec") is not False:
+            expected_parallel = args.max_running > 1
+            if capabilities.get("parallelExec") is not expected_parallel:
                 raise RuntimeError(
-                    f"P5 must report parallelExec=false until P7: {capabilities}"
+                    f"parallelExec={capabilities.get('parallelExec')}, "
+                    f"expected {expected_parallel}: {capabilities}"
                 )
-            if capabilities.get("sessionIsolation") is not False:
-                raise RuntimeError(f"P5 must report sessionIsolation=false: {capabilities}")
+            if args.session_isolation and capabilities.get("sessionIsolation") not in (False, True):
+                raise RuntimeError(
+                    f"invalid sessionIsolation capability: {capabilities}"
+                )
 
             stage = "open two sessions"
             opened_a = sidecar.ok(

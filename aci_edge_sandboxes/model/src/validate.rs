@@ -256,6 +256,9 @@ fn spec_capabilities(spec: &SandboxSpec, capabilities: &Capabilities) -> Result<
 ///
 /// [`ErrorCode::MalformedRequest`]: crate::ErrorCode::MalformedRequest
 pub fn exec_structure(request: &ExecRequest) -> Result<()> {
+    if request.guest_session == Some(0) {
+        return Err(Error::malformed_request("guest session identity must be nonzero"));
+    }
     let process = &request.process;
     match &process.command {
         Command::CommandLine(command_line) => {

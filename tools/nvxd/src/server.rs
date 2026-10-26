@@ -94,6 +94,7 @@ impl Vm {
 
 /// A logical session: routing and authorisation unit inside the VM, not a VM of its own.
 struct SessionInfo {
+    guest_session: Option<u64>,
     workspace: PathBuf,
     /// Prefix of every export name this session owns. Export names live in one namespace for
     /// the whole VM, so they cannot simply count from zero per session.
@@ -149,8 +150,10 @@ struct Spec {
 /// that cannot happen before [`REMOVAL_DEADLINE`], makes the VM dirty and it is destroyed.
 struct Removal {
     child: String,
+    source_target: String,
     target: String,
     session: String,
+    guest_session: Option<u64>,
     since: Instant,
 }
 
@@ -212,6 +215,7 @@ const GUEST_FEATURE_EXEC_SLOTS: u64 = 1 << 8;
 /// Guest feature bit `EXEC_LIMITS`: the agent enforces per-execution memory/CPU/pids limits on
 /// the execution's own cgroup, and refuses an execution whose limit it cannot write.
 const GUEST_FEATURE_EXEC_LIMITS: u64 = 1 << 9;
+const GUEST_FEATURE_SESSION_ISOLATION: u64 = 1 << 10;
 
 pub struct Context {
     backend: Arc<OpenVmmBackend>,
@@ -224,6 +228,7 @@ pub struct Context {
     /// announced to callers through `probe`, and only works with a guest image that advertises
     /// concurrent executions.
     max_running: usize,
+    session_isolation: bool,
     /// Empty directory provisioned with every VM so the virtio-fs device (and therefore the
     /// export channel) exists before the first session's workspace is exported.
     export_anchor: PathBuf,
@@ -242,6 +247,7 @@ pub struct Context {
     /// see the connection close.
     stopping: AtomicBool,
     counter: Mutex<u64>,
+    guest_session_counter: Mutex<u64>,
     runtime_prefix: String,
     stats: Mutex<Stats>,
 }
@@ -255,6 +261,7 @@ impl Context {
         max_queue: usize,
         max_sessions: usize,
         max_running: usize,
+        session_isolation: bool,
         export_anchor: PathBuf,
     ) -> Self {
         Self {
@@ -265,6 +272,7 @@ impl Context {
             max_queue: max_queue.max(1),
             max_sessions,
             max_running: max_running.max(1),
+            session_isolation,
             export_anchor,
             lifecycle: Mutex::new(()),
             vm: Mutex::new(None),
@@ -284,6 +292,7 @@ impl Context {
             retiring: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             counter: Mutex::new(0),
+            guest_session_counter: Mutex::new(0),
             runtime_prefix: {
                 use std::hash::Hash;
                 use std::hash::Hasher;
@@ -341,7 +350,8 @@ impl Context {
                                // per-execution limits refuses such an execution explicitly rather
                                // than accepting it and ignoring the limit.
                                "guestFeatures": features,
-                               "sessionIsolation": false,
+                               "sessionIsolation": self.session_isolation
+                                   && features & GUEST_FEATURE_SESSION_ISOLATION != 0,
                            }})
                 })
                 .map_err(|error| fail(protocol::REASON_BACKEND_UNAVAILABLE, error)),
@@ -562,6 +572,7 @@ impl Context {
                 inner.sessions.insert(
                     name.to_owned(),
                     SessionInfo {
+                        guest_session: None,
                         workspace: workspace_path.clone(),
                         prefix: safe_name(name),
                         workspace_guest: target.clone(),
@@ -581,8 +592,43 @@ impl Context {
             // directory tree.
             match self.ensure_workspace_export(&vm, name) {
                 Ok(()) => {
+                    if self.session_isolation {
+                        let features = self.inner.lock().unwrap().guest_features;
+                        if features & GUEST_FEATURE_SESSION_ISOLATION == 0 {
+                            self.rollback_open_session(&vm, name);
+                            return Err(fail(
+                                "E_NVX_GUEST_NO_SESSION_ISOLATION",
+                                "the guest image does not advertise isolated guest sessions",
+                            ));
+                        }
+                        let id = {
+                            let mut counter = self.guest_session_counter.lock().unwrap();
+                            *counter += 1;
+                            *counter
+                        };
+                        let spec = aci_edge_sandboxes::nvx::protocol::GuestSessionSpec {
+                            id,
+                            workspace: target.clone(),
+                            network: aci_edge_sandboxes::nvx::protocol::SessionNetwork::Deny,
+                        };
+                        if let Err(error) = self.backend.open_guest_session(&vm.sandbox, &spec) {
+                            self.rollback_open_session(&vm, name);
+                            return Err(fail("E_SESSION_OPEN_FAILED", error));
+                        }
+                        self.inner
+                            .lock()
+                            .unwrap()
+                            .sessions
+                            .get_mut(name)
+                            .expect("session inserted before workspace export")
+                            .guest_session = Some(id);
+                    }
                     return Ok(json!({
-                        "workspaceGuestPath": target,
+                        "workspaceGuestPath": if self.session_isolation {
+                            "/workspace"
+                        } else {
+                            target.as_str()
+                        },
                         "runtimeId": vm.runtime_id,
                         "vmGeneration": vm.generation,
                         "sharedVm": true,
@@ -597,6 +643,24 @@ impl Context {
                     continue;
                 }
                 Err(failure) => return Err(failure),
+            }
+        }
+    }
+
+    fn rollback_open_session(&self, vm: &Arc<Vm>, name: &str) {
+        let export = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.registry.close_session(name);
+            inner
+                .sessions
+                .remove(name)
+                .and_then(|info| info.workspace_export)
+        };
+        if let Some(export) = export {
+            if let Err(error) =
+                self.backend.remove_share(&vm.sandbox, &export.child, &export.target, SHARE_TIMEOUT)
+            {
+                self.mark_vm_lost(format!("isolated session rollback failed: {error}"));
             }
         }
     }
@@ -677,15 +741,21 @@ impl Context {
     ) -> Result<(), Failure> {
         // Snapshot, export, write back: the session keeps its identity (and its old shares)
         // for anything that looks at it while the (slow) export channel is being used.
-        let (prefix, mut shares, mut next_child) = {
+        let (prefix, guest_session, mut shares, mut next_child) = {
             let inner = self.inner.lock().unwrap();
             let info = inner
                 .sessions
                 .get(name)
                 .ok_or_else(|| fail(protocol::REASON_SESSION_UNKNOWN, format!("unknown session {name}")))?;
-            (info.prefix.clone(), info.shares.clone(), info.next_child)
+            (
+                info.prefix.clone(),
+                info.guest_session,
+                info.shares.clone(),
+                info.next_child,
+            )
         };
-        let outcome = self.reconcile(vm, &prefix, &mut shares, &mut next_child, desired);
+        let outcome =
+            self.reconcile(vm, &prefix, guest_session, &mut shares, &mut next_child, desired);
         {
             let mut inner = self.inner.lock().unwrap();
             if let Some(info) = inner.sessions.get_mut(name) {
@@ -1008,10 +1078,18 @@ impl Context {
                     let inner = self.inner.lock().unwrap();
                     match inner.sessions.get(&session) {
                         Some(info) => (
-                            info.workspace_guest.clone(),
+                            if info.guest_session.is_some() {
+                                "/workspace".to_owned()
+                            } else {
+                                info.workspace_guest.clone()
+                            },
                             info.shares.clone(),
                             info.workspace.display().to_string(),
-                            info.workspace_guest.clone(),
+                            if info.guest_session.is_some() {
+                                "/workspace".to_owned()
+                            } else {
+                                info.workspace_guest.clone()
+                            },
                         ),
                         None => (String::new(), Vec::new(), String::new(), String::new()),
                     }
@@ -1051,6 +1129,16 @@ impl Context {
         // limit it cannot write into the execution's own cgroup.
         if let Some(limits) = spec.limits {
             request = request.with_limits(limits);
+        }
+        if let Some(guest_session) = {
+            self.inner
+                .lock()
+                .unwrap()
+                .sessions
+                .get(&session)
+                .and_then(|info| info.guest_session)
+        } {
+            request = request.with_guest_session(guest_session);
         }
         vm.touch();
         let mut execution = match self.client.exec(&vm.sandbox, &request) {
@@ -1206,7 +1294,7 @@ impl Context {
         let Some(vm) = self.vm_now() else {
             return;
         };
-        let pending: Vec<(String, String, String)> = {
+        let pending: Vec<(String, String, String, String, Option<u64>)> = {
             let inner = self.inner.lock().unwrap();
             inner
                 .removals
@@ -1214,16 +1302,26 @@ impl Context {
                 .map(|removal| {
                     (
                         removal.child.clone(),
+                        removal.source_target.clone(),
                         removal.target.clone(),
                         removal.session.clone(),
+                        removal.guest_session,
                     )
                 })
                 .collect()
         };
-        for (child, target, _session) in pending {
+        for (child, source_target, target, _session, guest_session) in pending {
+            if let Some(id) = guest_session {
+                if let Err(_error) = self.backend.unbind_guest_session(
+                    &vm.sandbox, id, &target
+                ) {
+                    self.stats.lock().unwrap().shares_remove_failed += 1;
+                    continue;
+                }
+            }
             match self
                 .backend
-                .remove_share(&vm.sandbox, &child, &target, SHARE_TIMEOUT)
+                .remove_share(&vm.sandbox, &child, &source_target, SHARE_TIMEOUT)
             {
                 Ok(()) => {
                     let mut inner = self.inner.lock().unwrap();
@@ -1263,6 +1361,13 @@ impl Context {
                              ({error}); it stays registered until the group VM retires",
                             REMOVAL_DEADLINE.as_secs()
                         );
+                        if guest_session.is_some() {
+                            self.mark_vm_lost(format!(
+                                "isolated session mapping {} could not be revoked: {error}",
+                                target
+                            ));
+                            break;
+                        }
                     }
                 }
             }
@@ -1277,6 +1382,7 @@ impl Context {
         &self,
         vm: &Arc<Vm>,
         prefix: &str,
+        guest_session: Option<u64>,
         shares: &mut Vec<Share>,
         next_child: &mut u64,
         desired: &[Mount],
@@ -1284,10 +1390,25 @@ impl Context {
         for step in plan::plan(shares, desired) {
             match step {
                 Step::Remove(share) => {
+                    if let Some(id) = guest_session {
+                        self.backend
+                            .unbind_guest_session(
+                                &vm.sandbox,
+                                id,
+                                &share.target,
+                            )
+                            .map_err(|error| {
+                                self.mark_vm_lost(format!(
+                                    "isolated session unmount failed for {}: {error}",
+                                    share.target
+                                ));
+                                fail("E_SESSION_UNMOUNT_FAILED", error)
+                            })?;
+                    }
                     match self.backend.remove_share(
                         &vm.sandbox,
                         &share.child,
-                        &share.target,
+                        &share.source_target,
                         SHARE_TIMEOUT,
                     ) {
                         Ok(()) => {
@@ -1311,8 +1432,10 @@ impl Context {
                                 let mut inner = self.inner.lock().unwrap();
                                 inner.removals.push(Removal {
                                     child: share.child.clone(),
+                                    source_target: share.source_target.clone(),
                                     target: share.target.clone(),
                                     session: prefix.to_owned(),
+                                    guest_session,
                                     since: Instant::now(),
                                 });
                                 drop(inner);
@@ -1340,11 +1463,14 @@ impl Context {
                     } else {
                         preferred
                     };
+                    let source_target = guest_session
+                        .map(|_| format!("/sessions/{prefix}/mounts/{}", mount.id))
+                        .unwrap_or_else(|| target.clone());
                     let host = PathBuf::from(&mount.host_path);
                     let live = LiveShare {
                         child: &child,
                         host_path: &host,
-                        target: &target,
+                        target: &source_target,
                         read_only: mount.read_only,
                     };
                     self.backend
@@ -1362,6 +1488,19 @@ impl Context {
                                 text,
                             )
                         })?;
+                    if let Some(id) = guest_session {
+                        self.backend
+                            .bind_guest_session(
+                                &vm.sandbox,
+                                id,
+                                &aci_edge_sandboxes::nvx::protocol::SessionMount {
+                                    source: source_target.clone(),
+                                    target: target.clone(),
+                                    read_only: mount.read_only,
+                                },
+                            )
+                            .map_err(|error| fail("E_SESSION_MOUNT_FAILED", error))?;
+                    }
                     self.stats.lock().unwrap().shares_added += 1;
                     self.inner
                         .lock()
@@ -1371,6 +1510,7 @@ impl Context {
                     shares.push(Share {
                         mount,
                         child,
+                        source_target,
                         target,
                     });
                 }
@@ -1737,6 +1877,10 @@ impl Context {
                     child: export.child.clone(),
                     target: export.target.clone(),
                 });
+            let guest_session = inner
+                .sessions
+                .get(name)
+                .and_then(|info| info.guest_session);
             let shares = inner
                 .sessions
                 .remove(name)
@@ -1748,18 +1892,20 @@ impl Context {
             // Exports of a closed session cannot always be removed at once: another session's
             // command may be running. The contract is to wait for the guest, then remove — and
             // to destroy the VM if that does not converge (`try_removals`).
-            let mut exports: Vec<(String, String)> = Vec::new();
+            let mut exports: Vec<(String, String, String)> = Vec::new();
             if let Some(export) = workspace_export {
-                exports.push((export.child, export.target));
+                exports.push((export.child, export.target.clone(), export.target));
             }
             for share in shares {
-                exports.push((share.child, share.target));
+                exports.push((share.child, share.source_target, share.target));
             }
-            for (child, target) in exports {
+            for (child, source_target, target) in exports {
                 inner.removals.push(Removal {
                     child,
+                    source_target,
                     target,
                     session: name.to_owned(),
+                    guest_session,
                     since: Instant::now(),
                 });
             }

@@ -49,6 +49,9 @@ impl GuestFeatures {
     /// execution's own cgroup, and refuses an execution whose limit it cannot enforce. Not in
     /// [`GuestFeatures::REQUIRED`]: a host that asks for no limits works without it.
     pub const EXEC_LIMITS: Self = Self(1 << 9);
+    /// Versioned guest-session lifecycle, scoped execution, and namespace isolation.
+    /// Not required for legacy trusted-shared guests; hosts must explicitly negotiate it.
+    pub const SESSION_ISOLATION: Self = Self(1 << 10);
     /// The features that the host depends on.
     pub const REQUIRED: Self = Self(
         Self::CANCEL.0
@@ -60,7 +63,7 @@ impl GuestFeatures {
     );
 
     /// Human-readable names of every feature, used in compatibility errors.
-    pub(crate) const NAMES: [(Self, &'static str); 8] = [
+    pub(crate) const NAMES: [(Self, &'static str); 9] = [
         (Self::CANCEL, "cancellation"),
         (Self::WORKLOAD_ACCOUNT, "workload accounts"),
         (Self::EXEC_CGROUP, "workload containment"),
@@ -69,6 +72,7 @@ impl GuestFeatures {
         (Self::HOST_MAPPING_TABLE, "host path mapping tables"),
         (Self::EXEC_SLOTS, "concurrent executions"),
         (Self::EXEC_LIMITS, "per-execution resource limits"),
+        (Self::SESSION_ISOLATION, "isolated guest sessions"),
     ];
 
     /// Returns the features whose bits are set in `bits`.

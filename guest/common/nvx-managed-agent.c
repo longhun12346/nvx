@@ -37,6 +37,11 @@
 #define APP_FEATURES 5U
 #define APP_MAPS 6U
 #define APP_UNMAP 7U
+#define APP_SESSION_OPEN 8U
+#define APP_SESSION_CLOSE 9U
+#define APP_SESSION_EXEC 10U
+#define APP_SESSION_BIND 11U
+#define APP_SESSION_UNBIND 12U
 #define APP_READY 0x81U
 #define APP_STDOUT 0x82U
 #define APP_STDERR 0x83U
@@ -76,6 +81,8 @@
  * the agent cannot enforce is refused instead of running unlimited.
  */
 #define FEATURE_EXEC_LIMITS (1U << 9)
+/* Reserved for the complete P8 lifecycle; not advertised until it is implemented. */
+#define FEATURE_SESSION_ISOLATION (1U << 10)
 
 #define MAX_ARGUMENTS 64U
 #define MAX_ARGUMENT_LEN 4096U
@@ -174,6 +181,8 @@ struct agent_config {
 };
 
 struct exec_config {
+    /* Internal identity, set only by APP_SESSION_EXEC, never by the EXEC payload. */
+    uint64_t guest_session_id;
     char *cwd;
     char **environment;
     uint16_t environment_count;
@@ -1323,6 +1332,8 @@ static int cgroup_has_tasks(const char *path)
  * process. A reaped child is matched to its slot, which is how the scheduler
  * learns that an execution has exited.
  */
+#include "nvx-guest-session.h"
+
 static void reap_children(struct exec_slot *slots, size_t count)
 {
     for (;;) {
@@ -1336,6 +1347,7 @@ static void reap_children(struct exec_slot *slots, size_t count)
         if (pid <= 0) {
             return;
         }
+        guest_session_reaped(pid);
         for (index = 0; index < count; ++index) {
             struct exec_slot *slot = &slots[index];
 
@@ -2168,6 +2180,8 @@ static int start_slot(
     if (child == 0) {
         int null_fd;
         char config_fd[32];
+        char session_uid[16];
+        struct agent_config scoped_config;
 
         /* fork inherits the agent's OOM exemption. Restore eligibility while
          * still root, before setpriv drops capabilities or user code runs. */
@@ -2193,9 +2207,35 @@ static int start_slot(
         close(stderr_pipe[1]);
         if (config->direct) {
             const char *directory =
-                exec_config->cwd == NULL ? "/" : exec_config->cwd;
+                exec_config->cwd == NULL
+                    ? (exec_config->guest_session_id == 0 ? "/" : "/workspace")
+                    : exec_config->cwd;
 
             close(launch_pipe[0]);
+            if (exec_config->guest_session_id != 0) {
+                struct guest_session *context = guest_session_find(exec_config->guest_session_id);
+                if (context == NULL || join_cgroup(g_child_cgroup) != 0) {
+                    report_launch_failure(launch_pipe[1], LAUNCH_STAGE_SETUP, errno);
+                }
+                /* The wrapper and real workload join the leaf before entering
+                 * the private mount namespace, which exposes no cgroup handles. */
+                g_child_cgroup = NULL;
+                if (guest_session_enter(context, exec_config_fd, launch_pipe[1]) != 0) {
+                    report_launch_failure(launch_pipe[1], LAUNCH_STAGE_SETUP, errno);
+                }
+                scoped_config = *config;
+                snprintf(session_uid, sizeof(session_uid), "%u", context->uid);
+                scoped_config.uid = session_uid;
+                scoped_config.gid = session_uid;
+                scoped_config.user = "session";
+                scoped_config.home = "/home/session";
+                config = &scoped_config;
+                if (clearenv() != 0 ||
+                    setenv("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", 1) != 0 ||
+                    setenv("LANG", "C.UTF-8", 1) != 0) {
+                    report_launch_failure(launch_pipe[1], LAUNCH_STAGE_SETUP, errno);
+                }
+            }
             enter_workload_directory(config, directory, launch_pipe[1]);
             /*
              * A request that replaces the environment controls PWD itself;
@@ -2467,7 +2507,8 @@ static uint32_t agent_features(const struct agent_config *config)
 
     if (config->direct) {
         features |= FEATURE_HOST_MAPPING_TABLE | FEATURE_RUNTIME_MAPPINGS | FEATURE_EXEC_CGROUP |
-                    FEATURE_EXEC_CWD | FEATURE_EXEC_SLOTS | FEATURE_EXEC_LIMITS;
+                    FEATURE_EXEC_CWD | FEATURE_EXEC_SLOTS | FEATURE_EXEC_LIMITS |
+                    FEATURE_SESSION_ISOLATION;
     }
     return features;
 }
@@ -2658,26 +2699,129 @@ static int handle_app_request(
             portb_error("ping-ready", errno);
         }
         return result;
-    case APP_EXEC: {
+    case APP_SESSION_OPEN: {
+        char workspace[MAX_GUEST_PATH];
+        uint64_t id;
+        if (!config->direct ||
+            guest_session_decode(request->payload, request->payload_len, &id, workspace) != 0) {
+            return send_app_error(session, request->request_id, EINVAL, "invalid-request");
+        }
+        if (mappings->failed || mappings->applied != mappings->expected) {
+            return send_app_error(session, request->request_id, EAGAIN, "mappings-incomplete");
+        }
+        if (guest_session_create(id, workspace) != 0) {
+            return send_app_error(session, request->request_id, errno, "session-create-failed");
+        }
+        return send_app_frame(session, APP_READY, request->request_id, 0, NULL, 0);
+    }
+    case APP_SESSION_CLOSE: {
+        struct guest_session *context;
+        size_t index;
+        if (request->payload_len != 8 ||
+            (context = guest_session_find(read_u64(request->payload))) == NULL) {
+            return send_app_error(session, request->request_id, ESTALE, "session-stale");
+        }
+        for (index = 0; index < count; ++index) {
+            if ((slots[index].flags & SLOT_USED) != 0 &&
+                slots[index].config.guest_session_id == context->id) {
+                return send_app_error(session, request->request_id, EBUSY, "session-busy");
+            }
+        }
+        if (guest_session_destroy(context) != 0) {
+            return send_app_error(session, request->request_id, errno, "session-cleanup-failed");
+        }
+        return send_app_frame(session, APP_READY, request->request_id, 0, NULL, 0);
+    }
+    case APP_SESSION_BIND:
+    case APP_SESSION_UNBIND: {
+        struct guest_session *context;
+        char source[MAX_GUEST_PATH], target[MAX_GUEST_PATH];
+        uint64_t id;
+        int read_only = 0, registered = 0;
+        size_t index;
+        if (request->kind == APP_SESSION_BIND) {
+            if (guest_session_mount_decode(request->payload, request->payload_len,
+                                          &id, source, target, &read_only) != 0) {
+                return send_app_error(session, request->request_id, EINVAL, "invalid-request");
+            }
+            for (index = 0; index < MAX_RUNTIME_MAPPINGS; ++index) {
+                if (mappings->runtime_targets[index] != NULL &&
+                    strcmp(mappings->runtime_targets[index], source) == 0) registered = 1;
+            }
+            if (!registered) {
+                return send_app_error(session, request->request_id, EACCES, "session-source-denied");
+            }
+        } else {
+            if (request->payload_len <= 8 || request->payload_len - 8 >= MAX_GUEST_PATH ||
+                memchr(request->payload + 8, 0, request->payload_len - 8) != NULL) {
+                return send_app_error(session, request->request_id, EINVAL, "invalid-request");
+            }
+            id = read_u64(request->payload);
+            memcpy(target, request->payload + 8, request->payload_len - 8);
+            target[request->payload_len - 8] = 0;
+            if (!guest_session_mount_target_valid(target)) {
+                return send_app_error(session, request->request_id, EINVAL, "invalid-request");
+            }
+        }
+        context = guest_session_find(id);
+        if (context == NULL) {
+            return send_app_error(session, request->request_id, ESTALE, "session-stale");
+        }
+        for (index = 0; index < count; ++index) {
+            if ((slots[index].flags & SLOT_USED) != 0 &&
+                slots[index].config.guest_session_id == id) {
+                return send_app_error(session, request->request_id, EBUSY, "session-busy");
+            }
+        }
+        if (guest_session_change_mount(context,
+                request->kind == APP_SESSION_BIND ? source : NULL, target, read_only) != 0) {
+            int status = errno;
+            if (request->kind == APP_SESSION_UNBIND && status != ENOENT) {
+                guest_session_broken = 1;
+            }
+            return send_app_error(session, request->request_id, status, "session-mapping-failed");
+        }
+        return send_app_frame(session, APP_READY, request->request_id, 0, NULL, 0);
+    }
+    case APP_EXEC:
+    case APP_SESSION_EXEC: {
         struct exec_slot *slot = NULL;
+        uint64_t guest_session_id = 0;
+        const uint8_t *payload = request->payload;
+        uint32_t payload_len = request->payload_len;
         size_t capacity = config->direct ? count : 1U;
         size_t live = 0;
         size_t index;
 
         /* Workloads must not run without the host paths that they expect. */
-        if (mappings->applied != mappings->expected) {
+        if (guest_session_broken) {
+            return send_app_error(session, request->request_id, EIO, "session-isolation-failed");
+        }
+        if (request->kind == APP_SESSION_EXEC) {
+            if (!config->direct || payload_len < 8 ||
+                (guest_session_id = read_u64(payload)) == 0 ||
+                guest_session_find(guest_session_id) == NULL) {
+                return send_app_error(session, request->request_id, ESTALE, "session-stale");
+            }
+            payload += 8;
+            payload_len -= 8;
+        } else if (guest_session_highest_id != 0) {
+            return send_app_error(session, request->request_id, EXDEV, "session-mode-conflict");
+        }
+        if (mappings->failed || mappings->applied != mappings->expected) {
             return send_app_error(
                 session, request->request_id, EAGAIN, "mappings-incomplete");
         }
         if (decode_exec_payload(
-                request->payload,
-                request->payload_len,
+                payload,
+                payload_len,
                 &timeout_ms,
                 &workload_argv,
                 &exec_config) != 0) {
             return send_app_error(
                 session, request->request_id, 22, "invalid-request");
         }
+        exec_config.guest_session_id = guest_session_id;
         for (index = 0; index < count; ++index) {
             live += (slots[index].flags & SLOT_USED) != 0;
         }
@@ -2695,10 +2839,12 @@ static int handle_app_request(
         }
         result = start_slot(session, config, slot, request->request_id, timeout_ms,
             workload_argv, &exec_config);
-        if (result != 0) {
+        if (result != 0 || (slot->flags & SLOT_USED) == 0) {
             /* start_slot told the host why; the caller still owns these. */
             free_arguments(workload_argv);
             free_exec_config(&exec_config);
+        } else if (guest_session_id == 0) {
+            guest_session_legacy_used = 1;
         }
         return result;
     }
@@ -2744,6 +2890,8 @@ static int handle_app_request(
         /* Every execution ends before the VM does, so nothing is left to
          * outlive the acknowledgement. */
         (void)terminate_all_slots(config, slots, count);
+        guest_session_destroy_all();
+        if (guest_session_broken) return -1;
         if (send_app_frame(
                 session, APP_STOPPED, request->request_id, 0, NULL, 0) != 0) {
             return -1;
@@ -2860,6 +3008,13 @@ static int run_agent(
                 return -1;
             }
             if (record.type == OUTER_RESET) {
+                /* A new control epoch cannot inherit an isolated session's
+                 * credentials or mount history. Retire this VM generation. */
+                if (guest_session_highest_id != 0) {
+                    free_outer_record(&record);
+                    (void)terminate_all_slots(config, slots, MAX_EXEC_SLOTS);
+                    return -1;
+                }
                 if (acknowledge_reset(session, &record) != 0) {
                     portb_error("reset-ack", errno);
                     free_outer_record(&record);
@@ -2939,6 +3094,10 @@ static int run_agent(
             return -1;
         }
         reap_children(slots, MAX_EXEC_SLOTS);
+        if (guest_session_broken) {
+            (void)terminate_all_slots(config, slots, MAX_EXEC_SLOTS);
+            return -1;
+        }
         for (index = 0; index < MAX_EXEC_SLOTS; ++index) {
             struct exec_slot *slot = &slots[index];
 
@@ -3063,6 +3222,7 @@ int main(int argc, char **argv)
         return finish_agent(&config, 125);
     }
     result = run_agent(&session, &config, &mappings);
+    guest_session_destroy_all();
     if (result == AGENT_STOPPED) {
         close(session.fd);
         return finish_agent(&config, 0);

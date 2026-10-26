@@ -128,7 +128,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nvx::Artifacts;
 use nvx::host::filesystem::{self, ExportPlan, ExportRequest, PathList};
@@ -174,6 +174,88 @@ enum RunState {
 }
 
 impl OpenVmmBackend {
+    /// Create an isolated guest context through the VM's existing authenticated channel.
+    pub fn open_guest_session(
+        &self,
+        sandbox_id: &SandboxId,
+        spec: &nvx::protocol::GuestSessionSpec,
+    ) -> Result<()> {
+        let instance = self.store.instance(sandbox_id);
+        let (runtime, capability) = {
+            let (_guard, _) = self.store.lock_and_load(sandbox_id)?;
+            let RunState::Running(runtime) = self.reconcile(sandbox_id)? else {
+                return Err(Error::not_started(format!("sandbox {sandbox_id} is not running")));
+            };
+            (runtime, instance.read_capability()?)
+        };
+        let session = instance.control_session(&runtime, &capability, self.config.control_timeout)
+            .map_err(exec_error)?;
+        session.open_guest_session(spec, Instant::now() + self.config.control_timeout)
+            .map_err(|error| Error::backend_error(error.to_string()))
+    }
+
+    /// Remove a context only after its work has been cancelled and reaped.
+    pub fn close_guest_session(&self, sandbox_id: &SandboxId, id: u64) -> Result<()> {
+        let instance = self.store.instance(sandbox_id);
+        let (runtime, capability) = {
+            let (_guard, _) = self.store.lock_and_load(sandbox_id)?;
+            let RunState::Running(runtime) = self.reconcile(sandbox_id)? else {
+                return Err(Error::not_started(format!("sandbox {sandbox_id} is not running")));
+            };
+            (runtime, instance.read_capability()?)
+        };
+        let session = instance.control_session(&runtime, &capability, self.config.control_timeout)
+            .map_err(exec_error)?;
+        session.close_guest_session(id, Instant::now() + self.config.control_timeout)
+            .map_err(|error| Error::backend_error(error.to_string()))
+    }
+
+    /// Bind an already exported agent mapping into the private session root.
+    pub fn bind_guest_session(
+        &self,
+        sandbox_id: &SandboxId,
+        id: u64,
+        mount: &nvx::protocol::SessionMount,
+    ) -> Result<()> {
+        let instance = self.store.instance(sandbox_id);
+        let (runtime, capability) = {
+            let (_guard, _) = self.store.lock_and_load(sandbox_id)?;
+            let RunState::Running(runtime) = self.reconcile(sandbox_id)? else {
+                return Err(Error::not_started(format!("sandbox {sandbox_id} is not running")));
+            };
+            (runtime, instance.read_capability()?)
+        };
+        let session = instance
+            .control_session(&runtime, &capability, self.config.control_timeout)
+            .map_err(exec_error)?;
+        session
+            .bind_guest_session(id, mount, Instant::now() + self.config.control_timeout)
+            .map_err(|error| Error::backend_error(error.to_string()))
+    }
+
+    /// Strictly unbind a private mapping before its host export is revoked.
+    pub fn unbind_guest_session(
+        &self,
+        sandbox_id: &SandboxId,
+        id: u64,
+        target: &str,
+    ) -> Result<()> {
+        let instance = self.store.instance(sandbox_id);
+        let (runtime, capability) = {
+            let (_guard, _) = self.store.lock_and_load(sandbox_id)?;
+            let RunState::Running(runtime) = self.reconcile(sandbox_id)? else {
+                return Err(Error::not_started(format!("sandbox {sandbox_id} is not running")));
+            };
+            (runtime, instance.read_capability()?)
+        };
+        let session = instance
+            .control_session(&runtime, &capability, self.config.control_timeout)
+            .map_err(exec_error)?;
+        session
+            .unbind_guest_session(id, target, Instant::now() + self.config.control_timeout)
+            .map_err(|error| Error::backend_error(error.to_string()))
+    }
+
     /// Creates the backend, resolving relative paths and creating the state root.
     ///
     /// Fails with [`ErrorCode::BackendUnavailable`](crate::ErrorCode::BackendUnavailable) when
@@ -767,8 +849,9 @@ impl Backend for OpenVmmBackend {
             .control_session(&runtime, &capability, self.config.control_timeout)
             .map_err(exec_error)?;
         let execution = instance
-            .exec_shared(
+            .exec_shared_in_session(
                 &session,
+                request.guest_session,
                 &workload,
                 self.config.control_timeout,
                 self.config.exec_response_grace,

@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import time
 
-from shared_vm import Sidecar, read_frame
+from p8_support import BoundedSidecar, stop_sidecar, vmm_processes
 
 
 def start(nvxd: pathlib.Path, repo: pathlib.Path, initrd: pathlib.Path,
@@ -41,28 +41,15 @@ def start(nvxd: pathlib.Path, repo: pathlib.Path, initrd: pathlib.Path,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    ready = read_frame(process.stdout)
-    if ready is None or ready[0].get("event") != "ready":
-        process.kill()
-        process.wait()
-        raise RuntimeError(f"sidecar did not announce ready: {ready}")
-    return process, Sidecar(process)
+    try:
+        return process, BoundedSidecar(process)
+    except Exception:
+        stop_sidecar(process)
+        raise
 
 
 def stop(process: subprocess.Popen) -> None:
-    try:
-        process.stdin.write(b"")
-        process.stdin.close()
-    except (BrokenPipeError, OSError):
-        pass
-    try:
-        process.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-    if process.returncode != 0:
-        detail = process.stderr.read().decode(errors="replace")[-2000:]
-        raise RuntimeError(f"sidecar exited with {process.returncode}: {detail}")
+    stop_sidecar(process)
 
 
 def main() -> int:
@@ -84,6 +71,7 @@ def main() -> int:
     root = pathlib.Path(tempfile.mkdtemp(prefix="nvxd-p8-migration-"))
     trusted = None
     isolated = None
+    vm_handles = []
     try:
         trusted_ws_a = root / "trusted-a"
         trusted_ws_b = root / "trusted-b"
@@ -109,18 +97,31 @@ def main() -> int:
         }, deadline)
         if trusted_a.get("runtimeId") != trusted_b.get("runtimeId"):
             raise RuntimeError("trusted sessions did not share one runtime")
+        vm_handles = vmm_processes(trusted_process.pid)
         trusted.ok({
             "id": 4, "op": "exec", "session": "a", "execId": "trusted-write",
-            "argv": ["sh", "-c", "echo inherited >/tmp/migration-marker"],
+            "argv": ["sh", "-ec", "echo inherited >/tmp/migration-marker; echo ready; "
+                     "while [ ! -f /sessions/a/workspace/release ]; do sleep 0.05; done"],
             "cwd": str(trusted_ws_a),
         }, deadline)
-        trusted.await_exits(["trusted-write"], deadline)
+        while b"ready" not in trusted.stdout_of("trusted-write"):
+            trusted.pump(deadline)
+        trusted.refused({
+            "id": 40, "op": "session.open", "session": "forbidden",
+            "workspace": str(isolated_ws_a), "memoryMiB": 1024, "sessionIsolation": True,
+        }, deadline, "E_SESSION_MODE_MISMATCH")
+        unchanged = trusted.ok({"id": 41, "op": "diagnostics"}, deadline)
+        if unchanged["sessionCount"] != 2 or unchanged["vm"]["runtimeId"] != trusted_a["runtimeId"]:
+            raise RuntimeError(f"refused migration changed the running group: {unchanged}")
+        (trusted_ws_a / "release").write_text("release", encoding="utf-8")
+        trusted.succeeded(["trusted-write"], deadline)
+        print("CASE p8.migration.active_switch_refused PASS", flush=True)
         visible = trusted.ok({
             "id": 5, "op": "exec", "session": "b", "execId": "trusted-read",
             "argv": ["sh", "-c", "test \"$(cat /tmp/migration-marker)\" = inherited"],
             "cwd": str(trusted_ws_b),
         }, deadline)
-        trusted.await_exits(["trusted-read"], deadline)
+        trusted.succeeded(["trusted-read"], deadline)
         if visible.get("state") != "queued":
             raise RuntimeError(f"trusted read was not accepted: {visible}")
         if trusted.exits["trusted-read"].get("outcome") != "exited" or \
@@ -129,6 +130,10 @@ def main() -> int:
         trusted.ok({"id": 6, "op": "session.close", "session": "a"}, deadline)
         trusted.ok({"id": 7, "op": "session.close", "session": "b"}, deadline)
         stop(trusted_process)
+        for handle in vm_handles:
+            handle.wait()
+            handle.close()
+        vm_handles.clear()
         trusted = None
         print("CASE p8.migration.trusted_drained PASS")
 
@@ -157,7 +162,7 @@ def main() -> int:
             "argv": ["sh", "-c", "test ! -e /tmp/migration-marker"],
             "cwd": str(isolated_ws_b),
         }, deadline)
-        isolated.await_exits(["isolated-read"], deadline)
+        isolated.succeeded(["isolated-read"], deadline)
         terminal = isolated.exits["isolated-read"]
         if terminal.get("outcome") != "exited" or terminal.get("code") != 0:
             raise RuntimeError(f"trusted state leaked into isolated VM: {terminal}")
@@ -166,12 +171,13 @@ def main() -> int:
             "argv": ["sh", "-c", "echo private >/tmp/private-marker"],
             "cwd": str(isolated_ws_a),
         }, deadline)
+        isolated.succeeded(["isolated-write"], deadline)
         isolated.ok({
             "id": 16, "op": "exec", "session": "b", "execId": "isolated-peer",
             "argv": ["sh", "-c", "test ! -e /tmp/private-marker"],
             "cwd": str(isolated_ws_b),
         }, deadline)
-        isolated.await_exits(["isolated-write", "isolated-peer"], deadline)
+        isolated.succeeded(["isolated-write", "isolated-peer"], deadline)
         for exec_id in ("isolated-write", "isolated-peer"):
             terminal = isolated.exits[exec_id]
             if terminal.get("outcome") != "exited" or terminal.get("code") != 0:
@@ -179,10 +185,26 @@ def main() -> int:
         print("CASE p8.migration.old_state_not_inherited PASS")
         isolated.ok({"id": 17, "op": "session.close", "session": "a"}, deadline)
         isolated.ok({"id": 18, "op": "session.close", "session": "b"}, deadline)
+        rebuilt = isolated.ok({
+            "id": 19, "op": "session.open", "session": "a",
+            "workspace": str(isolated_ws_a), "memoryMiB": 1024,
+        }, deadline)
+        if rebuilt["vmGeneration"] <= isolated_a["vmGeneration"] or \
+                rebuilt["runtimeId"] == isolated_a["runtimeId"]:
+            raise RuntimeError(f"drained VM identity was reused: {isolated_a} -> {rebuilt}")
+        isolated.ok({
+            "id": 20, "op": "exec", "session": "a", "execId": "rebuilt-clean",
+            "argv": ["sh", "-ec", "test ! -e /tmp/private-marker; test ! -e /tmp/migration-marker"],
+        }, deadline)
+        isolated.succeeded(["rebuilt-clean"], deadline)
+        print(f"generation evidence: {trusted_a} -> {isolated_a} -> {rebuilt}", flush=True)
+        print("CASE p8.migration.generation_replaced PASS", flush=True)
         stop(isolated_process)
         isolated = None
         return 0
     finally:
+        for handle in vm_handles:
+            handle.close()
         if trusted is not None:
             try:
                 stop(trusted.process)

@@ -159,6 +159,9 @@ struct Removal {
 
 struct Inner {
     registry: Registry,
+    /// Namespace destruction is part of close, even after the logical session
+    /// has been removed. Keep the VM alive until that acknowledgement arrives.
+    closing_guest_sessions: usize,
     sessions: HashMap<String, SessionInfo>,
     specs: HashMap<String, Spec>,
     cancels: HashMap<String, Canceller>,
@@ -278,6 +281,7 @@ impl Context {
             vm: Mutex::new(None),
             inner: Mutex::new(Inner {
                 registry: Registry::new(max_queue.max(1), max_running.max(1), 0),
+                closing_guest_sessions: 0,
                 sessions: HashMap::new(),
                 guest_targets: std::collections::HashSet::new(),
                 next_sequence: 0,
@@ -356,6 +360,7 @@ impl Context {
                 })
                 .map_err(|error| fail(protocol::REASON_BACKEND_UNAVAILABLE, error)),
             protocol::OP_SESSION_OPEN => {
+                validate_session_policy(head, self.session_isolation)?;
                 let memory = match head.get("memoryMiB") {
                     None => protocol::DEFAULT_MEMORY_MIB,
                     Some(value) => number(Some(value)).ok_or_else(|| {
@@ -496,6 +501,7 @@ impl Context {
             "maxRunningPerSession": inner.registry.max_running_per_session(),
             "queued": inner.registry.queued_len(),
             "cleanupPending": inner.removals.len(),
+            "closingGuestSessions": inner.closing_guest_sessions,
             // How long the oldest unremoved export has been waiting. A number that keeps
             // growing is the signal that a directory somebody revoked is still bound in the
             // guest — support can see it without a debugger.
@@ -552,7 +558,14 @@ impl Context {
                 ));
             }
         }
-        let target = guest_workspace(name);
+        // A reopened logical name is a new authorization instance. VMM share
+        // names and agent source paths must not reuse a retired instance.
+        let prefix = if self.session_isolation {
+            format!("{}-s{}", safe_name(name), self.next_id())
+        } else {
+            safe_name(name)
+        };
+        let target = guest_workspace(&prefix);
         let workspace_path = PathBuf::from(workspace);
         // A VM that goes away while its first session opens is replaced once: the workspace
         // export then fails against a machine that no longer answers, and making the caller
@@ -574,7 +587,7 @@ impl Context {
                     SessionInfo {
                         guest_session: None,
                         workspace: workspace_path.clone(),
-                        prefix: safe_name(name),
+                        prefix: prefix.clone(),
                         workspace_guest: target.clone(),
                         workspace_export: None,
                         shares: Vec::new(),
@@ -824,6 +837,7 @@ impl Context {
         {
             let mut inner = self.inner.lock().unwrap();
             inner.registry.new_generation();
+            inner.closing_guest_sessions = 0;
             inner.sessions.clear();
             inner.specs.clear();
             inner.cancels.clear();
@@ -1312,11 +1326,14 @@ impl Context {
         };
         for (child, source_target, target, _session, guest_session) in pending {
             if let Some(id) = guest_session {
-                if let Err(_error) = self.backend.unbind_guest_session(
+                if let Err(error) = self.backend.unbind_guest_session(
                     &vm.sandbox, id, &target
                 ) {
                     self.stats.lock().unwrap().shares_remove_failed += 1;
-                    continue;
+                    self.mark_vm_lost(format!(
+                        "isolated session deferred unmount failed for {target}: {error}"
+                    ));
+                    return;
                 }
             }
             match self
@@ -1458,13 +1475,15 @@ impl Context {
                         let inner = self.inner.lock().unwrap();
                         inner.guest_targets.contains(&preferred)
                     };
-                    let target = if taken {
+                    // Isolated sessions own distinct mount namespaces; identical
+                    // /workspace paths in two sessions must remain identical.
+                    let target = if taken && guest_session.is_none() {
                         format!("/sessions/{prefix}/mounts/{}", mount.id)
                     } else {
                         preferred
                     };
                     let source_target = guest_session
-                        .map(|_| format!("/sessions/{prefix}/mounts/{}", mount.id))
+                        .map(|_| format!("/sessions/{prefix}/mounts/{child}"))
                         .unwrap_or_else(|| target.clone());
                     let host = PathBuf::from(&mount.host_path);
                     let live = LiveShare {
@@ -1866,7 +1885,7 @@ impl Context {
             return Err(fail(protocol::REASON_PROTOCOL, "session is required"));
         }
         let _lifecycle = self.lifecycle.lock().unwrap();
-        let (closed, running) = {
+        let (closed, running, guest_session, exports) = {
             let mut inner = self.inner.lock().unwrap();
             if !inner.sessions.contains_key(name) {
                 // Closing is idempotent (plan 3.3.2): a caller whose first close reply was lost
@@ -1893,6 +1912,9 @@ impl Context {
                 .sessions
                 .get(name)
                 .and_then(|info| info.guest_session);
+            if guest_session.is_some() {
+                inner.closing_guest_sessions += 1;
+            }
             let shares = inner
                 .sessions
                 .remove(name)
@@ -1911,17 +1933,7 @@ impl Context {
             for share in shares {
                 exports.push((share.child, share.source_target, share.target));
             }
-            for (child, source_target, target) in exports {
-                inner.removals.push(Removal {
-                    child,
-                    source_target,
-                    target,
-                    session: name.to_owned(),
-                    guest_session,
-                    since: Instant::now(),
-                });
-            }
-            (closed, running)
+            (closed, running, guest_session, exports)
         };
         // Queued work is already terminal; report it once, here.
         let generation = self.inner.lock().unwrap().registry.generation();
@@ -1968,6 +1980,44 @@ impl Context {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
+        // The guest owns namespace/keeper/private-root resources independently of
+        // the host's logical session. Destroy them after its executions stop, even
+        // while a peer is busy. Unbinding the global export alone cannot release
+        // the pinned workspace inside that namespace.
+        if let Some(id) = guest_session {
+            if cleanup_pending {
+                self.mark_vm_lost(format!(
+                    "isolated session {name} did not stop before its close deadline"
+                ));
+                return Err(fail("E_SESSION_CLOSE_FAILED", "isolated session cleanup timed out"));
+            }
+            if let Some(vm) = self.vm_now() {
+                if let Err(error) = self.backend.close_guest_session(&vm.sandbox, id) {
+                    self.mark_vm_lost(format!("isolated session {name} close failed: {error}"));
+                    return Err(fail("E_SESSION_CLOSE_FAILED", error));
+                }
+            }
+        }
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if guest_session.is_some() {
+                inner.closing_guest_sessions = inner.closing_guest_sessions.saturating_sub(1);
+            }
+            if inner.vm_present {
+                for (child, source_target, target) in exports {
+                    inner.removals.push(Removal {
+                        child,
+                        source_target,
+                        target,
+                        session: name.to_owned(),
+                        // The namespace and all of its mounts are gone. Only the
+                        // agent's source export remains to be removed.
+                        guest_session: None,
+                        since: Instant::now(),
+                    });
+                }
+            }
+        }
         // Removing exports is only possible in an idle gap; when this was the last session,
         // retiring the VM does the whole cleanup at once.
         self.try_removals(true);
@@ -1987,7 +2037,7 @@ impl Context {
     fn retire_if_idle(&self) -> bool {
         let idle = {
             let inner = self.inner.lock().unwrap();
-            inner.registry.is_idle() && inner.vm_present
+            inner.registry.is_idle() && inner.closing_guest_sessions == 0 && inner.vm_present
         };
         if !idle {
             self.wake.notify_all();
@@ -2162,6 +2212,76 @@ impl Context {
             let _ = canceller.cancel();
         }
         self.retire_if_idle();
+    }
+}
+
+/// A request cannot change the mode selected for this sidecar's VM lifecycle.
+/// Validate before any workspace export or VM boot so a refused policy has no effects.
+fn validate_session_policy(head: &Value, isolated: bool) -> Result<(), Failure> {
+    // C++ property_tree writes scalar JSON values as strings. Preserve that
+    // wire representation while refusing malformed or truthy policy values.
+    let boolean = |value: &Value| match value {
+        Value::Bool(value) => Some(*value),
+        Value::String(value) if value == "true" => Some(true),
+        Value::String(value) if value == "false" => Some(false),
+        _ => None,
+    };
+    if let Some(mode) = head.get("sessionIsolation") {
+        if boolean(mode) != Some(isolated) {
+            return Err(fail(
+                "E_SESSION_MODE_MISMATCH",
+                "sessionIsolation must match the startup mode; drain and recreate the backend to migrate",
+            ));
+        }
+    }
+    if let Some(network) = head.get("networkPolicy") {
+        if !isolated || network.as_str() != Some("deny") {
+            return Err(fail(
+                "E_SESSION_NETWORK_UNSUPPORTED",
+                "isolated sessions currently support only networkPolicy=deny",
+            ));
+        }
+    }
+    if let Some(independent) = head.get("independentKernel") {
+        if boolean(independent) != Some(false) {
+            return Err(fail(
+                "E_SESSION_KERNEL_UNSUPPORTED",
+                "sessions share the VM kernel",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod session_policy_tests {
+    use super::*;
+
+    #[test]
+    fn property_tree_and_native_policy_scalars_agree() {
+        for head in [
+            json!({"sessionIsolation": true, "independentKernel": false, "networkPolicy": "deny"}),
+            json!({"sessionIsolation": "true", "independentKernel": "false", "networkPolicy": "deny"}),
+        ] {
+            assert!(validate_session_policy(&head, true).is_ok());
+            assert!(validate_session_policy(&head, false).is_err());
+        }
+        assert!(validate_session_policy(&json!({"sessionIsolation": "false"}), false).is_ok());
+    }
+
+    #[test]
+    fn unsupported_policy_values_are_refused() {
+        for head in [
+            json!({"sessionIsolation": 1}),
+            json!({"sessionIsolation": "yes"}),
+            json!({"sessionIsolation": null}),
+            json!({"independentKernel": true}),
+            json!({"independentKernel": "true"}),
+            json!({"networkPolicy": "allow"}),
+            json!({"networkPolicy": {"allow": []}}),
+        ] {
+            assert!(validate_session_policy(&head, true).is_err());
+        }
     }
 }
 

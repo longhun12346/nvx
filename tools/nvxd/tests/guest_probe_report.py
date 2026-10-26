@@ -1,15 +1,13 @@
-"""Validate the target-guest P8 probe report as a mandatory gate input.
-
-The kernel probe is executed by the product verification harness because it needs a diagnostic
-initrd. This companion test keeps the result in the same required-case accounting as the
-sidecar suites and rejects an old, partial, or failed report.
-"""
+"""Build and run the target-guest negative matrix during this gate invocation."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import pathlib
+import hashlib
+import subprocess
+import time
 
 
 REQUIRED_CHECKS = {
@@ -63,22 +61,68 @@ REQUIRED_CHECKS = {
 }
 
 
+def sha256(path):
+    return hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
+
+
+def linux_path(path):
+    return subprocess.check_output(
+        ["wsl", "--exec", "wslpath", "-a", str(path.resolve())],
+        text=True, timeout=15).strip()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--report", required=True, type=pathlib.Path)
+    parser.add_argument("--nvxd", required=True, type=pathlib.Path)
+    parser.add_argument("--repo", required=True, type=pathlib.Path)
+    parser.add_argument("--initrd", required=True, type=pathlib.Path)
+    parser.add_argument("--output-dir", required=True, type=pathlib.Path)
     args = parser.parse_args()
-    if not args.report.is_file():
-        raise RuntimeError(f"guest probe report is missing: {args.report}")
-    report = json.loads(args.report.read_text(encoding="utf-8"))
-    if report.get("passed") is not True or report.get("exitCode") != 0:
-        raise RuntimeError(f"guest probe did not pass: {report}")
-    scope = report.get("scope", "")
-    if "guest session lifecycle" not in scope.lower():
-        raise RuntimeError(f"guest probe scope is not a session lifecycle report: {scope!r}")
-    checks = set(report.get("checks") or [])
+    out = args.output_dir.resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    inputs = {
+        "runtime": args.initrd.resolve(),
+        "kernel": args.repo / "build/vmlinux",
+        "openvmm": args.repo / "openvmm/target/release/openvmm.exe",
+        "agent": args.repo / "guest/common/nvx-managed-agent.c",
+        "session": args.repo / "guest/common/nvx-guest-session.h",
+        "probe": args.repo / "scripts/guest_session_probe.c",
+        "builder": args.repo / "scripts/build_guest_session_probe.sh",
+    }
+    hashes = {key: sha256(path) for key, path in inputs.items()}
+    diagnostic = out / "probe.cpio.gz"
+    with (out / "build.log").open("wb") as log:
+        subprocess.run(["wsl", "--exec", "sh", linux_path(inputs["builder"]),
+                        linux_path(args.initrd), linux_path(diagnostic)],
+                       stdout=log, stderr=subprocess.STDOUT, check=True, timeout=120)
+    started = time.monotonic()
+    command = [
+        str(inputs["openvmm"]), "--single-process", "--machine", "microvm",
+        "--processors", "2", "--hypervisor", "whp", "--cpu-profile", "host",
+        "--memory", "1024M", "--kernel", str(inputs["kernel"]),
+        "--initrd", str(diagnostic), "--cmdline", "nvx_exec=/p8-probe-boot",
+    ]
+    with (out / "boot.log").open("wb") as log:
+        # subprocess.run kills and waits for this specific process on timeout.
+        result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=60)
+    text = (out / "boot.log").read_text(errors="replace")
+    found = [line.split("P8-PROBE-PASS ", 1)[1].strip()
+             for line in text.splitlines() if "P8-PROBE-PASS " in line]
+    checks = set(found)
     missing = sorted(REQUIRED_CHECKS - checks)
-    if missing:
-        raise RuntimeError(f"guest probe report is missing checks: {missing}")
+    stable = hashes == {key: sha256(path) for key, path in inputs.items()}
+    passed = (result.returncode == 0 and not missing and stable
+              and "P8-PROBE-COMPLETE" in text and "P8-PROBE-FAIL" not in text
+              and len(found) == len(checks))
+    report = {
+        "passed": passed, "exitCode": result.returncode, "args": command,
+        "elapsedSeconds": time.monotonic() - started, "sha256": hashes,
+        "diagnosticSha256": sha256(diagnostic), "inputsUnchanged": stable,
+        "checks": found, "missing": missing,
+    }
+    (out / "result.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    if not passed:
+        raise RuntimeError(f"fresh target-guest probe failed; see {out / 'result.json'}")
     print("CASE p8.guest_probe.target_negative_matrix PASS", flush=True)
     return 0
 

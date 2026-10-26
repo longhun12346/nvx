@@ -22,6 +22,8 @@ import subprocess
 import tempfile
 import time
 
+from p8_support import vmm_processes
+
 
 def read_frame(stream):
     header = stream.read(8)
@@ -224,11 +226,14 @@ def case_vm_lost(nvxd, repo, initrd, root):
             "argv": ["sh", "-c", "sleep 60; echo late"],
         }, 60)
         time.sleep(1.5)
-        subprocess.run(
-            ["taskkill", "/F", "/IM", "openvmm.exe"],
-            capture_output=True,
-            check=False,
-        )
+        handles = vmm_processes(process.pid)
+        try:
+            for handle in handles:
+                handle.kill()
+                handle.wait()
+        finally:
+            for handle in handles:
+                handle.close()
         deadline = time.monotonic() + 60
         terminal = None
         while time.monotonic() < deadline:

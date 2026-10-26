@@ -438,6 +438,7 @@ def main():
     case_vm_lost(args.nvxd, args.repo, args.initrd, root)
     case_guest_oom(args.nvxd, args.repo, args.initrd, root)
     case_stalled_reader(args.nvxd, args.repo, args.initrd, root)
+    print("CASE p8.regression.fault_matrix PASS", flush=True)
     print("nvxd fault cases passed")
 
 

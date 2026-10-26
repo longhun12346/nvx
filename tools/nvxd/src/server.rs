@@ -1530,9 +1530,9 @@ impl Context {
                                 text,
                             )
                         })?;
+                    self.stats.lock().unwrap().shares_added += 1;
                     if let Some(id) = guest_session {
-                        self.backend
-                            .bind_guest_session(
+                        if let Err(error) = self.backend.bind_guest_session(
                                 &vm.sandbox,
                                 id,
                                 &aci_edge_sandboxes::nvx::protocol::SessionMount {
@@ -1541,9 +1541,22 @@ impl Context {
                                     read_only: mount.read_only,
                                 },
                             )
-                            .map_err(|error| fail("E_SESSION_MOUNT_FAILED", error))?;
+                        {
+                            // The export exists before the private bind. If the
+                            // bind fails, it must not become an untracked child.
+                            if let Err(cleanup) = self.backend.remove_share(
+                                &vm.sandbox, &child, &source_target, SHARE_TIMEOUT
+                            ) {
+                                self.mark_vm_lost(format!(
+                                    "isolated bind rollback for {child} failed: {cleanup}"
+                                ));
+                            } else {
+                                self.stats.lock().unwrap().shares_removed += 1;
+                                eprintln!("nvxd: rolled back unbound export {child}");
+                            }
+                            return Err(fail("E_SESSION_MOUNT_FAILED", error));
+                        }
                     }
-                    self.stats.lock().unwrap().shares_added += 1;
                     self.inner
                         .lock()
                         .unwrap()

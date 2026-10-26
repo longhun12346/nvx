@@ -5,6 +5,8 @@ It measures each VM through its own sidecar, and records SHA256 for all inputs.
 """
 
 import argparse
+import ctypes
+from ctypes import wintypes
 import hashlib
 import json
 import pathlib
@@ -16,6 +18,33 @@ import time
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def process_memory(pid):
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("faults", wintypes.DWORD)] + [
+            (key, ctypes.c_size_t) for key in (
+                "peakWorkingSet", "workingSet", "peakPaged", "paged",
+                "peakNonPaged", "nonPaged", "pagefile", "peakPagefile", "privateBytes")]
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
+    handle = kernel.OpenProcess(0x410, False, pid)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return {key + "MiB": getattr(counters, key) / (1 << 20)
+                for key in ("workingSet", "peakWorkingSet", "privateBytes")}
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def measure(args, isolated, memory_mib, repetition):
@@ -59,6 +88,8 @@ def measure(args, isolated, memory_mib, repetition):
         open_seconds = time.monotonic() - started
         handles = vmm_processes(process.pid)
         cold_idle = call("memory.stats")
+        process_samples = {"cold": {"sidecar": process_memory(process.pid),
+                                   "vmm": [process_memory(handle.pid) for handle in handles]}}
         for name in workspaces:
             key = "warm-" + name
             call("exec", session=name, execId=key,
@@ -66,6 +97,8 @@ def measure(args, isolated, memory_mib, repetition):
             sidecar.succeeded([key], deadline)
         vcpus = int(sidecar.stdout_of("warm-a").strip())
         idle = call("memory.stats")
+        process_samples["warm"] = {"sidecar": process_memory(process.pid),
+                                  "vmm": [process_memory(handle.pid) for handle in handles]}
         members = [(name, f"work-{index}") for index, name in enumerate(workspaces)]
         launch_started = time.monotonic()
         for name, key in members:
@@ -99,6 +132,8 @@ def measure(args, isolated, memory_mib, repetition):
         for _ in range(5):
             loaded_samples.append(call("memory.stats")["workingSetMiB"])
             time.sleep(0.2)
+        process_samples["loaded"] = {"sidecar": process_memory(process.pid),
+                                    "vmm": [process_memory(handle.pid) for handle in handles]}
         for name, key in members:
             (workspaces[name] / (key + ".release")).write_text("go", encoding="utf-8")
         sidecar.succeeded([key for _, key in members], deadline)
@@ -158,6 +193,7 @@ def measure(args, isolated, memory_mib, repetition):
             "isolated": isolated, "guestMemoryMiB": memory_mib, "repetition": repetition,
             "readySeconds": ready_seconds, "eightSessionOpenSeconds": open_seconds,
             "logicalSessions": len(workspaces), "privateStorage": private_storage,
+            "hostProcessMemory": process_samples,
             "privateTmpMiBPerSession": 8 if isolated else 0,
             "eightResidentReadySeconds": ready_all, "residentBytesPerTask": 32 << 20,
             "limitMiBPerExec": 96, "effectiveConcurrentExecs": 8,

@@ -10,11 +10,35 @@ must build from a clean NVX checkout with `cargo build --locked`.
 
 The sidecar keeps the v1 product contract explicit:
 
-- one fixed 1024 MiB guest configuration per session;
+- one VM per sidecar, shared by its logical sessions; guest size is fixed at boot,
+  accepts 1024–4096 MiB, and the engine chooses a tier before creating the VM;
 - `hardTimeoutSec` maps to guest execution timeout;
-- positive per-exec memory and CPU limits, stdin, and input are rejected with
-  stable reason codes until their later product phases are implemented;
-- zero-valued limits are accepted as “no additional request limit”.
+- up to eight concurrent executions by default, with per-execution memory, CPU,
+  and process limits when the guest advertises the required features;
+- stdin and input remain explicitly unsupported;
+- zero-valued limits inherit deployment defaults.
+
+`--session-isolation` selects a fixed mode for the lifetime of the sidecar.
+It requires the guest's session-isolation capability, creates private
+mount/PID/IPC/network environments, and supports only deny-external-network
+policy. It does not provide a separate kernel or session aggregate resource
+budgets. Mode migration requires draining the old group and creating a new VM.
+
+An isolated close cancels its executions, destroys its guest context, then
+removes source exports without waiting for unrelated sessions to idle.
+An unprovable revoke or cleanup failure retires the whole group and gives all
+affected executions terminal events. An unsuccessful private bind rolls its
+new source export back; failed rollback also retires the group.
+
+Independently authorized sessions may export the same host directory with
+separate read-only/read-write policies. They intentionally see shared host
+content, while private HOME/tmp and mount permissions remain per session.
+This requires the matching OpenVMM revision from the dependency lock.
+
+The engine's `verify-nvx-vm.ps1 -Stage P8` runs the required integration matrix,
+including fresh diagnostic guest probes, external cleanup fault injection,
+and the four-tier capacity matrix. Diagnostic fault observers are appended to
+disposable test initrds; they are not part of the production runtime.
 
 ## Diagnostics
 

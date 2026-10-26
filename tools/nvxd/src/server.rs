@@ -1552,6 +1552,18 @@ impl Context {
                 "a mount needs mountId and hostPath",
             ));
         }
+        if desired.iter().any(|mount| {
+            !plan::valid_mount_id(&mount.id)
+                || mount
+                    .guest_path
+                    .as_deref()
+                    .is_some_and(|path| !plan::valid_guest_target(path))
+        }) {
+            return Err(fail(
+                "E_WORKSPACE_MOUNT_INVALID",
+                "mountId and guestPath must be one safe /workspace/mounts component",
+            ));
+        }
         // A mount change rewrites the guest's bind mounts, which cannot happen under a task that
         // is already running. The parallel-mode barrier below is checked in the same critical
         // section as admission: checking it here, in an earlier one, would let two concurrent

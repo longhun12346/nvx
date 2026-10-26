@@ -19,6 +19,18 @@ pub fn guest_target_for(mount: &Mount) -> String {
         .unwrap_or_else(|| guest_target(&mount.id))
 }
 
+pub fn valid_mount_id(id: &str) -> bool {
+    id != "." && id != ".."
+        && !id.is_empty()
+        && id.len() <= 255
+        && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
+pub fn valid_guest_target(path: &str) -> bool {
+    path.strip_prefix("/workspace/mounts/")
+        .is_some_and(|leaf| valid_mount_id(leaf))
+}
+
 /// A share that is live in the guest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Share {
@@ -213,5 +225,16 @@ mod tests {
             join_guest("/sessions/A/workspace", "sub/dir"),
             "/sessions/A/workspace/sub/dir"
         );
+    }
+
+    #[test]
+    fn mount_identifiers_cannot_escape_the_workspace_mounts_directory() {
+        for id in ["", ".", "..", "../escape", "a/b", "a\\b", "a$"] {
+            assert!(!valid_mount_id(id), "{id:?}");
+        }
+        assert!(valid_mount_id("data-1"));
+        assert!(valid_guest_target("/workspace/mounts/data-1"));
+        assert!(!valid_guest_target("/workspace/mounts/../escape"));
+        assert!(!valid_guest_target("/tmp/data"));
     }
 }

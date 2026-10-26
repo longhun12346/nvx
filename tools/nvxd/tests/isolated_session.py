@@ -96,6 +96,20 @@ def main() -> int:
         }, deadline)
         sidecar.await_exits(["a2"], deadline)
         print("CASE p8.sidecar.same_session_state PASS")
+        overlap_started = time.monotonic()
+        for request_id, exec_id in ((16, "a3"), (17, "a4")):
+            sidecar.ok({
+                "id": request_id, "op": "exec", "session": "a", "execId": exec_id,
+                "argv": ["sh", "-c", "sleep 2"],
+                "cwd": str(workspaces["a"]),
+            }, deadline)
+        sidecar.await_exits(["a3", "a4"], deadline)
+        overlap_elapsed = time.monotonic() - overlap_started
+        if overlap_elapsed > 3.8:
+            raise RuntimeError(
+                f"same-session isolated executions did not overlap: {overlap_elapsed:.3f}s"
+            )
+        print("CASE p8.sidecar.same_session_concurrency PASS")
         sidecar.ok({"id": 13, "op": "session.close", "session": "a"}, deadline)
         sidecar.ok({
             "id": 14, "op": "exec", "session": "b", "execId": "b2",

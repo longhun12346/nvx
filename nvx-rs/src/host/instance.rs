@@ -978,6 +978,15 @@ pub enum WorkloadOutcome {
     Exited(i32),
     /// A signal with this number ended the workload.
     Signaled(i32),
+    /// The workload's own memory limit killed it. `signal` is the signal number, and
+    /// `vm_wide` says whether the pressure was the whole VM's (the workload was collateral)
+    /// or only this execution's.
+    OutOfMemory {
+        /// The signal that ended the workload.
+        signal: i32,
+        /// True when the VM ran out of memory; false when the execution's own limit did.
+        vm_wide: bool,
+    },
     /// The workload's timeout elapsed, and the guest agent killed it.
     TimedOut,
     /// The workload exceeded [`MAX_OUTPUT_BYTES`], and the guest agent killed it.
@@ -1002,6 +1011,14 @@ fn workload_outcome(category: ExitCategory, status: i32) -> WorkloadOutcome {
         } else {
             status
         }),
+        ExitCategory::Oom => WorkloadOutcome::OutOfMemory {
+            signal: if status > 128 { status - 128 } else { status },
+            vm_wide: false,
+        },
+        ExitCategory::VmOom => WorkloadOutcome::OutOfMemory {
+            signal: if status > 128 { status - 128 } else { status },
+            vm_wide: true,
+        },
         ExitCategory::Timeout => WorkloadOutcome::TimedOut,
         ExitCategory::OutputLimit => WorkloadOutcome::OutputLimitExceeded,
         ExitCategory::Failed => WorkloadOutcome::Failed,

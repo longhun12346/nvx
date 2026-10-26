@@ -264,6 +264,10 @@ struct exec_slot {
     /* Empty when the execution has no cgroup (sandbox mode). */
     char cgroup[EXEC_CGROUP_NAME_BYTES];
     int cgroup_ready;
+    /* Baselines belong to this leaf; the root has no memory.events file. */
+    unsigned long long initial_oom;
+    unsigned long long initial_oom_kill;
+    int memory_events_ready;
     /* Attempts spent settling this execution's cgroup, so one pass stays bounded. */
     unsigned settle_attempts;
 };
@@ -1096,6 +1100,76 @@ static int write_cgroup_file(const char *path, const char *name, const char *val
     return result;
 }
 
+/* Read both counters together. Unavailable accounting must not fabricate OOM. */
+static int read_memory_events(const char *path, unsigned long long *oom,
+    unsigned long long *oom_kill)
+{
+    char file[EXEC_CGROUP_NAME_BYTES + 32U];
+    char buffer[1024];
+    const char *cursor;
+    unsigned found = 0;
+    int written;
+    int fd;
+    ssize_t got;
+
+    written = snprintf(file, sizeof(file), "%s/memory.events", path);
+    if (written <= 0 || (size_t)written >= sizeof(file)) {
+        return -1;
+    }
+    fd = open(file, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    do {
+        got = read(fd, buffer, sizeof(buffer) - 1U);
+    } while (got < 0 && errno == EINTR);
+    close(fd);
+    if (got <= 0 || (size_t)got == sizeof(buffer) - 1U) {
+        return -1;
+    }
+    buffer[got] = '\0';
+    cursor = buffer;
+    while (cursor != NULL) {
+        char key[64];
+        unsigned long long value;
+
+        if (sscanf(cursor, "%63s %llu", key, &value) == 2) {
+            if (strcmp(key, "oom") == 0) {
+                *oom = value;
+                found |= 1U;
+            } else if (strcmp(key, "oom_kill") == 0) {
+                *oom_kill = value;
+                found |= 2U;
+            }
+        }
+        cursor = strchr(cursor, '\n');
+        if (cursor != NULL) {
+            ++cursor;
+        }
+    }
+    return found == 3U ? 0 : -1;
+}
+
+/*
+ * oom_kill counts victims of both local and global OOM. The leaf's oom counter
+ * counts hitting that leaf's own memory limit. These exec leaves sit directly
+ * under the root (no ancestor memory limits), so a victim without a local oom
+ * event was killed by VM-wide pressure. Never use unrelated executions' counters.
+ */
+static const char *slot_oom_category(const struct exec_slot *slot)
+{
+    unsigned long long oom = 0;
+    unsigned long long oom_kill = 0;
+
+    if (!slot->cgroup_ready || !slot->memory_events_ready ||
+        (WIFSIGNALED(slot->wait_status) && WTERMSIG(slot->wait_status) != SIGKILL) ||
+        read_memory_events(slot->cgroup, &oom, &oom_kill) != 0 ||
+        oom_kill <= slot->initial_oom_kill) {
+        return NULL;
+    }
+    return oom > slot->initial_oom ? "oom" : "vm-oom";
+}
+
 /* Defined with the rest of the pids-controller helpers below. */
 static int cgroup_has_tasks(const char *path);
 
@@ -1140,10 +1214,10 @@ static int create_slot_cgroup(struct exec_slot *slot, uint32_t memory_mib,
             write_cgroup_file(slot->cgroup, "memory.max", value) != 0) {
             return -1;
         }
-        /* The whole execution dies with its cgroup, not a random task of it. */
-        if (write_cgroup_file(slot->cgroup, "memory.oom.group", "1") != 0) {
-            return -1;
-        }
+    }
+    /* Global OOM must also retire a whole execution, not just its allocating child. */
+    if (write_cgroup_file(slot->cgroup, "memory.oom.group", "1") != 0) {
+        return -1;
     }
     if (cpu_percent != 0) {
         unsigned long long quota =
@@ -1163,6 +1237,8 @@ static int create_slot_cgroup(struct exec_slot *slot, uint32_t memory_mib,
         }
     }
     slot->cgroup_ready = 1;
+    slot->memory_events_ready = read_memory_events(slot->cgroup,
+        &slot->initial_oom, &slot->initial_oom_kill) == 0;
     return 0;
 }
 
@@ -2041,7 +2117,8 @@ static int start_slot(
          * The limits go on the leaf before the child joins it, so a workload
          * never runs without the limits the caller asked for.
          */
-        if (prepare_cgroup_root(exec_config->mem_mb != 0,
+        /* Accounting and group OOM handling also apply to uncapped executions. */
+        if (prepare_cgroup_root(1,
                 exec_config->cpu_percent != 0) != 0 ||
             create_slot_cgroup(
                 slot, exec_config->mem_mb, exec_config->cpu_percent, exec_config->pids_max) !=
@@ -2092,6 +2169,11 @@ static int start_slot(
         int null_fd;
         char config_fd[32];
 
+        /* fork inherits the agent's OOM exemption. Restore eligibility while
+         * still root, before setpriv drops capabilities or user code runs. */
+        if (write_cgroup_file("/proc/self", "oom_score_adj", "0") != 0) {
+            _exit(125);
+        }
         setpgid(0, 0);
         if (fcntl(exec_config_fd, F_SETFD, 0) != 0 ||
             snprintf(
@@ -2293,6 +2375,8 @@ static int finish_slot(
         }
     }
     if (!abandoned) {
+        const char *oom_category = slot_oom_category(slot);
+
         if (slot->launch_report > 0 && slot->launch_failure.stage == LAUNCH_STAGE_CWD) {
             result = refuse_working_directory(session, slot->request_id,
                 slot->config.cwd == NULL ? "/" : slot->config.cwd,
@@ -2309,6 +2393,9 @@ static int finish_slot(
         } else if ((slot->flags & SLOT_OUTPUT_LIMITED) != 0) {
             result = send_app_frame(
                 session, APP_EXIT, slot->request_id, 125, "output-limit", 12);
+        } else if (oom_category != NULL) {
+            result = send_app_frame(session, APP_EXIT, slot->request_id,
+                128 + SIGKILL, oom_category, strlen(oom_category));
         } else if (WIFEXITED(slot->wait_status)) {
             result = send_app_frame(session, APP_EXIT, slot->request_id,
                 WEXITSTATUS(slot->wait_status), "exit", 4);
@@ -2919,6 +3006,24 @@ int main(int argc, char **argv)
     }
     if (argc != 8) {
         return 125;
+    }
+    /*
+     * Keep the OOM killer away from the control plane.
+     *
+     * Executions without a request or deployment cap may exhaust the guest. The kernel
+     * then picks a victim by oom_score, roughly its share of resident memory.
+     * Without this exemption the agent is just another candidate, and killing it
+     * fails every session on the VM instead of the single execution that caused
+     * the pressure. nvx-time exempts its daemon the same way.
+     *
+     * The forked child explicitly restores oom_score_adj before dropping privileges.
+     */
+    if (write_cgroup_file("/proc/self", "oom_score_adj", "-1000") != 0) {
+        /* Not fatal: the agent still serves, it is just not protected. */
+        dprintf(
+            STDERR_FILENO,
+            "NVX-MANAGED-WARN: stage=oom-exemption status=%d\n",
+            errno);
     }
     config.rootfs = argv[2];
     config.hostname = argv[3];

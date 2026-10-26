@@ -673,6 +673,8 @@ fn exit_categories_match_the_guest_agent() {
         ExitCategory::Timeout,
         ExitCategory::OutputLimit,
         ExitCategory::Signal,
+        ExitCategory::Oom,
+        ExitCategory::VmOom,
         ExitCategory::Failed,
         ExitCategory::Cancelled,
     ] {

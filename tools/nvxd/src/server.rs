@@ -2210,6 +2210,14 @@ fn terminal_of(outcome: aci_edge_sandboxes::Result<ExecOutcome>, cancelled: bool
         _ if cancelled => Terminal::new("cancelled", None, "cancelled by the caller"),
         Ok(ExecOutcome::Exited(code)) => Terminal::new("exited", Some(code), ""),
         Ok(ExecOutcome::Signaled(signal)) => Terminal::new("signaled", Some(signal), ""),
+        Ok(ExecOutcome::OutOfMemory { signal, vm_wide }) => Terminal::new(
+            "signaled",
+            Some(signal),
+            // The outcome stays "signaled" so an existing caller keeps working; the reason is
+            // what distinguishes an execution-local limit from VM-wide pressure. Neither
+            // category promises that blindly retrying the execution will succeed.
+            if vm_wide { "vmOom" } else { "oom" },
+        ),
         Ok(ExecOutcome::TimedOut) => Terminal::new("timedOut", None, ""),
         Ok(ExecOutcome::Cancelled) => Terminal::new("cancelled", None, ""),
         Ok(other) => Terminal::new("failed", None, other.to_string()),

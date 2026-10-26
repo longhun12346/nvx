@@ -130,6 +130,18 @@ pub enum ExitCategory {
     OutputLimit,
     /// A signal ended the workload; the status is 128 plus the signal number.
     Signal,
+    /// The workload's own memory limit killed it: it was the execution that ran out.
+    ///
+    /// Reported separately from [`Signal`](Self::Signal) because a bare SIGKILL cannot be acted
+    /// on: the caller cannot tell "I used too much memory" from "something else killed me".
+    /// The status is 128 plus the signal number, as for `Signal`.
+    Oom,
+    /// The VM ran out of memory and the kernel killed this workload, which need not have been
+    /// the one that caused the pressure.
+    ///
+    /// Distinct from [`Oom`](Self::Oom) because no execution-local limit caused this kill.
+    /// This execution may itself have exhausted the VM; retrying is not guaranteed to help.
+    VmOom,
     /// The guest agent could not supervise the workload.
     Failed,
     /// A cancellation request ended the workload.
@@ -144,6 +156,8 @@ impl ExitCategory {
             b"timeout" => Ok(Self::Timeout),
             b"output-limit" => Ok(Self::OutputLimit),
             b"signal" => Ok(Self::Signal),
+            b"oom" => Ok(Self::Oom),
+            b"vm-oom" => Ok(Self::VmOom),
             b"failed" => Ok(Self::Failed),
             b"cancelled" => Ok(Self::Cancelled),
             _ => Err(violation(
@@ -159,6 +173,8 @@ impl ExitCategory {
             Self::Timeout => "timeout",
             Self::OutputLimit => "output-limit",
             Self::Signal => "signal",
+            Self::Oom => "oom",
+            Self::VmOom => "vm-oom",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
         }

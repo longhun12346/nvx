@@ -16,6 +16,17 @@ pub enum ExecOutcome {
     Exited(i32),
     /// The workload was terminated by this signal number.
     Signaled(i32),
+    /// The workload was killed for memory, with the signal number that ended it.
+    ///
+    /// `vm_wide` distinguishes VM-wide pressure from hitting the execution's own limit.
+    /// The victim may also have caused the global pressure; this is not a retry guarantee.
+    /// Ordinary external signals remain [`Signaled`](Self::Signaled).
+    OutOfMemory {
+        /// The signal that ended the workload.
+        signal: i32,
+        /// True when the whole VM ran out of memory.
+        vm_wide: bool,
+    },
     /// The workload overran `process.timeout` and is no longer running.
     TimedOut,
     /// The workload was cancelled at the caller's request and is no longer running.
@@ -44,6 +55,12 @@ impl fmt::Display for ExecOutcome {
         match self {
             Self::Exited(code) => write!(formatter, "exited with status {code}"),
             Self::Signaled(signal) => write!(formatter, "terminated by signal {signal}"),
+            Self::OutOfMemory { signal, vm_wide: false } => {
+                write!(formatter, "killed by its own memory limit (signal {signal})")
+            }
+            Self::OutOfMemory { signal, vm_wide: true } => {
+                write!(formatter, "killed by the VM running out of memory (signal {signal})")
+            }
             Self::TimedOut => formatter.write_str("timed out"),
             Self::Cancelled => formatter.write_str("cancelled"),
             Self::Failed(failure) => write!(formatter, "failed: {failure}"),

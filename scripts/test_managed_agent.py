@@ -30,6 +30,18 @@ class ManagedAgentDecoderTests(unittest.TestCase):
 #include "nvx-managed-agent.c"
 #undef main
 int main(int argc, char **argv) {
+    if (argc == 6 && strcmp(argv[1], "--oom-category") == 0) {
+        struct exec_slot slot = {0};
+        snprintf(slot.cgroup, sizeof(slot.cgroup), "%s", argv[2]);
+        slot.cgroup_ready = 1;
+        slot.memory_events_ready = 1;
+        slot.initial_oom = strtoull(argv[3], NULL, 10);
+        slot.initial_oom_kill = strtoull(argv[4], NULL, 10);
+        slot.wait_status = atoi(argv[5]);
+        const char *category = slot_oom_category(&slot);
+        puts(category == NULL ? "signal" : category);
+        return 0;
+    }
     unsigned char bytes[65536];
     uint32_t timeout_ms = 0;
     char **arguments = NULL;
@@ -234,6 +246,39 @@ int main(int argc, char **argv) {
             [str(self.executable), str(source)], capture_output=True, timeout=5
         )
         return result.returncode
+
+    def test_oom_attribution_uses_only_this_executions_new_events(self):
+        leaf = self.root / "oom-leaf"
+        leaf.mkdir(exist_ok=True)
+        events = leaf / "memory.events"
+        # oom_kill alone includes global victims; oom without a kill is not a termination.
+        cases = [
+            ("oom 1\noom_kill 1\n", 0, 0, 9, "oom"),
+            ("oom 0\noom_kill 1\n", 0, 0, 9, "vm-oom"),
+            ("oom 1\noom_kill 0\n", 0, 0, 9, "signal"),
+            ("oom 2\noom_kill 3\n", 2, 3, 9, "signal"),
+            ("oom 2\noom_kill 4\n", 2, 3, 9, "vm-oom"),
+            ("oom 3\noom_kill 4\n", 2, 3, 9, "oom"),
+            ("oom 1\noom_kill 1\n", 0, 0, 15, "signal"),
+            ("oom 1\n", 0, 0, 9, "signal"),
+            ("", 0, 0, 9, "signal"),
+        ]
+        for contents, initial_oom, initial_kill, signal, expected in cases:
+            with self.subTest(contents=contents, initial_oom=initial_oom,
+                              initial_kill=initial_kill, signal=signal):
+                events.write_text(contents, encoding="utf-8")
+                result = subprocess.run(
+                    [str(self.executable), "--oom-category", str(leaf),
+                     str(initial_oom), str(initial_kill), str(signal)],
+                    check=True, capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(result.stdout.strip(), expected)
+        events.unlink()
+        result = subprocess.run(
+            [str(self.executable), "--oom-category", str(leaf), "0", "0", "9"],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(result.stdout.strip(), "signal")
 
     def test_accepts_empty_and_exact_environment(self):
         self.assertEqual(self.decode(()), 0)
@@ -557,7 +602,7 @@ int main(int argc, char **argv) {
         request.request_id = request_id++;
         offset += 5 + request.payload_len;
         if (offset > length) return 2;
-        if (handle_app_request(&session, &config, &mappings, &request) < 0) return 4;
+        if (handle_app_request(&session, &config, &mappings, NULL, 0, &request) < 0) return 4;
     }
     printf("%u %u %d\\n", mappings.expected, mappings.applied, mappings.failed);
     return 0;
@@ -872,7 +917,8 @@ int main(int argc, char **argv) {
         kind, _, status, payload = answers[0]
         self.assertEqual((kind, status), (APP_READY, 0))
         (features,) = struct.unpack("<I", payload)
-        self.assertEqual(features, 0b1111_1101)
+        # P6 added execution slots (bit 8) and execution limits (bit 9).
+        self.assertEqual(features, 0b11_1111_1101)
 
 
 if __name__ == "__main__":

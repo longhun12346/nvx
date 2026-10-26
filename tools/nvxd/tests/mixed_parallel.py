@@ -29,6 +29,7 @@ CASES = (
     "p7.fairness.a_burst_does_not_starve_another_session",
     "p7.limits.cross_session_isolation",
     "p7.parallel.eight_at_once",
+    "p7.oom.attributed_and_agent_exempt",
 )
 
 _reported: list[str] = []
@@ -291,6 +292,103 @@ def phase_eight_at_once(args, root, environment):
         stop(process)
 
 
+def phase_oom_attribution(args, root, environment):
+    """A memory kill reaches the caller as a reason, and the agent is not a victim candidate.
+
+    Executions carry no memory limit by design (the VM's memory is the only bound), so two
+    things have to hold for that to be safe: the agent must be exempt from the OOM killer, and
+    a kill must say whether the execution hit its own limit ("oom") or the VM ran out
+    ("vmOom"), because only the first one calls for a smaller footprint.
+    """
+    workspace = root / "oom"
+    workspace.mkdir()
+    process = start(args.nvxd, args.repo, args.initrd, root / "state-oom", 2)
+    try:
+        sidecar = Sidecar(process)
+        sidecar.ok({"id": 1, "op": "session.open", "session": "O",
+                    "workspace": str(workspace), "memoryMiB": 1024}, 300)
+
+        # The agent is argv[0]-matched so this script's own command line cannot match it.
+        sweep = (
+            "echo \"WORKLOAD $(cat /proc/self/oom_score_adj)\"; "
+            "for p in /proc/[0-9]*; do "
+            "[ \"$p\" = \"/proc/$$\" ] && continue; "
+            "first=$(tr '\\0' '\\n' < \"$p/cmdline\" 2>/dev/null | head -1); "
+            "case \"$first\" in */nvx-managed-agent|nvx-managed-agent) "
+            "echo \"AGENT $(cat \"$p/oom_score_adj\" 2>/dev/null)\";; esac; done"
+        )
+        sidecar.ok({"id": 2, "op": "exec", "session": "O", "execId": "adj",
+                    "argv": ["sh", "-c", sweep], "cwd": str(workspace)}, 120)
+        sidecar.await_exits(["adj"], time.monotonic() + 120)
+        if sidecar.exits["adj"].get("outcome") != "exited" or sidecar.exits["adj"].get("code") != 0:
+            raise RuntimeError(f"OOM eligibility probe failed: {sidecar.exits['adj']}; "
+                               f"stderr={sidecar.stderr_of('adj')!r}")
+        adj = sidecar.stdout_of("adj").decode(errors="replace")
+        if "AGENT -1000" not in adj:
+            raise RuntimeError(
+                f"the agent is not exempt from the OOM killer: {adj!r}"
+            )
+        if "WORKLOAD 0" not in adj:
+            raise RuntimeError(f"the workload inherited the agent's OOM exemption: {adj!r}")
+
+        # A request-level limit makes the execution its own culprit, so the kill is attributed
+        # to it rather than reported as an unexplained signal.
+        sidecar.ok({
+            "id": 3, "op": "exec", "session": "O", "execId": "oom",
+            "argv": ["sh", "-c", "python3 -c 'x=bytearray(256*1024*1024); print(len(x))'"],
+            "cwd": str(workspace), "limits": {"memMb": 96},
+        }, 120)
+        sidecar.await_exits(["oom"], time.monotonic() + 180)
+        killed = sidecar.exits["oom"]
+        if killed.get("outcome") != "signaled" or killed.get("code") != 9:
+            raise RuntimeError(f"the limited execution was not stopped: {killed}")
+        if killed.get("detail") != "oom":
+            raise RuntimeError(
+                f"the kill was not attributed to the execution's own limit: {killed}"
+            )
+
+        # No request/deployment cap: force genuine VM-wide pressure. Bounded by the VM's
+        # 1024 MiB, never by the host, and by an execution timeout if OOM handling regresses.
+        sidecar.ok({
+            "id": 4, "op": "exec", "session": "O", "execId": "global-oom",
+            "argv": ["python3", "-c",
+                     "chunks=[]\nfor i in range(128):\n chunks.append(bytearray(16*1024*1024))"],
+            "cwd": str(workspace), "timeoutMs": 60000,
+        }, 120)
+        sidecar.await_exits(["global-oom"], time.monotonic() + 90)
+        global_kill = sidecar.exits["global-oom"]
+        if (global_kill.get("outcome"), global_kill.get("code"),
+                global_kill.get("detail")) != ("signaled", 9, "vmOom"):
+            raise RuntimeError(f"global OOM did not terminate and identify its victim: {global_kill}")
+
+        # An ordinary kill must NOT be reported as memory pressure: an always-set reason would
+        # make the field worthless.
+        sidecar.ok({"id": 5, "op": "exec", "session": "O", "execId": "plain",
+                    "argv": ["sh", "-c", "kill -9 $$"], "cwd": str(workspace)}, 120)
+        sidecar.await_exits(["plain"], time.monotonic() + 120)
+        plain = sidecar.exits["plain"]
+        if plain.get("outcome") != "signaled" or plain.get("code") != 9:
+            raise RuntimeError(f"the self-kill was not reported as a signal: {plain}")
+        if plain.get("detail") in ("oom", "vmOom"):
+            raise RuntimeError(f"an external kill was labelled as memory pressure: {plain}")
+
+        sidecar.ok({"id": 6, "op": "exec", "session": "O", "execId": "recovered",
+                    "argv": ["sh", "-c", "echo OOM-RECOVERED"],
+                    "cwd": str(workspace)}, 120)
+        sidecar.await_exits(["recovered"], time.monotonic() + 120)
+        recovered = sidecar.exits["recovered"]
+        if recovered.get("outcome") != "exited" or recovered.get("code") != 0:
+            raise RuntimeError(f"the same VM could not execute after OOM: {recovered}")
+        if b"OOM-RECOVERED" not in sidecar.stdout_of("recovered"):
+            raise RuntimeError("the recovered execution produced no output")
+        environment["agentOomExempt"] = True
+        environment["workloadOomScoreAdj"] = 0
+        environment["globalOomAttributed"] = True
+        case("p7.oom.attributed_and_agent_exempt")
+    finally:
+        stop(process)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run the cross-session parallel acceptance"
@@ -501,6 +599,10 @@ def main() -> int:
 
         # Last, and on its own VM: the four-slot sidecar above cannot show eight at once.
         phase_eight_at_once(args, root, environment)
+
+        # OOM must arrive as a reason, not as a bare signal, and the agent must not be a
+        # candidate for the kill. Both are what make "no memory limits" safe to run.
+        phase_oom_attribution(args, root, environment)
 
         missing = [case_id for case_id in CASES if case_id not in _reported]
         if missing:

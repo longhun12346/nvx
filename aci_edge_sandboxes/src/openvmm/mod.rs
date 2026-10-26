@@ -838,6 +838,9 @@ fn pump(
     Ok(match outcome {
         WorkloadOutcome::Exited(code) => ExecOutcome::Exited(code),
         WorkloadOutcome::Signaled(signal) => ExecOutcome::Signaled(signal),
+        WorkloadOutcome::OutOfMemory { signal, vm_wide } => {
+            ExecOutcome::OutOfMemory { signal, vm_wide }
+        }
         WorkloadOutcome::TimedOut => ExecOutcome::TimedOut,
         WorkloadOutcome::OutputLimitExceeded => {
             ExecOutcome::Failed(ExecFailure::OutputLimitExceeded)

@@ -540,6 +540,22 @@ mod tests {
     }
 
     #[test]
+    fn erofs_launch_binds_the_layer_read_only_and_accounts_for_cmdline_space() {
+        let mut spec = spec();
+        spec.distro = Some(PathBuf::from("D:/assets with spaces/ubuntu.erofs"));
+        let arguments = spec.openvmm_arguments("/e", Path::new("/r")).unwrap();
+        let block = arguments.iter().position(|arg| arg == "--microvm-sandbox-block").unwrap();
+        assert_eq!(arguments[block + 1], "distro:file:D:/assets with spaces/ubuntu.erofs,ro");
+        assert!(spec.kernel_command_line().unwrap().ends_with("nvx_overlay_upper=ramfs"));
+        // Parameters that just fit the legacy path must not overflow once EROFS adds a token.
+        let room = COMMAND_LINE_BUDGET - base_command_line("", &spec.hostname).len() - 2;
+        spec.kernel_parameters = "x".repeat(room);
+        assert!(spec.kernel_command_line().is_err());
+        spec.distro = None;
+        assert!(spec.kernel_command_line().is_ok());
+    }
+
+    #[test]
     fn only_an_explicit_cpu_profile_reaches_the_command_line() {
         // Auto is OpenVMM's own choice, so the argument is absent and the command line stays
         // identical to a build without this setting.

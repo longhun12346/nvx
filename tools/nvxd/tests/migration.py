@@ -13,6 +13,8 @@ WHP VMs:
 
 from __future__ import annotations
 
+from runtime_assets import artifact_args
+
 import argparse
 import pathlib
 import subprocess
@@ -27,8 +29,7 @@ def start(nvxd: pathlib.Path, repo: pathlib.Path, initrd: pathlib.Path,
     command = [
         str(nvxd),
         "--hypervisor", "whp",
-        "--repo", str(repo),
-        "--initrd", str(initrd),
+        *artifact_args(repo, initrd),
         "--cpu-profile", "host",
         "--max-running", "2",
         "--state-dir", str(state),

@@ -1,5 +1,7 @@
 """Exercise production sidecar/agent cleanup with an external guest observer."""
 
+from runtime_assets import artifact_args, distro_path
+
 import argparse
 import json
 import pathlib
@@ -12,7 +14,7 @@ from guest_probe_report import linux_path, sha256
 from p8_support import BoundedSidecar, stop_sidecar, vmm_processes
 
 
-def check_fault(args, diagnostic, mode, output):
+def check_fault(args, diagnostic, mode, output, diagnostic_distro=None):
     root = output / mode
     root.mkdir()
     workspaces = {name: root / name for name in ("a", "b", "c")}
@@ -23,7 +25,7 @@ def check_fault(args, diagnostic, mode, output):
     mount.mkdir()
     (mount / "marker").write_text("authorized")
     process = subprocess.Popen([
-        str(args.nvxd), "--repo", str(args.repo), "--initrd", str(diagnostic),
+        str(args.nvxd), *artifact_args(args.repo, diagnostic, distro=diagnostic_distro),
         "--hypervisor", "whp", "--cpu-profile", "host", "--session-isolation",
         "--max-running", "2", "--state-dir", str(root / "state"),
     ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -133,17 +135,23 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     inputs = [args.initrd, args.repo / "scripts/build_p8_fault_runtime.sh",
               args.repo / "scripts/p8_fault_observer.py", args.nvxd]
+    distro = distro_path()
+    if distro:
+        inputs += [distro, args.repo / "scripts/diagnostic_erofs.sh"]
     before = {str(path): sha256(path) for path in inputs}
     diagnostic = output / "fault.cpio.gz"
     subprocess.run(["wsl", "--exec", "sh", linux_path(inputs[1]),
-                    linux_path(args.initrd), linux_path(diagnostic)],
+                    linux_path(args.initrd), linux_path(diagnostic),
+                    *([linux_path(distro)] if distro else [])],
                    check=True, timeout=120)
+    diagnostic_distro = pathlib.Path(str(diagnostic) + ".erofs") if distro else None
     for mode in ("keeper", "strict-revoke", "source-unmap", "close-directory", "close-export"):
-        check_fault(args, diagnostic, mode, output)
+        check_fault(args, diagnostic, mode, output, diagnostic_distro)
     if before != {str(path): sha256(path) for path in inputs}:
         raise RuntimeError("inputs changed while testing")
     (output / "assets.json").write_text(json.dumps({
         "inputs": before, "diagnostic": sha256(diagnostic),
+        "diagnosticDistro": sha256(diagnostic_distro) if diagnostic_distro else None,
     }, indent=2))
 
 

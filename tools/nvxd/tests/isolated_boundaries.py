@@ -1,5 +1,7 @@
 """Product-sidecar checks for process/env/network isolation and active close."""
 
+from runtime_assets import artifact_args
+
 import argparse
 import errno
 import json
@@ -23,7 +25,7 @@ def main():
     for path in workspaces.values():
         path.mkdir()
     process = subprocess.Popen([
-        str(args.nvxd), "--repo", str(args.repo), "--initrd", str(args.initrd),
+        str(args.nvxd), *artifact_args(args.repo, args.initrd),
         "--hypervisor", "whp", "--cpu-profile", "host", "--session-isolation",
         "--max-running", "2", "--state-dir", str(root / "state"),
     ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

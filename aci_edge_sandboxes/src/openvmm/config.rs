@@ -305,6 +305,23 @@ mod tests {
     use crate::ErrorCode;
 
     #[test]
+    fn erofs_artifacts_survive_configuration_and_validate_the_layer() {
+        let Some(hypervisor) = Hypervisor::platform_default() else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let distro = directory.path().join("ubuntu-distro.erofs");
+        std::fs::write(&distro, b"layer").unwrap();
+        let artifacts = Artifacts::new("openvmm", "vmlinux", "stage").with_distro(&distro);
+        let config = OpenVmmConfig::from_artifacts(artifacts, hypervisor, directory.path());
+        assert_eq!(config.distro.as_ref(), Some(&distro));
+        let normalized = config.clone().normalized().unwrap();
+        assert_eq!(normalized.distro, Some(absolute(&distro).unwrap()));
+        std::fs::remove_file(&distro).unwrap();
+        assert!(config.normalized().unwrap_err().message().contains("EROFS distro"));
+    }
+
+    #[test]
     fn validation_rejects_bad_settings() {
         let Some(hypervisor) = Hypervisor::platform_default() else {
             return;

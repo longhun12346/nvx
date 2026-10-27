@@ -4,6 +4,8 @@ This workload-specific report does not promise arbitrary eight-task memory safet
 It measures each VM through its own sidecar, and records SHA256 for all inputs.
 """
 
+from runtime_assets import artifact_args, distro_path
+
 import argparse
 import ctypes
 from ctypes import wintypes
@@ -56,7 +58,7 @@ def measure(args, isolated, memory_mib, repetition):
         path.mkdir()
     command = [
         str(args.nvxd), "--hypervisor", "whp", "--cpu-profile", "host",
-        "--repo", str(args.repo), "--initrd", str(args.initrd),
+        *artifact_args(args.repo, args.initrd),
         "--max-running", "8", "--max-sessions", "8",
         "--idle-trim-secs", "0", "--state-dir", str(root / "state"),
     ]
@@ -229,6 +231,9 @@ def main():
         "helper": args.repo / "tools/nvxd/tests/p8_support.py",
         "measurement": pathlib.Path(__file__),
     }
+    distro = distro_path()
+    if distro:
+        sources["distro"] = distro
     hashes = {name: digest(path) for name, path in sources.items()}
     report = {
         "nvxRevision": subprocess.check_output(["git", "-C", str(args.repo), "rev-parse", "HEAD"],

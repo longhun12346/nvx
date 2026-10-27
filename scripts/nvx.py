@@ -342,7 +342,7 @@ def command_build_initramfs(args: argparse.Namespace) -> None:
         return
     build_initramfs(BuildConfig.initramfs_config(args.guest))
     if args.guest == UbuntuBuildConstants.GUEST_NAME:
-        build_stage_initramfs(BuildConfig.initramfs_config(args.guest))
+        build_stage_initramfs(BuildConfig.stage_initramfs_config())
 
 
 def command_build_stage_initramfs(args: argparse.Namespace) -> None:
@@ -359,7 +359,7 @@ def command_build_distro_layer(args: argparse.Namespace) -> None:
     build_distro_layer(
         DistroLayerBuildConfig(
             guest=args.guest,
-            work=(
+            work=args.work_dir or (
                 BuildConstants.BUILD_DIR
                 / InitramfsBuildConstants.DISTRO_WORK_DIRECTORY_TEMPLATE.format(
                     guest=args.guest
@@ -1068,6 +1068,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=artifact_path(UbuntuBuildConstants.DISTRO_NAME),
     )
     distro_layer.add_argument("--replace", action="store_true")
+    distro_layer.add_argument("--work-dir", type=Path)
     distro_layer.set_defaults(handler=command_build_distro_layer)
 
     determinism = subparsers.add_parser(

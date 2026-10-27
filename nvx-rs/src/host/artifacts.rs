@@ -388,6 +388,30 @@ mod tests {
     }
 
     #[test]
+    fn erofs_layouts_select_stage_and_reject_a_missing_stage() {
+        for is_release in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            if is_release {
+                release(directory.path());
+            } else {
+                checkout(directory.path());
+            }
+            let assets_dir = directory.path().join(if is_release { "guest" } else { "build" });
+            fs::create_dir_all(&assets_dir).unwrap();
+            let distro = assets_dir.join(RELEASE_DISTRO[1]);
+            let stage = assets_dir.join(RELEASE_STAGE_INITRD[1]);
+            fs::write(&distro, b"layer").unwrap();
+            assert!(Artifacts::from_dir(directory.path()).unwrap_err().to_string().contains("stage"));
+            fs::write(&stage, b"stage").unwrap();
+            let artifacts = Artifacts::from_dir(directory.path()).unwrap();
+            assert_eq!(artifacts.initrd, absolute(&stage).unwrap());
+            assert_eq!(artifacts.distro, Some(absolute(&distro).unwrap()));
+            fs::remove_file(&stage).unwrap();
+            assert!(Artifacts::from_dir(directory.path()).is_err());
+        }
+    }
+
+    #[test]
     fn repository_layout_is_detected_beside_the_guest_sources() {
         let directory = tempfile::tempdir().unwrap();
         checkout(directory.path());

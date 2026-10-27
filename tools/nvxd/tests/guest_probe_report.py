@@ -8,6 +8,7 @@ import pathlib
 import hashlib
 import subprocess
 import time
+from runtime_assets import distro_path
 
 
 REQUIRED_CHECKS = {
@@ -89,11 +90,16 @@ def main() -> int:
         "probe": args.repo / "scripts/guest_session_probe.c",
         "builder": args.repo / "scripts/build_guest_session_probe.sh",
     }
+    distro = distro_path()
+    if distro:
+        inputs["distro"] = distro
+        inputs["erofsBuilder"] = args.repo / "scripts/diagnostic_erofs.sh"
     hashes = {key: sha256(path) for key, path in inputs.items()}
     diagnostic = out / "probe.cpio.gz"
     with (out / "build.log").open("wb") as log:
         subprocess.run(["wsl", "--exec", "sh", linux_path(inputs["builder"]),
-                        linux_path(args.initrd), linux_path(diagnostic)],
+                        linux_path(args.initrd), linux_path(diagnostic),
+                        *([linux_path(distro)] if distro else [])],
                        stdout=log, stderr=subprocess.STDOUT, check=True, timeout=120)
     started = time.monotonic()
     command = [
@@ -102,6 +108,9 @@ def main() -> int:
         "--memory", "1024M", "--kernel", str(inputs["kernel"]),
         "--initrd", str(diagnostic), "--cmdline", "nvx_exec=/p8-probe-boot",
     ]
+    diagnostic_distro = pathlib.Path(str(diagnostic) + ".erofs") if distro else None
+    if diagnostic_distro:
+        command += ["--microvm-sandbox-block", f"distro:file:{diagnostic_distro},ro"]
     with (out / "boot.log").open("wb") as log:
         # subprocess.run kills and waits for this specific process on timeout.
         result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=60)
@@ -118,6 +127,7 @@ def main() -> int:
         "passed": passed, "exitCode": result.returncode, "args": command,
         "elapsedSeconds": time.monotonic() - started, "sha256": hashes,
         "diagnosticSha256": sha256(diagnostic), "inputsUnchanged": stable,
+        "diagnosticDistroSha256": sha256(diagnostic_distro) if diagnostic_distro else None,
         "checks": found, "missing": missing,
     }
     (out / "result.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

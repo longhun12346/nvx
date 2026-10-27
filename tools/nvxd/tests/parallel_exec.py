@@ -11,6 +11,8 @@ itself to a smoke test.
 
 from __future__ import annotations
 
+from runtime_assets import artifact_args
+
 import argparse
 import json
 import pathlib
@@ -112,10 +114,7 @@ def start(nvxd, repo, initrd, state, extra=(), max_running=2):
             str(nvxd),
             "--hypervisor",
             "whp",
-            "--repo",
-            str(repo),
-            "--initrd",
-            str(initrd),
+            *artifact_args(repo, initrd),
             "--cpu-profile",
             "host",
             "--max-running",

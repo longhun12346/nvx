@@ -522,7 +522,7 @@ def build_guest(config: BuildConfig) -> None:
         for guest in config.selected_guests():
             build_initramfs(config.initramfs_config(guest))
             if guest == UbuntuBuildConstants.GUEST_NAME:
-                build_stage_initramfs(config.initramfs_config(guest))
+                build_stage_initramfs(config.stage_initramfs_config())
         if config.guest == "all":
             build_distro_layer(config.distro_layer_config())
         return
@@ -759,6 +759,8 @@ def build_stage_initramfs(config: InitramfsBuildConfig) -> None:
     output = (
         config.output or artifact_path(UbuntuBuildConstants.STAGE_INITRAMFS_NAME)
     ).resolve()
+    if output == source or (output.exists() and output.samefile(source)):
+        raise ScriptError("EROFS stage output must not overwrite its source initramfs")
     stage = Path(tempfile.mkdtemp(prefix="nvx-erofs-stage-"))
     extracted = Path(tempfile.mkdtemp(prefix="nvx-erofs-source-"))
     try:
@@ -768,13 +770,15 @@ def build_stage_initramfs(config: InitramfsBuildConfig) -> None:
             ["gzip", "-dc", str(source)], stdout=subprocess.PIPE
         )
         assert decompressor.stdout is not None
-        extractor = subprocess.run(
-            ["cpio", "-idm", "--quiet"],
-            cwd=extracted,
-            stdin=decompressor.stdout,
-        )
-        decompressor.stdout.close()
-        decompressor_code = decompressor.wait()
+        try:
+            extractor = subprocess.run(
+                ["cpio", "-idm", "--quiet"],
+                cwd=extracted,
+                stdin=decompressor.stdout,
+            )
+        finally:
+            decompressor.stdout.close()
+            decompressor_code = decompressor.wait()
         if extractor.returncode or decompressor_code:
             raise ScriptError("failed to extract Ubuntu initramfs for EROFS stage")
         busybox = extracted / "bin" / "busybox"
@@ -789,7 +793,7 @@ def build_stage_initramfs(config: InitramfsBuildConfig) -> None:
         shutil.copy2(init, stage / "init")
         (stage / "init").chmod(0o755)
         _pack_initramfs(stage, output)
-        manifest = output.with_name(UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME)
+        manifest = output.with_name(output.name + BuildConstants.DISTRO_MANIFEST_SUFFIX)
         manifest.write_text(
             json.dumps(
                 {

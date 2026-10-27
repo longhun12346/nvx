@@ -14,6 +14,8 @@ caller, because counting another process's children is not portable from here.
 
 from __future__ import annotations
 
+from runtime_assets import artifact_args
+
 import argparse
 import json
 import pathlib
@@ -42,8 +44,7 @@ def send_frame(stream, body):
 def start(nvxd, repo, initrd, state):
     process = subprocess.Popen(
         [
-            str(nvxd), "--hypervisor", "whp", "--repo", str(repo),
-            "--initrd", str(initrd), "--cpu-profile", "host", "--state-dir", str(state),
+            str(nvxd), "--hypervisor", "whp", *artifact_args(repo, initrd), "--cpu-profile", "host", "--state-dir", str(state),
         ],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
@@ -143,8 +144,7 @@ def case_burst_while_booting(nvxd, repo, initrd, root):
     """
     process = subprocess.Popen(
         [
-            str(nvxd), "--hypervisor", "whp", "--repo", str(repo),
-            "--initrd", str(initrd), "--cpu-profile", "host",
+            str(nvxd), "--hypervisor", "whp", *artifact_args(repo, initrd), "--cpu-profile", "host",
             "--max-pending", "2", "--work-workers", "1",
             "--state-dir", str(root / "state-burst"),
         ],
@@ -353,8 +353,7 @@ def case_stalled_reader(nvxd, repo, initrd, root):
     """
     process = subprocess.Popen(
         [
-            str(nvxd), "--hypervisor", "whp", "--repo", str(repo),
-            "--initrd", str(initrd), "--cpu-profile", "host",
+            str(nvxd), "--hypervisor", "whp", *artifact_args(repo, initrd), "--cpu-profile", "host",
             "--outbound-capacity", "4", "--state-dir", str(root / "state-stall"),
         ],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,

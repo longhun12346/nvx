@@ -1,8 +1,8 @@
 #!/bin/sh
 # Build a diagnostic-only initrd from an existing runtime. Does not replace it.
 set -eu
-if [ "$#" -ne 2 ]; then
-    echo "usage: $0 runtime.cpio.gz probe.cpio.gz" >&2
+if [ "$#" -ne 2 ] && [ "$#" -ne 3 ]; then
+    echo "usage: $0 runtime.cpio.gz probe.cpio.gz [runtime.erofs]" >&2
     exit 2
 fi
 input=$(realpath "$1")
@@ -23,6 +23,14 @@ status=0
 exec /sbin/nvx-exit "$status"
 EOF
 chmod 0755 "$stage/p8-probe-boot"
+if [ "$#" -eq 3 ]; then
+    . "$repo/scripts/diagnostic_erofs.sh"
+    diagnostic_erofs_extract "$3"
+    cp "$stage/p8-session-probe" "$stage/p8-probe-boot" "$stage/root/"
+    cp "$stage/usr/sbin/nvx-managed-agent" "$stage/root/usr/sbin/"
+    diagnostic_erofs_pack
+    exit 0
+fi
 cp "$input" "$output"
 (
     cd "$stage"

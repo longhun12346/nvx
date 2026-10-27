@@ -7,6 +7,8 @@ entry before running the engine integration smoke.
 
 from __future__ import annotations
 
+from runtime_assets import artifact_args
+
 import argparse
 import json
 import pathlib
@@ -78,10 +80,7 @@ def main():
                 str(args.nvxd),
                 "--hypervisor",
                 "whp",
-                "--repo",
-                str(args.repo),
-                "--initrd",
-                str(args.initrd),
+                *artifact_args(args.repo, args.initrd),
                 "--cpu-profile",
                 "host",
                 "--state-dir",

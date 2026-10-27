@@ -1,5 +1,7 @@
 """Same host roots, separately authorized workspace and ro/rw mount lifetimes."""
 
+from runtime_assets import artifact_args
+
 import argparse
 import json
 import pathlib
@@ -22,7 +24,7 @@ def main():
     data.mkdir()
     (data / "marker").write_text("shared")
     process = subprocess.Popen([
-        str(args.nvxd), "--repo", str(args.repo), "--initrd", str(args.initrd),
+        str(args.nvxd), *artifact_args(args.repo, args.initrd),
         "--hypervisor", "whp", "--cpu-profile", "host", "--session-isolation",
         "--state-dir", str(root / "state"),
     ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

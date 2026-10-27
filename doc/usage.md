@@ -29,6 +29,7 @@ python3 scripts/nvx.py performance gate --help
 | `test-guest-binaries` | Run the musl integration tests against prebuilt Rust guest executables. |
 | `build-kernel` | Build the pinned and patched Linux kernel natively. |
 | `build-initramfs` | Build the selected Alpine, Ubuntu, or Azure Linux initramfs. |
+| `build-stage-initramfs` | Build the thin Ubuntu EROFS boot initramfs. |
 | `build-distro-layer` | Build a deterministic Ubuntu EROFS distro layer. |
 | `verify-guest-determinism` | Rebuild Ubuntu guest artifacts twice and compare SHA-256 values. |
 | `build-openvmm` | Build the OpenVMM release binary. |
@@ -228,7 +229,27 @@ python3 scripts/nvx.py build-initramfs [--guest {alpine,ubuntu,azurelinux}]
 Builds the selected initramfs. Alpine and Ubuntu build directly on Linux; Azure
 Linux uses Docker. Alpine is the default.
 
+### `build-stage-initramfs`
+
+```console
+python3 scripts/nvx.py build-stage-initramfs [--guest ubuntu]
+    [--source PATH] [--output PATH]
+```
+
+On Linux, extracts BusyBox from the full Ubuntu initramfs and packs the EROFS
+stage init. The default source is `build/initramfs-ubuntu.cpio.gz`; the default
+output is `build/initramfs-ubuntu-stage.cpio.gz`. The source is preserved, and
+the output has an adjacent `.manifest.json` recording both SHA256 digests.
+The native Ubuntu build also produces this stage image. Boot it with the
+matching read-only `ubuntu-distro.erofs` layer; the stage mounts a 64 MiB
+tmpfs upper, combines it with EROFS using overlayfs, and switches to `/init`.
+
 ### `build-distro-layer`
+
+`--work-dir PATH` chooses the rootfs staging directory. It must preserve POSIX
+permissions; when the checkout is on a Windows drive, use a directory such as
+`/tmp/nvx-distro-work` in WSL. The final image may still be written to the
+Windows drive with `--output`. Filesystems that ignore chmod are rejected.
 
 ```text
 python3 scripts/nvx.py build-distro-layer

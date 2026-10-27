@@ -15,6 +15,8 @@ ids to be reported as passed, so adding a case here means adding it to the stage
 
 from __future__ import annotations
 
+from runtime_assets import artifact_args
+
 import argparse
 import json
 import pathlib
@@ -137,10 +139,7 @@ def start(nvxd, repo, initrd, state, max_running):
             str(nvxd),
             "--hypervisor",
             "whp",
-            "--repo",
-            str(repo),
-            "--initrd",
-            str(initrd),
+            *artifact_args(repo, initrd),
             "--cpu-profile",
             "host",
             "--max-running",

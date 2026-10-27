@@ -7923,7 +7923,7 @@ class BuildTests(unittest.TestCase):
         )
         self.assertEqual(
             ubuntu_manifest["package_lock_sha256"],
-            "ba053365ab647edab3a923f6669b5ecc32443496da1f42d8130f0599c66d8a73",
+            "3ba9c2e408b2b7838781138f16fb9e3c7ec049a57d726f2bd8347ccf2df49377",
         )
         packages = ubuntu.load_package_lock()
         self.assertEqual(
@@ -8103,11 +8103,13 @@ class BuildTests(unittest.TestCase):
                 patch.object(ubuntu, "load_package_lock", return_value=()),
                 patch.object(ubuntu, "_validate_package_closure"),
                 patch.object(ubuntu, "_customize_root"),
+                patch.object(ubuntu, "require_posix_permissions") as permissions,
                 patch.object(ubuntu.Path, "chmod", autospec=True) as chmod,
             ):
                 self.assertEqual(ubuntu.prepare_root(work), expected_root)
 
             chmod.assert_called_once_with(expected_root, 0o755)
+            permissions.assert_called_once_with(work)
 
     def test_ubuntu_customization_installs_busybox_wget(self):
         with tempfile.TemporaryDirectory() as temporary:

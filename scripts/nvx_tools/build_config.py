@@ -142,6 +142,14 @@ class BuildConfig:
         )
 
     @staticmethod
+    def stage_initramfs_config() -> InitramfsBuildConfig:
+        return InitramfsBuildConfig(
+            guest=UbuntuBuildConstants.GUEST_NAME,
+            source=artifact_path(UbuntuBuildConstants.INITRAMFS_NAME),
+            output=artifact_path(UbuntuBuildConstants.STAGE_INITRAMFS_NAME),
+        )
+
+    @staticmethod
     def distro_layer_config(
         guest: str = UbuntuBuildConstants.GUEST_NAME,
     ) -> DistroLayerBuildConfig:

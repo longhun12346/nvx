@@ -37,8 +37,16 @@ This requires the matching OpenVMM revision from the dependency lock.
 
 The engine's `verify-nvx-vm.ps1 -Stage P8` runs the required integration matrix,
 including fresh diagnostic guest probes, external cleanup fault injection,
-and the four-tier capacity matrix. Diagnostic fault observers are appended to
-disposable test initrds; they are not part of the production runtime.
+and the four-tier capacity matrix. For EROFS, pass the stage initramfs as
+`-Initrd` and the locked read-only layer as `-Distro`. The gate passes
+`NVX_DISTRO` to every test; tests pass explicit artifact paths to the sidecar
+instead of discovering other files from the checkout. Standalone Python suites
+use the same environment variable. Leave it unset for full-initramfs tests.
+
+Diagnostic fault observers live in disposable copies of the runtime: appended
+archives for full initramfs, or rebuilt EROFS layers paired with an unchanged
+stage image. The cleanup observer preserves the production agent's bytes.
+Diagnostic helpers are not part of the production runtime.
 
 ## Diagnostics
 

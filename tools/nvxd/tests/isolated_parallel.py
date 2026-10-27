@@ -1,5 +1,7 @@
 """Real guest execution barriers for the P7 matrix in P8 namespace mode."""
 
+from runtime_assets import artifact_args
+
 import argparse
 import json
 import pathlib
@@ -20,7 +22,7 @@ def main():
     for path in workspaces.values():
         path.mkdir()
     process = subprocess.Popen([
-        str(args.nvxd), "--repo", str(args.repo), "--initrd", str(args.initrd),
+        str(args.nvxd), *artifact_args(args.repo, args.initrd),
         "--hypervisor", "whp", "--cpu-profile", "host", "--session-isolation",
         "--max-running", "8", "--state-dir", str(root / "state"),
     ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

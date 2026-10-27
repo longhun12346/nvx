@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from runtime_assets import artifact_args
+
 import argparse
 import pathlib
 import subprocess
@@ -26,8 +28,7 @@ def main() -> int:
         workspace.mkdir()
     process = subprocess.Popen(
         [
-            str(args.nvxd), "--hypervisor", "whp", "--repo", str(args.repo),
-            "--initrd", str(args.initrd), "--cpu-profile", "host",
+            str(args.nvxd), "--hypervisor", "whp", *artifact_args(args.repo, args.initrd), "--cpu-profile", "host",
             "--max-running", "2", "--session-isolation",
             "--state-dir", str(root / "state"),
         ],

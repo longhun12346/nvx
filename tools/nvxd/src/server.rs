@@ -59,6 +59,22 @@ pub struct Failure {
     pub message: String,
 }
 
+/// The request's `protocol`: `tcp` (the default) or `udp`. Anything else is refused by name, so
+/// a caller asking about, say, sctp is not told that its port is merely unpublished.
+fn port_transport(head: &Value) -> Result<ports::Transport, Failure> {
+    let wanted = head.get("protocol");
+    let name = match wanted {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_str().unwrap_or("")),
+    };
+    ports::Transport::parse(name).ok_or_else(|| {
+        fail(
+            protocol::REASON_PORT_PROTOCOL_UNSUPPORTED,
+            "protocol must be \"tcp\" or \"udp\"",
+        )
+    })
+}
+
 fn fail(code: &'static str, message: impl ToString) -> Failure {
     Failure {
         code,
@@ -374,35 +390,36 @@ impl Context {
             .filter(|port| (1..=65535).contains(port))
             .ok_or_else(|| fail(protocol::REASON_PROTOCOL, "port must be an integer in 1..=65535"))?
             as u16;
-        if let Some(protocol) = head.get("protocol") {
-            if protocol.as_str() != Some("tcp") {
-                return Err(fail(protocol::REASON_PROTOCOL, "only tcp ports can be checked"));
-            }
-        }
-        // The guest announces its listeners every couple of seconds, so a server that was just
+        let transport = port_transport(head)?;
+        // The guest announces its listeners every couple of seconds, and a UDP socket is only
+        // announced after it has stayed unconnected for a second, so a server that was just
         // started is not there yet; give it a bounded moment before calling it unpublished.
-        let wait = number(head.get("waitMs")).unwrap_or(3000).min(10_000);
+        let default_wait = match transport {
+            ports::Transport::Tcp => 3000,
+            ports::Transport::Udp => 6000,
+        };
+        let wait = number(head.get("waitMs")).unwrap_or(default_wait).min(10_000);
         let vmm_pid = self
             .vm_now()
             .and_then(|vm| vm.memory.map(|memory| memory.pid()))
             .ok_or_else(|| fail("E_BACKEND_UNAVAILABLE", "no VMM process is known"))?;
         let deadline = Instant::now() + Duration::from_millis(wait);
         loop {
-            let listeners = ports::tcp_listeners(port)
+            let listeners = ports::listeners(transport, port)
                 .map_err(|error| fail("E_NVX_PORT_CHECK", error))?;
             match ports::classify(&listeners, vmm_pid) {
                 ports::PortState::Published => {
                     return Ok(json!({
-                        "port": port, "protocol": "tcp", "state": "published",
+                        "port": port, "protocol": transport.as_str(), "state": "published",
                         "hostAddress": "127.0.0.1",
                     }));
                 }
                 ports::PortState::Conflict { pid } => {
                     // Nothing will change by waiting: the host port is taken. Say who holds it
                     // and which port the caller can use instead.
-                    let suggested = self.free_port()?;
+                    let suggested = self.free_port(transport)?;
                     return Ok(json!({
-                        "port": port, "protocol": "tcp", "state": "conflict",
+                        "port": port, "protocol": transport.as_str(), "state": "conflict",
                         "owner": { "pid": pid, "name": ports::process_name(pid) },
                         "suggestedPort": suggested,
                     }));
@@ -412,7 +429,7 @@ impl Context {
                 }
                 ports::PortState::Unpublished => {
                     return Ok(json!({
-                        "port": port, "protocol": "tcp", "state": "unpublished",
+                        "port": port, "protocol": transport.as_str(), "state": "unpublished",
                     }));
                 }
             }
@@ -420,16 +437,22 @@ impl Context {
     }
 
     /// A port that is free on the host's loopback right now, for a server about to be started.
-    fn port_allocate(&self, _head: &Value) -> Result<Value, Failure> {
+    fn port_allocate(&self, head: &Value) -> Result<Value, Failure> {
         // Needs no session and no VM: it is asked before the first command, to pick the port
         // that command's server will listen on.
         self.port_enabled()?;
-        Ok(json!({ "port": self.free_port()?, "hostAddress": "127.0.0.1" }))
+        let transport = port_transport(head)?;
+        Ok(json!({
+            "port": self.free_port(transport)?,
+            "protocol": transport.as_str(),
+            "hostAddress": "127.0.0.1",
+        }))
     }
 
-    fn free_port(&self) -> Result<u16, Failure> {
+    fn free_port(&self, transport: ports::Transport) -> Result<u16, Failure> {
         let mut recent = self.allocated_ports.lock().unwrap();
-        let port = ports::free_port(&recent).map_err(|error| fail("E_NVX_PORT_CHECK", error))?;
+        let port = ports::free_port(transport, &recent)
+            .map_err(|error| fail("E_NVX_PORT_CHECK", error))?;
         recent.push_back(port);
         while recent.len() > 64 {
             recent.pop_front();
@@ -2517,6 +2540,25 @@ fn validate_session_policy(head: &Value, isolated: bool, network_allowed: bool) 
 #[cfg(test)]
 mod session_policy_tests {
     use super::*;
+
+    /// A port question picks tcp unless it says udp, and refuses a transport it cannot answer
+    /// for with a code of its own rather than a misleading "unpublished".
+    #[test]
+    fn a_port_question_names_tcp_or_udp() {
+        assert_eq!(port_transport(&json!({})).ok(), Some(ports::Transport::Tcp));
+        assert_eq!(
+            port_transport(&json!({"protocol": null})).ok(),
+            Some(ports::Transport::Tcp)
+        );
+        assert_eq!(
+            port_transport(&json!({"protocol": "udp"})).ok(),
+            Some(ports::Transport::Udp)
+        );
+        for bad in [json!("sctp"), json!(7), json!("")] {
+            let failure = port_transport(&json!({ "protocol": bad })).err().expect("refused");
+            assert_eq!(failure.code, protocol::REASON_PORT_PROTOCOL_UNSUPPORTED);
+        }
+    }
 
     /// What the sidecar sends must be a policy the sandbox model accepts as written.
     fn accepted(network: Value) -> ProvisionRequest {

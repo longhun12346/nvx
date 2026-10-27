@@ -36,6 +36,8 @@ pub const EVENT_EXEC_EXIT: &str = "exec.exit";
 pub const REASON_PROTOCOL: &str = "E_BACKEND_PROTOCOL";
 /// Host-loopback ingress is off, so nothing the guest listens on is published to the host.
 pub const REASON_INBOUND_DISABLED: &str = "E_NVX_INBOUND_DISABLED";
+/// A port question named a transport other than `tcp` or `udp`.
+pub const REASON_PORT_PROTOCOL_UNSUPPORTED: &str = "E_NVX_PORT_PROTOCOL_UNSUPPORTED";
 pub const REASON_MEMORY_LIMIT_UNSUPPORTED: &str = "E_NVX_MEMORY_LIMIT_UNSUPPORTED";
 pub const REASON_CPU_LIMIT_UNSUPPORTED: &str = "E_NVX_CPU_LIMIT_UNSUPPORTED";
 pub const REASON_MEMORY_UNSUPPORTED: &str = "E_NVX_MEMORY_UNSUPPORTED";

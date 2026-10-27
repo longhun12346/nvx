@@ -297,6 +297,7 @@ impl OpenVmmBackend {
             openvmm: self.config.openvmm.clone(),
             kernel: self.config.kernel.clone(),
             initrd: self.config.initrd.clone(),
+            distro: self.config.distro.clone(),
             hypervisor: self.config.hypervisor,
             cpu_profile: cpu_profile(self.config.cpu_profile),
             memory_mib: record.memory_mib,

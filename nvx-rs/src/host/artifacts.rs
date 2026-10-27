@@ -22,6 +22,8 @@ pub const MANIFEST_NAME: &str = "SOURCE-MANIFEST.json";
 const RELEASE_KERNEL: [&str; 2] = ["guest", "vmlinux"];
 /// Release-layout path of the Alpine initramfs.
 const RELEASE_INITRD: [&str; 2] = ["guest", "initramfs.cpio.gz"];
+const RELEASE_STAGE_INITRD: [&str; 2] = ["guest", "initramfs-ubuntu-stage.cpio.gz"];
+const RELEASE_DISTRO: [&str; 2] = ["guest", "ubuntu-distro.erofs"];
 /// Repository-layout directory of guest artifacts.
 const REPO_BUILD_DIR: &str = "build";
 
@@ -42,6 +44,9 @@ pub struct Artifacts {
     pub kernel: PathBuf,
     /// The NVX Alpine initramfs (`initramfs.cpio.gz`): the guest userland and its control agent.
     pub initrd: PathBuf,
+    /// Optional Ubuntu EROFS distro layer. When present, `initrd` is the thin
+    /// stage image and the host launches OpenVMM with a read-only distro block.
+    pub distro: Option<PathBuf>,
 }
 
 impl Artifacts {
@@ -55,7 +60,14 @@ impl Artifacts {
             openvmm: openvmm.into(),
             kernel: kernel.into(),
             initrd: initrd.into(),
+            distro: None,
         }
+    }
+
+    /// Adds the optional read-only EROFS distro layer to this artifact set.
+    pub fn with_distro(mut self, distro: impl Into<PathBuf>) -> Self {
+        self.distro = Some(distro.into());
+        self
     }
 
     /// Checks that this host can run NVX VMs and that the three files exist.
@@ -80,6 +92,14 @@ impl Artifacts {
                 )));
             }
         }
+        if let Some(distro) = &self.distro {
+            if !distro.is_file() {
+                return Err(Error::unavailable(format!(
+                    "NVX EROFS distro layer not found: {}",
+                    distro.display()
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -92,11 +112,23 @@ impl Artifacts {
         let root = absolute(release_dir.as_ref())?;
         check_manifest(&root.join(MANIFEST_NAME))?;
         let join = |parts: [&str; 2]| root.join(parts[0]).join(parts[1]);
-        Ok(Self::new(
+        let mut artifacts = Self::new(
             root.join("bin").join(openvmm_executable()),
             join(RELEASE_KERNEL),
             join(RELEASE_INITRD),
-        ))
+        );
+        let distro = root.join(RELEASE_DISTRO[0]).join(RELEASE_DISTRO[1]);
+        if distro.is_file() {
+            let stage = root.join(RELEASE_STAGE_INITRD[0]).join(RELEASE_STAGE_INITRD[1]);
+            if !stage.is_file() {
+                return Err(Error::unavailable(
+                    "NVX EROFS distro layer is present without its stage initramfs",
+                ));
+            }
+            artifacts.initrd = stage;
+            artifacts.distro = Some(distro);
+        }
+        Ok(artifacts)
     }
 
     /// Uses an NVX repository checkout after `nvx.py download` or a local build:
@@ -105,14 +137,26 @@ impl Artifacts {
         let root = absolute(repo_root.as_ref())?;
         check_manifest(&root.join(MANIFEST_NAME))?;
         let build = root.join(REPO_BUILD_DIR);
-        Ok(Self::new(
+        let mut artifacts = Self::new(
             root.join("openvmm")
                 .join("target")
                 .join("release")
                 .join(openvmm_executable()),
             build.join(RELEASE_KERNEL[1]),
             build.join(RELEASE_INITRD[1]),
-        ))
+        );
+        let distro = build.join(RELEASE_DISTRO[1]);
+        if distro.is_file() {
+            let stage = build.join(RELEASE_STAGE_INITRD[1]);
+            if !stage.is_file() {
+                return Err(Error::unavailable(
+                    "NVX EROFS distro layer is present without its stage initramfs",
+                ));
+            }
+            artifacts.initrd = stage;
+            artifacts.distro = Some(distro);
+        }
+        Ok(artifacts)
     }
 
     /// Uses a directory in either the release or the repository layout.

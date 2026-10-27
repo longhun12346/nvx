@@ -31,6 +31,7 @@ from nvx_tools.build import (
     build_docker_initramfs,
     build_guest,
     build_initramfs,
+    build_stage_initramfs,
     build_kernel,
     build_openvmm,
     materialize_kernel_provenance_inputs,
@@ -41,6 +42,7 @@ from nvx_tools.build_config import (
     BuildConfig,
     DistroLayerBuildConfig,
     DockerBuildConfig,
+    InitramfsBuildConfig,
     KernelBuildConfig,
     OpenVmmBuildConfig,
 )
@@ -339,6 +341,18 @@ def command_build_initramfs(args: argparse.Namespace) -> None:
         build_docker_initramfs(DockerBuildConfig(), args.guest)
         return
     build_initramfs(BuildConfig.initramfs_config(args.guest))
+    if args.guest == UbuntuBuildConstants.GUEST_NAME:
+        build_stage_initramfs(BuildConfig.initramfs_config(args.guest))
+
+
+def command_build_stage_initramfs(args: argparse.Namespace) -> None:
+    build_stage_initramfs(
+        InitramfsBuildConfig(
+            guest=args.guest,
+            source=args.source,
+            output=args.output,
+        )
+    )
 
 
 def command_build_distro_layer(args: argparse.Namespace) -> None:
@@ -1029,6 +1043,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     initramfs.set_defaults(handler=command_build_initramfs)
+
+    stage_initramfs = subparsers.add_parser(
+        "build-stage-initramfs",
+        help="build the thin Ubuntu initramfs that switches into an EROFS layer",
+    )
+    stage_initramfs.add_argument("--guest", choices=("ubuntu",), default="ubuntu")
+    stage_initramfs.add_argument("--source", type=Path)
+    stage_initramfs.add_argument(
+        "--output",
+        type=Path,
+        default=artifact_path(UbuntuBuildConstants.STAGE_INITRAMFS_NAME),
+    )
+    stage_initramfs.set_defaults(handler=command_build_stage_initramfs)
 
     distro_layer = subparsers.add_parser(
         "build-distro-layer",

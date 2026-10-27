@@ -43,6 +43,7 @@ class InitramfsBuildConfig:
         )
     )
     output: Path | None = None
+    source: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)

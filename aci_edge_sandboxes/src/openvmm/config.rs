@@ -26,6 +26,8 @@ pub struct OpenVmmConfig {
     pub kernel: PathBuf,
     /// The NVX Alpine initramfs (`initramfs.cpio.gz`): the guest userland and its control agent.
     pub initrd: PathBuf,
+    /// Optional read-only Ubuntu EROFS distro layer paired with a thin stage initrd.
+    pub distro: Option<PathBuf>,
     /// Hypervisor used by OpenVMM.
     pub hypervisor: Hypervisor,
     /// CPU profile of the guests. Explicit configuration, never derived from the environment:
@@ -115,6 +117,7 @@ impl OpenVmmConfig {
             openvmm: openvmm.into(),
             kernel: kernel.into(),
             initrd: initrd.into(),
+            distro: None,
             hypervisor,
             cpu_profile: CpuProfile::Auto,
             state_root: state_root.into(),
@@ -142,13 +145,15 @@ impl OpenVmmConfig {
         hypervisor: Hypervisor,
         state_root: impl Into<PathBuf>,
     ) -> Self {
-        Self::new(
+        let mut config = Self::new(
             artifacts.openvmm,
             artifacts.kernel,
             artifacts.initrd,
             hypervisor,
             state_root,
-        )
+        );
+        config.distro = artifacts.distro;
+        config
     }
 
     /// Creates a configuration with no NVX-specific input: the artifacts come from
@@ -219,6 +224,11 @@ impl OpenVmmConfig {
         self.openvmm = absolute(&self.openvmm)?;
         self.kernel = absolute(&self.kernel)?;
         self.initrd = absolute(&self.initrd)?;
+        self.distro = self
+            .distro
+            .as_deref()
+            .map(absolute)
+            .transpose()?;
         self.state_root = absolute(&self.state_root)?;
         self.validate()?;
         Ok(self)
@@ -234,6 +244,14 @@ impl OpenVmmConfig {
         let invalid = |message: String| Err(Error::backend_unavailable(message));
         if self.memory_mib == 0 {
             return invalid("memory_mib must be positive".to_owned());
+        }
+        if let Some(distro) = &self.distro {
+            if !distro.is_file() {
+                return invalid(format!(
+                    "EROFS distro layer not found: {}",
+                    distro.display()
+                ));
+            }
         }
         if self.workload_uid == 0 || self.workload_gid == 0 {
             return invalid("workloads must run as a non-root UID and GID".to_owned());

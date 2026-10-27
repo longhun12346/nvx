@@ -253,6 +253,10 @@ class UbuntuBuildConstants:
     PACKAGE_LOCK: Final = BuildConstants.REPO_ROOT / PACKAGE_LOCK_RELATIVE_PATH
     PACKAGE_LOCK_FORMAT: Final = 1
     INITRAMFS_NAME: Final = "initramfs-ubuntu.cpio.gz"
+    STAGE_INITRAMFS_NAME: Final = "initramfs-ubuntu-stage.cpio.gz"
+    STAGE_INITRAMFS_MANIFEST_NAME: Final = (
+        f"{STAGE_INITRAMFS_NAME}{BuildConstants.DISTRO_MANIFEST_SUFFIX}"
+    )
     PACKAGE_MANIFEST_NAME: Final = (
         f"{INITRAMFS_NAME}{BuildConstants.PACKAGE_MANIFEST_SUFFIX}"
     )

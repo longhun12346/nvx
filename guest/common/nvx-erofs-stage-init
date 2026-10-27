@@ -1,0 +1,31 @@
+#!/bin/sh
+# Stage-0 for the Ubuntu EROFS root. No NVX runtime work starts before
+# switch_root, so the real init runs exactly once on the final root.
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+b=/bin/busybox
+fail() {
+    echo "NVX-EROFS-STAGE-ERROR: $*" >&2
+    "$b" reboot -f
+    while :; do "$b" sleep 1; done
+}
+"$b" mount -t proc proc /proc || fail proc
+"$b" mount -t sysfs sysfs /sys || fail sys
+"$b" mount -t devtmpfs -o mode=755 devtmpfs /dev || fail dev
+i=0
+while [ ! -b /dev/vda ]; do
+    i=$((i + 1))
+    [ "$i" -lt 200 ] || fail disk-timeout
+    "$b" sleep 0.05
+done
+"$b" mount -t erofs -o ro /dev/vda /lower || fail erofs
+"$b" mount -t tmpfs -o size=64m,mode=755,nosuid,nodev tmpfs /rw || fail upper
+"$b" mkdir -p /rw/upper /rw/work || fail upper-layout
+"$b" mount -t overlay overlay \
+    -o lowerdir=/lower,upperdir=/rw/upper,workdir=/rw/work /newroot ||
+    fail overlay
+"$b" umount /proc || fail unmount-proc
+"$b" umount /sys || fail unmount-sys
+"$b" umount /dev || fail unmount-dev
+echo "NVX-EROFS-STAGE-SWITCH"
+exec "$b" switch_root /newroot /init
+fail switch-root

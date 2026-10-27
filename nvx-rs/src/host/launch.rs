@@ -134,6 +134,9 @@ pub struct LaunchSpec {
     pub kernel: PathBuf,
     /// The NVX Alpine initramfs (`initramfs.cpio.gz`): the guest userland and its control agent.
     pub initrd: PathBuf,
+    /// Optional read-only Ubuntu EROFS distro layer. When present, `initrd`
+    /// must be the thin stage image generated for that layer.
+    pub distro: Option<PathBuf>,
     /// Hypervisor used by OpenVMM.
     pub hypervisor: Hypervisor,
     /// CPU profile of the guest; [`CpuProfile::Auto`] keeps OpenVMM's built-in choice.
@@ -171,6 +174,7 @@ impl LaunchSpec {
             openvmm: artifacts.openvmm,
             kernel: artifacts.kernel,
             initrd: artifacts.initrd,
+            distro: artifacts.distro,
             hypervisor,
             cpu_profile: CpuProfile::Auto,
             memory_mib: DEFAULT_MEMORY_MIB,
@@ -239,6 +243,9 @@ impl LaunchSpec {
         if let Some(plan) = &self.filesystem {
             tokens.push(plan.kernel_token());
         }
+        if self.distro.is_some() {
+            tokens.push("nvx_overlay_upper=ramfs".to_owned());
+        }
         let command_line = tokens.join(" ");
         if command_line.len() + 1 > COMMAND_LINE_BUDGET {
             return Err(Error::unsupported(format!(
@@ -303,6 +310,10 @@ impl LaunchSpec {
         arguments.push(self.initrd.clone().into());
         arguments.push("--cmdline".into());
         arguments.push(self.checked_kernel_command_line()?.into());
+        if let Some(distro) = &self.distro {
+            arguments.push("--microvm-sandbox-block".into());
+            arguments.push(format!("distro:file:{},ro", distro.display()).into());
+        }
         arguments.push("--virtio-console".into());
         // `none` is the product setting: the control console carries the agent channel,
         // and a second console would change device shape. A diagnostic run may set

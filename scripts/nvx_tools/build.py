@@ -10,6 +10,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import TypedDict
 
@@ -520,6 +521,8 @@ def build_guest(config: BuildConfig) -> None:
             build_kernel(KernelBuildConfig.debug_variant())
         for guest in config.selected_guests():
             build_initramfs(config.initramfs_config(guest))
+            if guest == UbuntuBuildConstants.GUEST_NAME:
+                build_stage_initramfs(config.initramfs_config(guest))
         if config.guest == "all":
             build_distro_layer(config.distro_layer_config())
         return
@@ -742,6 +745,70 @@ def _pack_initramfs(root: Path, output: Path) -> None:
             f"(find={finder_code}, sort={sorter_code}, cpio={cpio_code}, "
             f"gzip={gzip_code})"
         )
+
+
+def build_stage_initramfs(config: InitramfsBuildConfig) -> None:
+    """Build the thin initramfs that switches into the Ubuntu EROFS layer."""
+    _require_linux("build-stage-initramfs")
+    if config.guest != UbuntuBuildConstants.GUEST_NAME:
+        raise ScriptError("build-stage-initramfs currently supports only --guest ubuntu")
+    source = (
+        config.source or artifact_path(UbuntuBuildConstants.INITRAMFS_NAME)
+    ).resolve()
+    require_file(source, "Ubuntu initramfs source for EROFS stage")
+    output = (
+        config.output or artifact_path(UbuntuBuildConstants.STAGE_INITRAMFS_NAME)
+    ).resolve()
+    stage = Path(tempfile.mkdtemp(prefix="nvx-erofs-stage-"))
+    extracted = Path(tempfile.mkdtemp(prefix="nvx-erofs-source-"))
+    try:
+        for name in ("bin", "proc", "sys", "dev", "lower", "rw", "newroot"):
+            (stage / name).mkdir()
+        decompressor = subprocess.Popen(
+            ["gzip", "-dc", str(source)], stdout=subprocess.PIPE
+        )
+        assert decompressor.stdout is not None
+        extractor = subprocess.run(
+            ["cpio", "-idm", "--quiet"],
+            cwd=extracted,
+            stdin=decompressor.stdout,
+        )
+        decompressor.stdout.close()
+        decompressor_code = decompressor.wait()
+        if extractor.returncode or decompressor_code:
+            raise ScriptError("failed to extract Ubuntu initramfs for EROFS stage")
+        busybox = extracted / "bin" / "busybox"
+        require_file(busybox, "busybox in Ubuntu initramfs source")
+        shutil.copy2(busybox, stage / "bin" / "busybox")
+        (stage / "bin" / "sh").symlink_to("busybox")
+        init = (
+            BuildConstants.REPO_ROOT
+            / BuildConstants.COMMON_GUEST_DIRECTORY
+            / "nvx-erofs-stage-init"
+        )
+        shutil.copy2(init, stage / "init")
+        (stage / "init").chmod(0o755)
+        _pack_initramfs(stage, output)
+        manifest = output.with_name(UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME)
+        manifest.write_text(
+            json.dumps(
+                {
+                    "format": UbuntuBuildConstants.PACKAGE_MANIFEST_VERSION,
+                    "guest": UbuntuBuildConstants.GUEST_NAME,
+                    "artifact": output.name,
+                    "artifact_sha256": sha256_file(output),
+                    "source_artifact": source.name,
+                    "source_artifact_sha256": sha256_file(source),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(f">> built {output} ({format_size(output.stat().st_size)})")
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(extracted, ignore_errors=True)
 
 
 def _write_apk_manifest(

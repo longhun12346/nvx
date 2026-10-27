@@ -52,6 +52,7 @@ struct Args {
     openvmm: Option<PathBuf>,
     kernel: Option<PathBuf>,
     initrd: Option<PathBuf>,
+    distro: Option<PathBuf>,
     /// Required: the guest CPU profile is a deployment decision, never inferred.
     cpu_profile: Option<CpuProfile>,
     hypervisor: Option<Hypervisor>,
@@ -101,6 +102,7 @@ fn parse_args() -> Result<Args, String> {
         openvmm: None,
         kernel: None,
         initrd: None,
+        distro: None,
         cpu_profile: None,
         hypervisor: None,
         state_dir: std::env::temp_dir().join(format!("nvxd-{}", std::process::id())),
@@ -129,6 +131,7 @@ fn parse_args() -> Result<Args, String> {
             "--openvmm" => args.openvmm = Some(PathBuf::from(value()?)),
             "--kernel" => args.kernel = Some(PathBuf::from(value()?)),
             "--initrd" => args.initrd = Some(PathBuf::from(value()?)),
+            "--distro" => args.distro = Some(PathBuf::from(value()?)),
             "--cpu-profile" => {
                 let text = value()?;
                 args.cpu_profile = Some(CpuProfile::parse(&text).ok_or_else(|| {
@@ -226,6 +229,9 @@ fn resolve_artifacts(args: &Args) -> Result<Artifacts, String> {
     if let Some(initrd) = &args.initrd {
         artifacts.initrd = initrd.clone();
     }
+    if let Some(distro) = &args.distro {
+        artifacts.distro = Some(distro.clone());
+    }
     Ok(artifacts)
 }
 
@@ -243,6 +249,7 @@ fn run() -> Result<(), String> {
         "openvmm": artifacts.openvmm.display().to_string(),
         "kernel": artifacts.kernel.display().to_string(),
         "initrd": artifacts.initrd.display().to_string(),
+        "distro": artifacts.distro.as_ref().map(|path| path.display().to_string()),
         "cpuProfile": cpu_profile.as_str(),
         "idleTrimSecs": args.idle_trim_secs,
         "sessionTtlSecs": args.session_ttl_secs,

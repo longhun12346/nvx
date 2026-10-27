@@ -17,6 +17,13 @@ pub const OP_SHUTDOWN: &str = "shutdown";
 /// Needed because a lost start reply says nothing about whether the work started: the host
 /// asks instead of guessing, and "unknown" is a real answer rather than a retry signal.
 pub const OP_EXEC_STATUS: &str = "exec.status";
+/// Says whether a TCP server the guest started at `port` is reachable from the host on
+/// 127.0.0.1: published, held by another host process (with a free port to use instead), or not
+/// forwarded at all. Waits up to `waitMs` for the guest's announcement to arrive.
+pub const OP_PORT_CHECK: &str = "port.check";
+/// Hands out a TCP port that is free on the host's loopback, for a server the guest is about to
+/// start, so the port it listens on is also the port the host can reach.
+pub const OP_PORT_ALLOCATE: &str = "port.allocate";
 /// Returns this sidecar's own counters and session summary. Read-only, so a diagnostic
 /// run never changes what it is measuring.
 pub const OP_DIAGNOSTICS: &str = "diagnostics";
@@ -27,6 +34,8 @@ pub const EVENT_EXEC_STDERR: &str = "exec.stderr";
 pub const EVENT_EXEC_EXIT: &str = "exec.exit";
 
 pub const REASON_PROTOCOL: &str = "E_BACKEND_PROTOCOL";
+/// Host-loopback ingress is off, so nothing the guest listens on is published to the host.
+pub const REASON_INBOUND_DISABLED: &str = "E_NVX_INBOUND_DISABLED";
 pub const REASON_MEMORY_LIMIT_UNSUPPORTED: &str = "E_NVX_MEMORY_LIMIT_UNSUPPORTED";
 pub const REASON_CPU_LIMIT_UNSUPPORTED: &str = "E_NVX_CPU_LIMIT_UNSUPPORTED";
 pub const REASON_MEMORY_UNSUPPORTED: &str = "E_NVX_MEMORY_UNSUPPORTED";

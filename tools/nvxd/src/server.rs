@@ -34,6 +34,7 @@ use aci_edge_sandboxes::{
 use serde_json::{Value, json};
 
 use crate::plan::{self, Mount, Share, Step};
+use crate::ports;
 use crate::protocol;
 use crate::registry::{Accept, Cancel, Closed, Registry, Terminal};
 use crate::winmem::VmmMemory;
@@ -243,6 +244,9 @@ pub struct Context {
     /// Whether the host (and only the host, on its loopback) may reach what the guest listens on.
     /// The guest's own access to the host's loopback services stays closed.
     ingress_host_loopback: bool,
+    /// Ports `port.allocate` handed out lately, newest last, so concurrent callers do not get
+    /// the same one.
+    allocated_ports: Mutex<std::collections::VecDeque<u16>>,
     /// Empty directory provisioned with every VM so the virtio-fs device (and therefore the
     /// export channel) exists before the first session's workspace is exported.
     export_anchor: PathBuf,
@@ -292,6 +296,7 @@ impl Context {
             session_isolation,
             network_egress,
             ingress_host_loopback,
+            allocated_ports: Mutex::new(std::collections::VecDeque::new()),
             export_anchor,
             lifecycle: Mutex::new(()),
             removals_lock: Mutex::new(()),
@@ -342,6 +347,104 @@ impl Context {
 
     fn vm_now(&self) -> Option<Arc<Vm>> {
         self.vm.lock().unwrap().clone()
+    }
+
+    /// What a port the guest serves on looks like from the host's loopback.
+    ///
+    /// The guest's server is published at the same port on 127.0.0.1 only when no host process
+    /// already holds it, and OpenVMM skips a taken port without saying so. This is the check
+    /// that turns that silence into an answer the caller can act on.
+    fn port_check(&self, head: &Value) -> Result<Value, Failure> {
+        self.port_session(head)?;
+        let port = number(head.get("port"))
+            .filter(|port| (1..=65535).contains(port))
+            .ok_or_else(|| fail(protocol::REASON_PROTOCOL, "port must be an integer in 1..=65535"))?
+            as u16;
+        if let Some(protocol) = head.get("protocol") {
+            if protocol.as_str() != Some("tcp") {
+                return Err(fail(protocol::REASON_PROTOCOL, "only tcp ports can be checked"));
+            }
+        }
+        // The guest announces its listeners every couple of seconds, so a server that was just
+        // started is not there yet; give it a bounded moment before calling it unpublished.
+        let wait = number(head.get("waitMs")).unwrap_or(3000).min(10_000);
+        let vmm_pid = self
+            .vm_now()
+            .and_then(|vm| vm.memory.map(|memory| memory.pid()))
+            .ok_or_else(|| fail("E_BACKEND_UNAVAILABLE", "no VMM process is known"))?;
+        let deadline = Instant::now() + Duration::from_millis(wait);
+        loop {
+            let listeners = ports::tcp_listeners(port)
+                .map_err(|error| fail("E_NVX_PORT_CHECK", error))?;
+            match ports::classify(&listeners, vmm_pid) {
+                ports::PortState::Published => {
+                    return Ok(json!({
+                        "port": port, "protocol": "tcp", "state": "published",
+                        "hostAddress": "127.0.0.1",
+                    }));
+                }
+                ports::PortState::Conflict { pid } => {
+                    // Nothing will change by waiting: the host port is taken. Say who holds it
+                    // and which port the caller can use instead.
+                    let suggested = self.free_port()?;
+                    return Ok(json!({
+                        "port": port, "protocol": "tcp", "state": "conflict",
+                        "owner": { "pid": pid, "name": ports::process_name(pid) },
+                        "suggestedPort": suggested,
+                    }));
+                }
+                ports::PortState::Unpublished if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                ports::PortState::Unpublished => {
+                    return Ok(json!({
+                        "port": port, "protocol": "tcp", "state": "unpublished",
+                    }));
+                }
+            }
+        }
+    }
+
+    /// A port that is free on the host's loopback right now, for a server about to be started.
+    fn port_allocate(&self, _head: &Value) -> Result<Value, Failure> {
+        // Needs no session and no VM: it is asked before the first command, to pick the port
+        // that command's server will listen on.
+        self.port_enabled()?;
+        Ok(json!({ "port": self.free_port()?, "hostAddress": "127.0.0.1" }))
+    }
+
+    fn free_port(&self) -> Result<u16, Failure> {
+        let mut recent = self.allocated_ports.lock().unwrap();
+        let port = ports::free_port(&recent).map_err(|error| fail("E_NVX_PORT_CHECK", error))?;
+        recent.push_back(port);
+        while recent.len() > 64 {
+            recent.pop_front();
+        }
+        Ok(port)
+    }
+
+    fn port_enabled(&self) -> Result<(), Failure> {
+        if !self.ingress_host_loopback {
+            return Err(fail(
+                protocol::REASON_INBOUND_DISABLED,
+                "host-loopback ingress is off, so nothing the guest listens on is published",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checking a port belongs to an open session and needs ingress to be on.
+    fn port_session(&self, head: &Value) -> Result<(), Failure> {
+        self.port_enabled()?;
+        let name = head.get("session").and_then(Value::as_str).unwrap_or("");
+        let inner = self.inner.lock().unwrap();
+        if !inner.sessions.contains_key(name) {
+            return Err(fail(
+                protocol::REASON_SESSION_UNKNOWN,
+                format!("unknown session {name}"),
+            ));
+        }
+        Ok(())
     }
 
     pub fn handle(self: &Arc<Self>, head: &Value) -> Result<Value, Failure> {
@@ -403,6 +506,8 @@ impl Context {
             protocol::OP_MEMORY_STATS => self.memory_stats(),
             protocol::OP_MEMORY_TRIM => self.memory_trim(),
             protocol::OP_DIAGNOSTICS => Ok(self.diagnostics()),
+            protocol::OP_PORT_CHECK => self.port_check(head),
+            protocol::OP_PORT_ALLOCATE => self.port_allocate(head),
             other => Err(fail(
                 protocol::REASON_PROTOCOL,
                 format!("unknown op {other:?}"),

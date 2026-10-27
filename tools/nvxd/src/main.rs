@@ -10,6 +10,7 @@ mod control;
 mod frame;
 mod outbound;
 mod plan;
+mod ports;
 mod protocol;
 mod registry;
 mod server;

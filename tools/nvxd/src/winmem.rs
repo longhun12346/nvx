@@ -15,6 +15,11 @@ impl VmmMemory {
         Self { pid, start_time }
     }
 
+    /// The VMM's process id: what owns the sockets OpenVMM opens on the host.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
     /// Working set in bytes.
     pub fn working_set(&self) -> Result<u64, String> {
         self.with_process(|process| imp::working_set(process))

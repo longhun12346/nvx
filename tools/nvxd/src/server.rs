@@ -244,6 +244,9 @@ pub struct Context {
     /// Whether the host (and only the host, on its loopback) may reach what the guest listens on.
     /// The guest's own access to the host's loopback services stays closed.
     ingress_host_loopback: bool,
+    /// Whether the guest may reach private and link-local networks (company network, LAN,
+    /// metadata addresses) when it has outbound access. Closed unless asked for.
+    private_networks_allow: bool,
     /// Ports `port.allocate` handed out lately, newest last, so concurrent callers do not get
     /// the same one.
     allocated_ports: Mutex<std::collections::VecDeque<u16>>,
@@ -283,6 +286,7 @@ impl Context {
         session_isolation: bool,
         network_egress: bool,
         ingress_host_loopback: bool,
+        private_networks_allow: bool,
         export_anchor: PathBuf,
     ) -> Self {
         Self {
@@ -296,6 +300,7 @@ impl Context {
             session_isolation,
             network_egress,
             ingress_host_loopback,
+            private_networks_allow,
             allocated_ports: Mutex::new(std::collections::VecDeque::new()),
             export_anchor,
             lifecycle: Mutex::new(()),
@@ -998,38 +1003,12 @@ impl Context {
             "filesystem": { "readwritePaths": [anchor] },
             "microvm": { "provision": { "memoryMib": memory_mib } }
         });
-        if self.network_egress {
-            // Outbound is open to everything; inbound and the host's own loopback stay closed,
-            // so the guest can reach the network but nothing on this machine.
-            provision["network"] = if self.ingress_host_loopback {
-                // OpenVMM's one switch for host loopback works both ways: the host reaches the
-                // guest's listeners on its own loopback, and the guest reaches the host's
-                // loopback services through the gateway. Only the first is wanted, so the
-                // gateway is closed to the guest on every port but DNS.
-                let ports = |from: u16, to: u16| {
-                    json!([
-                        { "protocol": "tcp", "port": from, "endPort": to },
-                        { "protocol": "udp", "port": from, "endPort": to }
-                    ])
-                };
-                let mut gateway_ports = ports(1, 52).as_array().unwrap().clone();
-                gateway_ports.extend(ports(54, 65535).as_array().unwrap().clone());
-                json!({
-                    "egress": {
-                        "default": "allow",
-                        "deny": [
-                            { "to": [{ "cidr": GUEST_GATEWAY_V4 }], "ports": gateway_ports.clone() },
-                            { "to": [{ "cidr": GUEST_GATEWAY_V6 }], "ports": gateway_ports }
-                        ]
-                    },
-                    "ingress": { "default": "deny", "hostLoopback": "allow" }
-                })
-            } else {
-                json!({
-                    "egress": { "default": "allow" },
-                    "ingress": { "default": "deny", "hostLoopback": "deny" }
-                })
-            };
+        if let Some(network) = network_policy(
+            self.network_egress,
+            self.ingress_host_loopback,
+            self.private_networks_allow,
+        ) {
+            provision["network"] = network;
         }
         let request: ProvisionRequest = serde_json::from_value(provision)
             .map_err(|error| fail(protocol::REASON_PROTOCOL, error))?;
@@ -2419,6 +2398,60 @@ impl Context {
 
 /// A request cannot change the mode selected for this sidecar's VM lifecycle.
 /// Validate before any workspace export or VM boot so a refused policy has no effects.
+/// The `network` section of the VM's provision request, or `None` for a guest with loopback only.
+///
+/// Outbound is open to everything, except that the guest is kept off the networks the user's
+/// machine happens to sit in: the private and link-local ranges (the company network, the home
+/// LAN, a cloud host's metadata address) unless `private_networks_allow`. The guest's own subnet
+/// is the one exception, because its gateway answers DNS. Inbound and the host's own loopback
+/// stay closed, unless `ingress_host_loopback` publishes the guest's listeners there.
+fn network_policy(
+    egress: bool,
+    ingress_host_loopback: bool,
+    private_networks_allow: bool,
+) -> Option<Value> {
+    if !egress {
+        return None;
+    }
+    let mut deny: Vec<Value> = Vec::new();
+    if ingress_host_loopback {
+        // OpenVMM's one switch for host loopback works both ways: the host reaches the guest's
+        // listeners on its own loopback, and the guest reaches the host's loopback services
+        // through the gateway. Only the first is wanted, so the gateway is closed to the guest
+        // on every port but DNS.
+        let mut gateway_ports = Vec::new();
+        for (from, to) in [(1u16, 52u16), (54, 65535)] {
+            for protocol in ["tcp", "udp"] {
+                gateway_ports.push(json!({ "protocol": protocol, "port": from, "endPort": to }));
+            }
+        }
+        deny.push(json!({ "to": [{ "cidr": GUEST_GATEWAY_V4 }], "ports": gateway_ports.clone() }));
+        deny.push(json!({ "to": [{ "cidr": GUEST_GATEWAY_V6 }], "ports": gateway_ports }));
+    }
+    if !private_networks_allow {
+        deny.push(json!({ "to": [
+            { "cidr": "10.0.0.0/8", "except": ["10.0.0.1"] },
+            { "cidr": "172.16.0.0/12" },
+            { "cidr": "192.168.0.0/16" },
+            { "cidr": "169.254.0.0/16" },
+            { "cidr": "100.64.0.0/10" },
+            { "cidr": "fc00::/7", "except": ["fd00::a00:1"] },
+            { "cidr": "fe80::/10" }
+        ] }));
+    }
+    let mut egress_policy = json!({ "default": "allow" });
+    if !deny.is_empty() {
+        egress_policy["deny"] = Value::Array(deny);
+    }
+    Some(json!({
+        "egress": egress_policy,
+        "ingress": {
+            "default": "deny",
+            "hostLoopback": if ingress_host_loopback { "allow" } else { "deny" }
+        }
+    }))
+}
+
 fn validate_session_policy(head: &Value, isolated: bool, network_allowed: bool) -> Result<(), Failure> {
     // C++ property_tree writes scalar JSON values as strings. Preserve that
     // wire representation while refusing malformed or truthy policy values.
@@ -2462,6 +2495,62 @@ fn validate_session_policy(head: &Value, isolated: bool, network_allowed: bool) 
 #[cfg(test)]
 mod session_policy_tests {
     use super::*;
+
+    /// What the sidecar sends must be a policy the sandbox model accepts as written.
+    fn accepted(network: Value) -> ProvisionRequest {
+        serde_json::from_value(json!({
+            "filesystem": { "readwritePaths": ["C:/anchor"] },
+            "microvm": { "provision": { "memoryMib": 1024 } },
+            "network": network
+        }))
+        .expect("the provision request parses")
+    }
+
+    #[test]
+    fn a_guest_without_outbound_access_gets_no_network_section() {
+        assert!(network_policy(false, false, false).is_none());
+        assert!(network_policy(false, true, true).is_none());
+    }
+
+    #[test]
+    fn outbound_is_open_but_private_networks_are_closed_by_default() {
+        let network = network_policy(true, false, false).unwrap();
+        accepted(network.clone());
+        assert_eq!(network["egress"]["default"], "allow");
+        let denied = network["egress"]["deny"][0]["to"].as_array().unwrap();
+        let cidrs: Vec<&str> = denied.iter().map(|peer| peer["cidr"].as_str().unwrap()).collect();
+        for expected in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
+                         "100.64.0.0/10", "fc00::/7", "fe80::/10"] {
+            assert!(cidrs.contains(&expected), "{expected} must be closed: {cidrs:?}");
+        }
+        // The gateway answers DNS from inside the guest's own 10/8 and fc00::/7 subnets.
+        assert_eq!(denied[0]["except"][0], "10.0.0.1");
+        assert_eq!(network["ingress"]["hostLoopback"], "deny");
+    }
+
+    #[test]
+    fn private_networks_can_be_left_open() {
+        let network = network_policy(true, false, true).unwrap();
+        accepted(network.clone());
+        assert!(network["egress"].get("deny").is_none());
+    }
+
+    #[test]
+    fn host_loopback_ingress_closes_the_gateway_but_keeps_dns() {
+        for private in [false, true] {
+            let network = network_policy(true, true, private).unwrap();
+            accepted(network.clone());
+            assert_eq!(network["ingress"]["hostLoopback"], "allow");
+            let rules = network["egress"]["deny"].as_array().unwrap();
+            let gateway = &rules[0];
+            assert_eq!(gateway["to"][0]["cidr"], GUEST_GATEWAY_V4);
+            for selector in gateway["ports"].as_array().unwrap() {
+                let (from, to) = (selector["port"].as_u64().unwrap(), selector["endPort"].as_u64().unwrap());
+                assert!(!(from..=to).contains(&53), "port 53 must stay open: {selector}");
+            }
+            assert_eq!(rules.len(), if private { 2 } else { 3 });
+        }
+    }
 
     #[test]
     fn property_tree_and_native_policy_scalars_agree() {

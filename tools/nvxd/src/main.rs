@@ -86,6 +86,9 @@ struct Args {
     /// Let the host reach whatever the guest listens on, on host loopback only
     /// (`--ingress host-loopback`). Needs `--network allow`.
     ingress_host_loopback: bool,
+    /// Let the guest reach private and link-local networks (`--private-networks allow`).
+    /// Closed by default when the guest has outbound access.
+    private_networks_allow: bool,
     /// Requests that may wait for a worker before the caller is refused.
     max_pending: usize,
     /// Workers that run the slow requests (open a session, start an execution).
@@ -125,6 +128,7 @@ fn parse_args() -> Result<Args, String> {
         session_isolation: false,
         network_egress: false,
         ingress_host_loopback: false,
+        private_networks_allow: false,
         max_pending: DEFAULT_MAX_PENDING,
         work_workers: DEFAULT_WORK_WORKERS,
         outbound_capacity: outbound::DEFAULT_CAPACITY,
@@ -159,6 +163,15 @@ fn parse_args() -> Result<Args, String> {
                 args.max_running = value()?.parse().map_err(|e| format!("{e}"))?
             }
             "--session-isolation" => args.session_isolation = true,
+            "--private-networks" => {
+                args.private_networks_allow = match value()?.as_str() {
+                    "allow" => true,
+                    "deny" => false,
+                    other => {
+                        return Err(format!("--private-networks takes allow or deny, not {other:?}"))
+                    }
+                }
+            }
             "--ingress" => {
                 args.ingress_host_loopback = match value()?.as_str() {
                     "host-loopback" => true,
@@ -287,6 +300,7 @@ fn run() -> Result<(), String> {
         "sessionIsolation": args.session_isolation,
         "network": if args.network_egress { "allow" } else { "deny" },
         "ingress": if args.ingress_host_loopback { "host-loopback" } else { "none" },
+        "privateNetworks": if args.private_networks_allow { "allow" } else { "deny" },
         "execLimits": {
             "memMb": args.exec_memory_mb,
             "cpuPercent": args.exec_cpu_percent,
@@ -329,6 +343,7 @@ fn run() -> Result<(), String> {
         args.session_isolation,
         args.network_egress,
         args.ingress_host_loopback,
+        args.private_networks_allow,
         state_dir.join("export-anchor"),
     ));
 

@@ -62,6 +62,56 @@ pub const REASON_GENERATION_STALE: &str = "E_BACKEND_GENERATION_STALE";
 /// anything was registered, so the caller may retry once the backlog drains.
 pub const REASON_OVERLOAD: &str = "E_BACKEND_OVERLOAD";
 
+/// The VM could not be brought up and the failure was not classified further.
+pub const REASON_START: &str = "E_BACKEND_START";
+/// A file the VM needs is missing or unreadable (OpenVMM, kernel, initramfs, distro layer), or
+/// OpenVMM could not be launched at all.
+pub const REASON_START_ASSET: &str = "E_BACKEND_START_ASSET";
+/// OpenVMM exited before the guest was ready.
+pub const REASON_START_VMM_EXIT: &str = "E_BACKEND_START_VMM_EXIT";
+/// The guest did not become ready within the start timeout.
+pub const REASON_START_TIMEOUT: &str = "E_BACKEND_START_TIMEOUT";
+/// The VM booted but the control channel failed, or the guest image lacks control features.
+pub const REASON_START_CONTROL: &str = "E_BACKEND_START_CONTROL";
+/// The hypervisor (Windows Hypervisor Platform) is missing or reports that none is present.
+pub const REASON_START_HYPERVISOR: &str = "E_BACKEND_START_HYPERVISOR";
+
+/// Names the reason a VM did not come up. Every code it returns means the machine or the VM
+/// image cannot boot, as opposed to one session's request being refused, so a caller may treat
+/// the whole family (`E_BACKEND_START*`) as "do not keep retrying this VM".
+///
+/// `kind` is the NVX error kind when the failure came from NVX, and `message` its text. Kinds
+/// that the NVX library folds together (several different causes of `Unavailable`) are told
+/// apart by their message; anything that does not match stays `E_BACKEND_START`.
+pub fn classify_start_failure(kind: Option<ErrorKind>, message: &str) -> &'static str {
+    match kind {
+        Some(ErrorKind::Exited) => REASON_START_VMM_EXIT,
+        Some(ErrorKind::TimedOut) => REASON_START_TIMEOUT,
+        Some(ErrorKind::Protocol) => REASON_START_CONTROL,
+        Some(ErrorKind::Io) if message.starts_with("cannot launch") => REASON_START_ASSET,
+        Some(ErrorKind::Unavailable) => {
+            let lower = message.to_ascii_lowercase();
+            if lower.contains("control features") {
+                REASON_START_CONTROL
+            } else if lower.contains(" not found: ")
+                || lower.starts_with("cannot resolve")
+                || lower.starts_with("cannot read")
+                || lower.contains("is not valid json")
+            {
+                REASON_START_ASSET
+            } else if lower.contains("hypervisor") || lower.contains("winhv") || lower.contains("whv")
+            {
+                REASON_START_HYPERVISOR
+            } else {
+                REASON_START
+            }
+        }
+        _ => REASON_START,
+    }
+}
+
+use aci_edge_sandboxes::nvx::ErrorKind;
+
 use aci_edge_sandboxes::nvx::protocol::{ExecLimits, MAX_EXEC_CPU_PERCENT, MAX_EXEC_MEMORY_MIB};
 use serde_json::Value;
 
@@ -192,6 +242,70 @@ mod tests {
         assert!(validate_memory(DEFAULT_MEMORY_MIB).is_ok());
         let error = validate_memory(768).unwrap_err();
         assert_eq!(error.0, REASON_MEMORY_UNSUPPORTED);
+    }
+
+    /// Messages are the ones NVX really produces (nvx-rs `Artifacts::probe`, `Instance::start`,
+    /// `probe_hypervisor`); a reworded message degrades to the generic code, never to a wrong one.
+    #[test]
+    fn boot_failures_are_told_apart() {
+        use ErrorKind::*;
+        let cases = [
+            (Some(Unavailable), "OpenVMM executable not found: D:/x/openvmm.exe", REASON_START_ASSET),
+            (Some(Unavailable), "NVX guest kernel not found: D:/x/vmlinux", REASON_START_ASSET),
+            (Some(Unavailable), "NVX EROFS distro layer not found: D:/x/d.erofs", REASON_START_ASSET),
+            (Some(Io), "cannot launch D:/x/openvmm.exe", REASON_START_ASSET),
+            (Some(Exited), "sandbox s failed to start: OpenVMM exited during startup; see log", REASON_START_VMM_EXIT),
+            (Some(TimedOut), "sandbox s failed to start: timed out; see log", REASON_START_TIMEOUT),
+            (Some(Protocol), "the control session was reset", REASON_START_CONTROL),
+            (
+                Some(Unavailable),
+                "sandbox s failed to start: the guest image lacks control features that the openvmm backend needs (x)",
+                REASON_START_CONTROL,
+            ),
+            (
+                Some(Unavailable),
+                "the Windows Hypervisor Platform is not installed (WinHvPlatform.dll is missing)",
+                REASON_START_HYPERVISOR,
+            ),
+            (
+                Some(Unavailable),
+                "the Windows Hypervisor Platform reports that no hypervisor is present",
+                REASON_START_HYPERVISOR,
+            ),
+            (Some(Io), "cannot write /state/runtime.json", REASON_START),
+            (Some(Unsupported), "kernel command line too long", REASON_START),
+            (Some(Other), "anything", REASON_START),
+            (None, "not from NVX", REASON_START),
+        ];
+        for (kind, message, expected) in cases {
+            assert_eq!(classify_start_failure(kind, message), expected, "{message}");
+        }
+    }
+
+    /// A path that happens to contain the word hypervisor is still a missing file.
+    #[test]
+    fn a_missing_asset_under_a_hypervisor_directory_is_still_an_asset_failure() {
+        assert_eq!(
+            classify_start_failure(
+                Some(ErrorKind::Unavailable),
+                "OpenVMM executable not found: D:/hypervisor/openvmm.exe"
+            ),
+            REASON_START_ASSET
+        );
+    }
+
+    #[test]
+    fn every_boot_failure_code_is_in_the_start_family() {
+        for code in [
+            REASON_START,
+            REASON_START_ASSET,
+            REASON_START_VMM_EXIT,
+            REASON_START_TIMEOUT,
+            REASON_START_CONTROL,
+            REASON_START_HYPERVISOR,
+        ] {
+            assert!(code.starts_with("E_BACKEND_START"), "{code}");
+        }
     }
 
     /// The range is a correctness boundary, not a suggestion: a size below the floor boots

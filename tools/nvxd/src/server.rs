@@ -66,6 +66,15 @@ fn fail(code: &'static str, message: impl ToString) -> Failure {
     }
 }
 
+/// A failed provision or start of the VM, with the cause named in the code: see
+/// [`protocol::classify_start_failure`]. The message stays the backend's own text.
+fn start_failure(error: &aci_edge_sandboxes::Error) -> Failure {
+    fail(
+        protocol::classify_start_failure(error.nvx_kind(), error.message()),
+        error,
+    )
+}
+
 /// The one VM this sidecar runs, named by a generation that changes whenever it is replaced.
 pub struct Vm {
     sandbox: SandboxId,
@@ -1015,13 +1024,13 @@ impl Context {
         let sandbox = self
             .client
             .provision(&request)
-            .map_err(|error| fail("E_BACKEND_START", error))?
+            .map_err(|error| start_failure(&error))?
             .sandbox_id;
         let started = match self.client.start(&sandbox) {
             Ok(started) => started,
             Err(error) => {
                 let _ = self.client.deprovision(&sandbox);
-                return Err(fail("E_BACKEND_START", error));
+                return Err(start_failure(&error));
             }
         };
         // What this image can actually do, remembered for `probe`: a caller must not have to

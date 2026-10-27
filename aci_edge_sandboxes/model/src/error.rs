@@ -88,6 +88,7 @@ pub struct Error {
     message: String,
     #[source]
     source: Option<BoxedSource>,
+    nvx_kind: Option<nvx::ErrorKind>,
 }
 
 impl Error {
@@ -97,6 +98,7 @@ impl Error {
             code,
             message: message.into(),
             source: None,
+            nvx_kind: None,
         }
     }
 
@@ -115,6 +117,13 @@ impl Error {
     /// Returns the human-readable description of this error.
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Returns the kind of the NVX error this one was converted from, if it was. The wire code
+    /// folds several kinds together (an exited VMM, a timeout and a protocol failure are all
+    /// `backend_error`); a caller that has to tell them apart reads this.
+    pub fn nvx_kind(&self) -> Option<nvx::ErrorKind> {
+        self.nvx_kind
     }
 
     /// Returns the contract's serializable `{ "code", "message" }` error body.
@@ -198,6 +207,7 @@ impl From<nvx::Error> for Error {
             code,
             message,
             source,
+            nvx_kind: Some(kind),
         }
     }
 }
@@ -259,6 +269,8 @@ mod tests {
             let cause = std::io::Error::other("disk full");
             let error = Error::from(nvx::Error::new(kind, "cannot write state").with_source(cause));
             assert_eq!(error.code(), code, "{kind}");
+            assert_eq!(error.nvx_kind(), Some(kind), "{kind} survives the conversion");
+            assert_eq!(Error::backend_error("x").nvx_kind(), None);
             assert_eq!(error.message(), "cannot write state");
             let source = std::error::Error::source(&error).unwrap();
             assert_eq!(source.to_string(), "disk full");

@@ -72,6 +72,21 @@ def linux_path(path):
         text=True, timeout=15).strip()
 
 
+def probe_command(openvmm, kernel, diagnostic, diagnostic_distro=None):
+    cmdline = "nvx_exec=/p8-probe-boot"
+    if diagnostic_distro is not None:
+        cmdline += " nvx_overlay_upper=ramfs"
+    command = [
+        str(openvmm), "--single-process", "--machine", "microvm",
+        "--processors", "2", "--hypervisor", "whp", "--cpu-profile", "host",
+        "--memory", "1024M", "--kernel", str(kernel),
+        "--initrd", str(diagnostic), "--cmdline", cmdline,
+    ]
+    if diagnostic_distro is not None:
+        command += ["--microvm-sandbox-block", f"distro:file:{diagnostic_distro},ro"]
+    return command
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--nvxd", required=True, type=pathlib.Path)
@@ -102,15 +117,9 @@ def main() -> int:
                         *([linux_path(distro)] if distro else [])],
                        stdout=log, stderr=subprocess.STDOUT, check=True, timeout=120)
     started = time.monotonic()
-    command = [
-        str(inputs["openvmm"]), "--single-process", "--machine", "microvm",
-        "--processors", "2", "--hypervisor", "whp", "--cpu-profile", "host",
-        "--memory", "1024M", "--kernel", str(inputs["kernel"]),
-        "--initrd", str(diagnostic), "--cmdline", "nvx_exec=/p8-probe-boot",
-    ]
     diagnostic_distro = pathlib.Path(str(diagnostic) + ".erofs") if distro else None
-    if diagnostic_distro:
-        command += ["--microvm-sandbox-block", f"distro:file:{diagnostic_distro},ro"]
+    command = probe_command(
+        inputs["openvmm"], inputs["kernel"], diagnostic, diagnostic_distro)
     with (out / "boot.log").open("wb") as log:
         # subprocess.run kills and waits for this specific process on timeout.
         result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=60)

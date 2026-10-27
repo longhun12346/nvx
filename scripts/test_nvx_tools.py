@@ -275,6 +275,26 @@ def _write_release_fixture(
             ),
             encoding="utf-8",
         )
+    (build_dir / UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "format": 1,
+                "guest": "ubuntu",
+                "artifact": UbuntuBuildConstants.STAGE_INITRAMFS_NAME,
+                "artifact_sha256": common.sha256_file(
+                    build_dir / UbuntuBuildConstants.STAGE_INITRAMFS_NAME
+                ),
+                "source_artifact": UbuntuBuildConstants.INITRAMFS_NAME,
+                "source_artifact_sha256": common.sha256_file(
+                    build_dir / UbuntuBuildConstants.INITRAMFS_NAME
+                ),
+                "stage_init_sha256": common.sha256_file(
+                    root / "guest/common/nvx-erofs-stage-init"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
     (build_dir / AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME).write_text(
         json.dumps(
             {
@@ -11393,7 +11413,7 @@ class ManagedAgentStopTests(unittest.TestCase):
     def test_agent_advertises_the_control_features_of_its_mode(self):
         cancel, workload_account, exec_cgroup, environment = (1, 4, 8, 16)
         exec_cwd, host_mapping_table, runtime_mappings = (32, 64, 128)
-        exec_slots, exec_limits = (256, 512)
+        exec_slots, exec_limits, session_isolation = (256, 512, 1024)
         for rootfs, expected in (
             # Only the direct agent maps host paths (also after readiness), gives each
             # workload a cgroup, refuses a working directory that the workload cannot
@@ -11409,7 +11429,8 @@ class ManagedAgentStopTests(unittest.TestCase):
                 | host_mapping_table
                 | runtime_mappings
                 | exec_slots
-                | exec_limits,
+                | exec_limits
+                | session_isolation,
             ),
             ("/run/nvx/rootfs", cancel | workload_account | environment),
         ):
@@ -21357,6 +21378,9 @@ class ReleaseTests(unittest.TestCase):
             for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
                 self.assertTrue((destination / "guest" / name).is_file())
             self.assertTrue(
+                (destination / "guest/initramfs-ubuntu-stage.cpio.gz").is_file()
+            )
+            self.assertTrue(
                 (
                     destination / "provenance" / OpenVMMBuildConstants.PROVENANCE_NAME
                 ).is_file()
@@ -21375,6 +21399,10 @@ class ReleaseTests(unittest.TestCase):
                 (destination / "SOURCE-MANIFEST.json").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["distribution"]["version"], "1.0.0")
+            self.assertEqual(
+                manifest["ubuntu"]["stage_initramfs_sha256"],
+                common.sha256_file(destination / "guest/initramfs-ubuntu-stage.cpio.gz"),
+            )
             self.assertNotIn("guest_agent", manifest)
             self.assertEqual(manifest["openvmm"]["source_revision"], revision)
             self.assertEqual(
@@ -21659,6 +21687,7 @@ class ReleaseTests(unittest.TestCase):
         for artifact_name in (
             "initramfs-ubuntu.cpio.gz",
             "ubuntu-distro.erofs",
+            "initramfs-ubuntu-stage.cpio.gz",
         ):
             with (
                 self.subTest(artifact=artifact_name),
@@ -21678,6 +21707,23 @@ class ReleaseTests(unittest.TestCase):
                         common.ScriptError,
                         "Ubuntu artifact manifest does not match",
                     ),
+                ):
+                    release._guest_release_inputs(include_azurelinux=True)
+
+    def test_guest_release_inputs_bind_stage_to_source_and_boot_script(self):
+        for field in ("source_artifact_sha256", "stage_init_sha256"):
+            with (
+                self.subTest(field=field),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                paths, _, _ = _write_release_fixture(Path(temporary))
+                manifest = paths["build"] / UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME
+                document = json.loads(manifest.read_text())
+                document[field] = "0" * 64
+                manifest.write_text(json.dumps(document))
+                with (
+                    patch.object(release, "artifact_path", side_effect=paths["build"].joinpath),
+                    self.assertRaisesRegex(common.ScriptError, "EROFS stage inputs"),
                 ):
                     release._guest_release_inputs(include_azurelinux=True)
 

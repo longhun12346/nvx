@@ -631,6 +631,8 @@ def _packaged_guest_artifact_names(package_root: Path) -> list[str]:
             (
                 UbuntuBuildConstants.INITRAMFS_NAME,
                 UbuntuBuildConstants.PACKAGE_MANIFEST_NAME,
+                UbuntuBuildConstants.STAGE_INITRAMFS_NAME,
+                UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME,
                 UbuntuBuildConstants.DISTRO_NAME,
                 UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
             )
@@ -993,6 +995,26 @@ def _guest_release_inputs(
             raise ScriptError(
                 f"Ubuntu artifact manifest does not match {artifact_name}"
             )
+    stage = artifact_path(UbuntuBuildConstants.STAGE_INITRAMFS_NAME)
+    stage_document = _read_json_object(
+        artifact_path(UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME),
+        "Ubuntu EROFS stage manifest",
+    )
+    stage_init = (
+        BuildConstants.REPO_ROOT / BuildConstants.COMMON_GUEST_DIRECTORY
+        / "nvx-erofs-stage-init"
+    )
+    if (
+        stage_document.get("format") != UbuntuBuildConstants.PACKAGE_MANIFEST_VERSION
+        or stage_document.get("guest") != UbuntuBuildConstants.GUEST_NAME
+        or stage_document.get("artifact") != stage.name
+        or stage_document.get("artifact_sha256") != sha256_file(stage)
+        or stage_document.get("source_artifact") != UbuntuBuildConstants.INITRAMFS_NAME
+        or stage_document.get("source_artifact_sha256")
+        != sha256_file(artifact_path(UbuntuBuildConstants.INITRAMFS_NAME))
+        or stage_document.get("stage_init_sha256") != sha256_file(stage_init)
+    ):
+        raise ScriptError("Ubuntu artifact manifest does not match EROFS stage inputs")
     return guest_names, alpine_manifests, ubuntu_manifests, azurelinux_manifests
 
 
@@ -1166,6 +1188,12 @@ def _packaged_source_manifest(
     )
     ubuntu_section["initramfs_package_manifest_sha256"] = sha256_file(
         release_root / "guest" / UbuntuBuildConstants.PACKAGE_MANIFEST_NAME
+    )
+    ubuntu_section["stage_initramfs_sha256"] = sha256_file(
+        release_root / "guest" / UbuntuBuildConstants.STAGE_INITRAMFS_NAME
+    )
+    ubuntu_section["stage_initramfs_manifest_sha256"] = sha256_file(
+        release_root / "guest" / UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME
     )
     ubuntu_section["distro_layer_sha256"] = sha256_file(
         release_root / "guest" / UbuntuBuildConstants.DISTRO_NAME

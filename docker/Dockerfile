@@ -222,6 +222,8 @@ COPY --from=initramfs /repo/build/initramfs.provenance.json /initramfs.provenanc
 FROM scratch AS ubuntu-initramfs-artifacts
 COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu.cpio.gz /initramfs-ubuntu.cpio.gz
 COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu.cpio.gz.packages.json /initramfs-ubuntu.cpio.gz.packages.json
+COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu-stage.cpio.gz /initramfs-ubuntu-stage.cpio.gz
+COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu-stage.cpio.gz.manifest.json /initramfs-ubuntu-stage.cpio.gz.manifest.json
 
 FROM scratch AS azurelinux-initramfs-artifacts
 COPY --from=azurelinux-initramfs /tmp/initramfs-azurelinux.cpio.gz /initramfs-azurelinux.cpio.gz
@@ -258,6 +260,8 @@ COPY --from=kernel /repo/build/vmlinux.config /vmlinux.config
 COPY --from=kernel /repo/build/vmlinux.provenance.json /vmlinux.provenance.json
 COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu.cpio.gz /initramfs-ubuntu.cpio.gz
 COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu.cpio.gz.packages.json /initramfs-ubuntu.cpio.gz.packages.json
+COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu-stage.cpio.gz /initramfs-ubuntu-stage.cpio.gz
+COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu-stage.cpio.gz.manifest.json /initramfs-ubuntu-stage.cpio.gz.manifest.json
 
 FROM scratch AS all-guest-artifacts
 COPY --from=kernel /repo/build/vmlinux /vmlinux
@@ -268,6 +272,8 @@ COPY --from=initramfs /repo/build/initramfs.cpio.gz.packages.json /initramfs.cpi
 COPY --from=initramfs /repo/build/initramfs.provenance.json /initramfs.provenance.json
 COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu.cpio.gz /initramfs-ubuntu.cpio.gz
 COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu.cpio.gz.packages.json /initramfs-ubuntu.cpio.gz.packages.json
+COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu-stage.cpio.gz /initramfs-ubuntu-stage.cpio.gz
+COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu-stage.cpio.gz.manifest.json /initramfs-ubuntu-stage.cpio.gz.manifest.json
 COPY --from=ubuntu-distro-layer /repo/build/ubuntu-distro.erofs /ubuntu-distro.erofs
 COPY --from=ubuntu-distro-layer /repo/build/ubuntu-distro.erofs.manifest.json /ubuntu-distro.erofs.manifest.json
 COPY --from=azurelinux-initramfs /tmp/initramfs-azurelinux.cpio.gz /initramfs-azurelinux.cpio.gz

@@ -784,6 +784,9 @@ def build_stage_initramfs(config: InitramfsBuildConfig) -> None:
         busybox = extracted / "bin" / "busybox"
         require_file(busybox, "busybox in Ubuntu initramfs source")
         shutil.copy2(busybox, stage / "bin" / "busybox")
+        # The source archive may have been assembled on a filesystem that
+        # loses Unix modes. Stage-0's executable must never inherit 0777.
+        (stage / "bin" / "busybox").chmod(0o755)
         (stage / "bin" / "sh").symlink_to("busybox")
         init = (
             BuildConstants.REPO_ROOT
@@ -803,6 +806,7 @@ def build_stage_initramfs(config: InitramfsBuildConfig) -> None:
                     "artifact_sha256": sha256_file(output),
                     "source_artifact": source.name,
                     "source_artifact_sha256": sha256_file(source),
+                    "stage_init_sha256": sha256_file(init),
                 },
                 indent=2,
             )
@@ -1162,6 +1166,8 @@ def verify_guest_determinism(work: Path, guest: str) -> None:
     artifact_names = (
         descriptor.initramfs_name,
         descriptor.package_manifest_name,
+        UbuntuBuildConstants.STAGE_INITRAMFS_NAME,
+        UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME,
         UbuntuBuildConstants.DISTRO_NAME,
         UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
     )
@@ -1190,6 +1196,13 @@ def verify_guest_determinism(work: Path, guest: str) -> None:
                     / InitramfsBuildConstants.DETERMINISM_DISTRO_WORK_DIRECTORY_NAME
                 ),
                 output=attempt_root / UbuntuBuildConstants.DISTRO_NAME,
+            )
+        )
+        build_stage_initramfs(
+            InitramfsBuildConfig(
+                guest=descriptor.name,
+                source=attempt_root / descriptor.initramfs_name,
+                output=attempt_root / UbuntuBuildConstants.STAGE_INITRAMFS_NAME,
             )
         )
         attempts.append(attempt_root)
@@ -1398,6 +1411,12 @@ def build_docker_artifacts(
         )
         if descriptor.name == "alpine":
             expected = (*expected, InitramfsBuildConstants.PROVENANCE_NAME)
+        elif descriptor.name == "ubuntu":
+            expected = (
+                *expected,
+                UbuntuBuildConstants.STAGE_INITRAMFS_NAME,
+                UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME,
+            )
         guest_label = descriptor.distribution
     print(
         f">> building Linux artifacts into '{destination}' "

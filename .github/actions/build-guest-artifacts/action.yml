@@ -119,6 +119,8 @@ runs:
         path: |
           build/initramfs-ubuntu.cpio.gz
           build/initramfs-ubuntu.cpio.gz.packages.json
+          build/initramfs-ubuntu-stage.cpio.gz
+          build/initramfs-ubuntu-stage.cpio.gz.manifest.json
         key: ${{ steps.guest-cache-keys.outputs.ubuntu }}
         enableCrossOsArchive: true
 
@@ -277,6 +279,8 @@ runs:
         path: |
           build/initramfs-ubuntu.cpio.gz
           build/initramfs-ubuntu.cpio.gz.packages.json
+          build/initramfs-ubuntu-stage.cpio.gz
+          build/initramfs-ubuntu-stage.cpio.gz.manifest.json
         key: ${{ steps.guest-cache-keys.outputs.ubuntu }}
         enableCrossOsArchive: true
 

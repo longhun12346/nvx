@@ -19,9 +19,21 @@ from nvx_tools.build_constants import UbuntuBuildConstants
 from nvx_tools.common import ScriptError
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools/nvxd/tests"))
 from runtime_assets import artifact_args
+from guest_probe_report import probe_command
 
 
 class StageRoutingTests(unittest.TestCase):
+    def test_guest_probe_declares_the_erofs_ram_upper_topology(self):
+        for distro in (None, Path("diagnostic image.erofs")):
+            with self.subTest(distro=distro):
+                command = probe_command("openvmm", "kernel", "stage", distro)
+                cmdline = command[command.index("--cmdline") + 1].split()
+                self.assertIn("nvx_exec=/p8-probe-boot", cmdline)
+                self.assertEqual("nvx_overlay_upper=ramfs" in cmdline, distro is not None)
+                self.assertEqual("--microvm-sandbox-block" in command, distro is not None)
+                if distro is not None:
+                    self.assertEqual(command[-1], f"distro:file:{distro},ro")
+
     def assert_stage_paths(self, config):
         full = BuildConfig.initramfs_config("ubuntu").output
         self.assertEqual(config.source, full)
@@ -88,6 +100,40 @@ class StageRoutingTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "missing"):
                     artifact_args(repo, repo / "stage.cpio.gz")
 
+    def test_determinism_rejects_a_changed_stage(self):
+        def full(config):
+            config.output.write_bytes(b"full")
+            Path(str(config.output) + ".packages.json").write_bytes(b"packages")
+
+        def distro(config):
+            config.output.write_bytes(b"distro")
+            Path(str(config.output) + ".manifest.json").write_bytes(b"packages")
+
+        for changed in (False, True):
+            calls = []
+
+            def stage(config):
+                calls.append(config)
+                self.assertEqual(config.source.name, UbuntuBuildConstants.INITRAMFS_NAME)
+                config.output.write_bytes(bytes([len(calls) if changed else 1]))
+                Path(str(config.output) + ".manifest.json").write_bytes(b"stage metadata")
+
+            with (
+                self.subTest(changed=changed),
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(build, "_require_linux"),
+                patch.object(build, "build_initramfs", side_effect=full),
+                patch.object(build, "build_distro_layer", side_effect=distro),
+                patch.object(build, "build_stage_initramfs", side_effect=stage),
+                patch.object(ubuntu, "rootfs_inventory", return_value={}),
+            ):
+                if changed:
+                    with self.assertRaisesRegex(ScriptError, "initramfs-ubuntu-stage"):
+                        build.verify_guest_determinism(Path(directory), "ubuntu")
+                else:
+                    build.verify_guest_determinism(Path(directory), "ubuntu")
+                self.assertEqual(len(calls), 2)
+
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux cpio")
 class StageArchiveTests(unittest.TestCase):
@@ -108,7 +154,7 @@ class StageArchiveTests(unittest.TestCase):
             source_root = root / "source"
             (source_root / "bin").mkdir(parents=True)
             (source_root / "bin" / "busybox").write_bytes(b"fixture busybox")
-            (source_root / "bin" / "busybox").chmod(0o755)
+            (source_root / "bin" / "busybox").chmod(0o777)
             source = root / "full.cpio.gz"
             build._pack_initramfs(source_root, source)
             original = source.read_bytes()
@@ -123,6 +169,12 @@ class StageArchiveTests(unittest.TestCase):
             self.assertEqual(manifest["artifact"], output.name)
             self.assertEqual(manifest["artifact_sha256"], hashlib.sha256(output.read_bytes()).hexdigest())
             self.assertEqual(manifest["source_artifact_sha256"], hashlib.sha256(original).hexdigest())
+            self.assertEqual(
+                manifest["stage_init_sha256"],
+                hashlib.sha256(
+                    (Path(__file__).resolve().parents[1] / "guest/common/nvx-erofs-stage-init").read_bytes()
+                ).hexdigest(),
+            )
             unpacked = root / "unpacked"
             unpacked.mkdir()
             import gzip
@@ -132,6 +184,7 @@ class StageArchiveTests(unittest.TestCase):
             )
             self.assertEqual(os.readlink(unpacked / "bin" / "sh"), "busybox")
             self.assertEqual((unpacked / "bin" / "busybox").read_bytes(), b"fixture busybox")
+            self.assertEqual((unpacked / "bin" / "busybox").stat().st_mode & 0o7777, 0o755)
             self.assertIn("switch_root", (unpacked / "init").read_text())
             self.assertTrue(os.access(unpacked / "init", os.X_OK))
 

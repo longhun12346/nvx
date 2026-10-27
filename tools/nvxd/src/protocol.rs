@@ -196,17 +196,18 @@ pub fn request_exec_limits(
 
 /// Guest RAM accepted per session.
 ///
-/// The floor is measured, not chosen for looks. The guest rootfs is a RAM initramfs of
-/// ~253 MiB uncompressed, so everything above it (kernel, agent, the shipped runtimes) has
-/// to fit in what is left. On the reference machine: at 640 MiB the guest boots but Node
-/// aborts in V8 startup, 672 MiB is the first size where Python and Node both run, and at
-/// or below 576 MiB the guest never reaches the control channel and the failure surfaces
-/// only as an opaque 60 s timeout. The floor stays at the validated 1024 MiB baseline so a
-/// caller can raise the size for heavier work without lowering it into that band.
+/// The floor is measured on the EROFS runtime (thin stage initramfs + read-only EROFS distro,
+/// so the root filesystem is not held in RAM). Python and Node boot and run from 256 MiB; a
+/// 192 MiB Node allocation needs 320 MiB; the eight-session workload (eight resident 32 MiB
+/// tasks, plus 8 MiB private tmpfs each in isolated mode) fails at 320 MiB shared and 384 MiB
+/// isolated, and passes from 448 MiB in both modes. The floor is the next size up, 512 MiB, so
+/// it keeps a margin over the smallest size that passed. The sizes below 1024 MiB are
+/// measured with that workload only; heavier work should ask for more. The older RAM-initramfs
+/// numbers (253 MiB rootfs, 672 MiB first usable) no longer describe the shipped assets.
 ///
 /// The ceiling matches the instance budget the host reserves by default, so one session can
 /// never ask for more guest RAM than the host is willing to hold.
-pub const MIN_MEMORY_MIB: u64 = 1024;
+pub const MIN_MEMORY_MIB: u64 = 512;
 pub const MAX_MEMORY_MIB: u64 = 4096;
 
 pub fn validate_memory(memory_mib: u64) -> Result<(), (&'static str, String)> {
@@ -240,9 +241,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn product_baseline_is_1024_mib() {
+    fn default_stays_1024_and_the_floor_is_512_mib() {
         assert!(validate_memory(DEFAULT_MEMORY_MIB).is_ok());
-        let error = validate_memory(768).unwrap_err();
+        assert!(validate_memory(MIN_MEMORY_MIB).is_ok());
+        let error = validate_memory(MIN_MEMORY_MIB - 1).unwrap_err();
         assert_eq!(error.0, REASON_MEMORY_UNSUPPORTED);
     }
 
@@ -317,7 +319,7 @@ mod tests {
         for mib in [MIN_MEMORY_MIB, DEFAULT_MEMORY_MIB, 2048, MAX_MEMORY_MIB] {
             assert!(validate_memory(mib).is_ok(), "{mib} MiB should be accepted");
         }
-        for mib in [0, 512, MIN_MEMORY_MIB - 1, MAX_MEMORY_MIB + 1] {
+        for mib in [0, 256, MIN_MEMORY_MIB - 1, MAX_MEMORY_MIB + 1] {
             let error = validate_memory(mib).unwrap_err();
             assert_eq!(error.0, REASON_MEMORY_UNSUPPORTED, "{mib} MiB should be refused");
         }

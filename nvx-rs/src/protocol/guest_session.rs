@@ -25,6 +25,19 @@ pub const MAX_SESSION_PATH: usize = 4095;
 pub enum SessionNetwork {
     /// Loopback within this session only; no device or route to another namespace.
     Deny,
+    /// The session stays in the VM's own network namespace and uses whatever network the VM has.
+    /// Sessions then share addresses and ports with each other; mount, PID, IPC and UTS
+    /// isolation are unaffected.
+    Shared,
+}
+
+impl SessionNetwork {
+    fn wire(self) -> u16 {
+        match self {
+            SessionNetwork::Deny => 0,
+            SessionNetwork::Shared => 1,
+        }
+    }
 }
 
 /// Host-owned creation request. The workspace names an already-authorized mount
@@ -108,7 +121,7 @@ pub fn encode_session_open(spec: &GuestSessionSpec) -> Result<Vec<u8>, ProtocolE
     }
     let mut bytes = Vec::with_capacity(16 + spec.workspace.len());
     bytes.extend_from_slice(&SESSION_VERSION.to_le_bytes());
-    bytes.extend_from_slice(&0u16.to_le_bytes()); // Deny is the sole supported policy.
+    bytes.extend_from_slice(&spec.network.wire().to_le_bytes());
     bytes.extend_from_slice(&spec.id.to_le_bytes());
     bytes.extend_from_slice(&(spec.workspace.len() as u32).to_le_bytes());
     bytes.extend_from_slice(spec.workspace.as_bytes());
@@ -117,12 +130,14 @@ pub fn encode_session_open(spec: &GuestSessionSpec) -> Result<Vec<u8>, ProtocolE
 
 /// Decode strictly so older guests never treat a newer policy as no-network.
 pub fn decode_session_open(bytes: &[u8]) -> Result<GuestSessionSpec, ProtocolError> {
-    if bytes.len() < 16
-        || u16::from_le_bytes(bytes[0..2].try_into().unwrap()) != SESSION_VERSION
-        || bytes[2..4] != [0, 0]
-    {
+    if bytes.len() < 16 || u16::from_le_bytes(bytes[0..2].try_into().unwrap()) != SESSION_VERSION {
         return Err(violation("unsupported guest session header"));
     }
+    let network = match u16::from_le_bytes(bytes[2..4].try_into().unwrap()) {
+        0 => SessionNetwork::Deny,
+        1 => SessionNetwork::Shared,
+        _ => return Err(violation("unsupported guest session network policy")),
+    };
     let id = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
     let length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
     if length != bytes.len() - 16 {
@@ -130,7 +145,7 @@ pub fn decode_session_open(bytes: &[u8]) -> Result<GuestSessionSpec, ProtocolErr
     }
     let workspace = std::str::from_utf8(&bytes[16..])
         .map_err(|_| violation("guest session workspace is not UTF-8"))?;
-    let spec = GuestSessionSpec { id, workspace: workspace.to_owned(), network: SessionNetwork::Deny };
+    let spec = GuestSessionSpec { id, workspace: workspace.to_owned(), network };
     encode_session_open(&spec)?;
     Ok(spec)
 }
@@ -159,6 +174,22 @@ mod tests {
         expected.extend_from_slice(b"/sessions/a/workspace");
         assert_eq!(encode_session_open(&spec).unwrap(), expected);
         assert_eq!(decode_session_open(&expected).unwrap(), spec);
+    }
+
+    #[test]
+    fn shared_network_policy_is_distinct_on_the_wire_and_round_trips() {
+        let shared = GuestSessionSpec {
+            id: 7, workspace: "/sessions/a/workspace".into(), network: SessionNetwork::Shared,
+        };
+        let bytes = encode_session_open(&shared).unwrap();
+        assert_eq!(bytes[2..4], [1, 0]);
+        assert_eq!(decode_session_open(&bytes).unwrap(), shared);
+        let mut private = bytes.clone();
+        private[2] = 0;
+        assert_eq!(decode_session_open(&private).unwrap().network, SessionNetwork::Deny);
+        let mut unknown = bytes;
+        unknown[2] = 2;
+        assert!(decode_session_open(&unknown).is_err());
     }
 
     #[test]

@@ -212,6 +212,10 @@ pub type Writer = Arc<crate::outbound::Writer>;
 
 /// Metadata key under which the backend reports the guest's control features.
 const GUEST_FEATURES_KEY: &str = "guestFeatures";
+/// The guest's gateway on OpenVMM's portable network profile (guest 10.0.0.2/24). Traffic to it
+/// is what reaches the host's own loopback services, and it answers DNS on port 53.
+const GUEST_GATEWAY_V4: &str = "10.0.0.1/32";
+const GUEST_GATEWAY_V6: &str = "fd00::a00:1/128";
 /// Guest feature bit `EXEC_SLOTS`: the agent serves several executions at once
 /// (`guest/common/nvx-managed-agent.c`, `FEATURE_EXEC_SLOTS`).
 const GUEST_FEATURE_EXEC_SLOTS: u64 = 1 << 8;
@@ -232,6 +236,13 @@ pub struct Context {
     /// concurrent executions.
     max_running: usize,
     session_isolation: bool,
+    /// Whether the VM gets a network interface with unrestricted outbound access. Inbound
+    /// traffic and the host's loopback stay denied either way. Off by default: the guest then
+    /// has only `lo`. Isolated sessions keep their own empty network namespace regardless.
+    network_egress: bool,
+    /// Whether the host (and only the host, on its loopback) may reach what the guest listens on.
+    /// The guest's own access to the host's loopback services stays closed.
+    ingress_host_loopback: bool,
     /// Empty directory provisioned with every VM so the virtio-fs device (and therefore the
     /// export channel) exists before the first session's workspace is exported.
     export_anchor: PathBuf,
@@ -266,6 +277,8 @@ impl Context {
         max_sessions: usize,
         max_running: usize,
         session_isolation: bool,
+        network_egress: bool,
+        ingress_host_loopback: bool,
         export_anchor: PathBuf,
     ) -> Self {
         Self {
@@ -277,6 +290,8 @@ impl Context {
             max_sessions,
             max_running: max_running.max(1),
             session_isolation,
+            network_egress,
+            ingress_host_loopback,
             export_anchor,
             lifecycle: Mutex::new(()),
             removals_lock: Mutex::new(()),
@@ -362,7 +377,7 @@ impl Context {
                 })
                 .map_err(|error| fail(protocol::REASON_BACKEND_UNAVAILABLE, error)),
             protocol::OP_SESSION_OPEN => {
-                validate_session_policy(head, self.session_isolation)?;
+                validate_session_policy(head, self.session_isolation, self.network_egress)?;
                 let memory = match head.get("memoryMiB") {
                     None => protocol::DEFAULT_MEMORY_MIB,
                     Some(value) => number(Some(value)).ok_or_else(|| {
@@ -627,7 +642,11 @@ impl Context {
                         let spec = aci_edge_sandboxes::nvx::protocol::GuestSessionSpec {
                             id,
                             workspace: target.clone(),
-                            network: aci_edge_sandboxes::nvx::protocol::SessionNetwork::Deny,
+                            network: if self.network_egress {
+                                aci_edge_sandboxes::nvx::protocol::SessionNetwork::Shared
+                            } else {
+                                aci_edge_sandboxes::nvx::protocol::SessionNetwork::Deny
+                            },
                         };
                         if let Err(error) = self.backend.open_guest_session(&vm.sandbox, &spec) {
                             self.rollback_open_session(&vm, name);
@@ -870,11 +889,45 @@ impl Context {
         // mount mode, so a read-only anchor would make every session's workspace and every
         // mount read-only in the guest no matter what the request asked for. The directory
         // is empty and owned by this sidecar, so exposing it writable exposes nothing.
-        let request: ProvisionRequest = serde_json::from_value(json!({
+        let mut provision = json!({
             "filesystem": { "readwritePaths": [anchor] },
             "microvm": { "provision": { "memoryMib": memory_mib } }
-        }))
-        .map_err(|error| fail(protocol::REASON_PROTOCOL, error))?;
+        });
+        if self.network_egress {
+            // Outbound is open to everything; inbound and the host's own loopback stay closed,
+            // so the guest can reach the network but nothing on this machine.
+            provision["network"] = if self.ingress_host_loopback {
+                // OpenVMM's one switch for host loopback works both ways: the host reaches the
+                // guest's listeners on its own loopback, and the guest reaches the host's
+                // loopback services through the gateway. Only the first is wanted, so the
+                // gateway is closed to the guest on every port but DNS.
+                let ports = |from: u16, to: u16| {
+                    json!([
+                        { "protocol": "tcp", "port": from, "endPort": to },
+                        { "protocol": "udp", "port": from, "endPort": to }
+                    ])
+                };
+                let mut gateway_ports = ports(1, 52).as_array().unwrap().clone();
+                gateway_ports.extend(ports(54, 65535).as_array().unwrap().clone());
+                json!({
+                    "egress": {
+                        "default": "allow",
+                        "deny": [
+                            { "to": [{ "cidr": GUEST_GATEWAY_V4 }], "ports": gateway_ports.clone() },
+                            { "to": [{ "cidr": GUEST_GATEWAY_V6 }], "ports": gateway_ports }
+                        ]
+                    },
+                    "ingress": { "default": "deny", "hostLoopback": "allow" }
+                })
+            } else {
+                json!({
+                    "egress": { "default": "allow" },
+                    "ingress": { "default": "deny", "hostLoopback": "deny" }
+                })
+            };
+        }
+        let request: ProvisionRequest = serde_json::from_value(provision)
+            .map_err(|error| fail(protocol::REASON_PROTOCOL, error))?;
         let sandbox = self
             .client
             .provision(&request)
@@ -2261,7 +2314,7 @@ impl Context {
 
 /// A request cannot change the mode selected for this sidecar's VM lifecycle.
 /// Validate before any workspace export or VM boot so a refused policy has no effects.
-fn validate_session_policy(head: &Value, isolated: bool) -> Result<(), Failure> {
+fn validate_session_policy(head: &Value, isolated: bool, network_allowed: bool) -> Result<(), Failure> {
     // C++ property_tree writes scalar JSON values as strings. Preserve that
     // wire representation while refusing malformed or truthy policy values.
     let boolean = |value: &Value| match value {
@@ -2279,10 +2332,14 @@ fn validate_session_policy(head: &Value, isolated: bool) -> Result<(), Failure> 
         }
     }
     if let Some(network) = head.get("networkPolicy") {
-        if !isolated || network.as_str() != Some("deny") {
+        // The network is a property of the VM, not of one session: an isolated session either
+        // has its own empty namespace (the VM has no network) or shares the VM's (it has one).
+        // Asking for the other is refused instead of being silently granted.
+        let supported = if network_allowed { "allow" } else { "deny" };
+        if !isolated || network.as_str() != Some(supported) {
             return Err(fail(
                 "E_SESSION_NETWORK_UNSUPPORTED",
-                "isolated sessions currently support only networkPolicy=deny",
+                format!("isolated sessions here support only networkPolicy={supported}"),
             ));
         }
     }
@@ -2307,10 +2364,14 @@ mod session_policy_tests {
             json!({"sessionIsolation": true, "independentKernel": false, "networkPolicy": "deny"}),
             json!({"sessionIsolation": "true", "independentKernel": "false", "networkPolicy": "deny"}),
         ] {
-            assert!(validate_session_policy(&head, true).is_ok());
-            assert!(validate_session_policy(&head, false).is_err());
+            assert!(validate_session_policy(&head, true, false).is_ok());
+            assert!(validate_session_policy(&head, false, false).is_err());
         }
-        assert!(validate_session_policy(&json!({"sessionIsolation": "false"}), false).is_ok());
+        assert!(validate_session_policy(&json!({"sessionIsolation": "false"}), false, false).is_ok());
+        // With a network on the VM the isolated session shares it, and says so.
+        assert!(validate_session_policy(&json!({"networkPolicy": "allow"}), true, true).is_ok());
+        assert!(validate_session_policy(&json!({"networkPolicy": "deny"}), true, true).is_err());
+        assert!(validate_session_policy(&json!({"networkPolicy": "allow"}), true, false).is_err());
     }
 
     #[test]
@@ -2324,7 +2385,7 @@ mod session_policy_tests {
             json!({"networkPolicy": "allow"}),
             json!({"networkPolicy": {"allow": []}}),
         ] {
-            assert!(validate_session_policy(&head, true).is_err());
+            assert!(validate_session_policy(&head, true, false).is_err());
         }
     }
 }

@@ -2702,14 +2702,16 @@ static int handle_app_request(
     case APP_SESSION_OPEN: {
         char workspace[MAX_GUEST_PATH];
         uint64_t id;
+        int share_network = 0;
         if (!config->direct ||
-            guest_session_decode(request->payload, request->payload_len, &id, workspace) != 0) {
+            guest_session_decode(request->payload, request->payload_len, &id, workspace,
+                                 &share_network) != 0) {
             return send_app_error(session, request->request_id, EINVAL, "invalid-request");
         }
         if (mappings->failed || mappings->applied != mappings->expected) {
             return send_app_error(session, request->request_id, EAGAIN, "mappings-incomplete");
         }
-        if (guest_session_create(id, workspace) != 0) {
+        if (guest_session_create(id, workspace, share_network) != 0) {
             return send_app_error(session, request->request_id, errno, "session-create-failed");
         }
         return send_app_frame(session, APP_READY, request->request_id, 0, NULL, 0);

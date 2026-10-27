@@ -238,17 +238,26 @@ int main(int argc, char **argv)
     write_u64(payload + 4, 1);
     write_u32(payload + 12, (uint32_t)strlen(source));
     memcpy(payload + 16, source, strlen(source));
-    CHECK(guest_session_decode(payload, 16 + (uint32_t)strlen(source), &id, decoded) == 0 &&
-          id == 1 && strcmp(decoded, source) == 0, "session-wire");
+    int share_network = -1;
+    CHECK(guest_session_decode(payload, 16 + (uint32_t)strlen(source), &id, decoded,
+                               &share_network) == 0 &&
+          id == 1 && strcmp(decoded, source) == 0 && share_network == 0, "session-wire");
     payload[2] = 1;
-    CHECK(guest_session_decode(payload, 16 + (uint32_t)strlen(source), &id, decoded) < 0,
+    share_network = -1;
+    CHECK(guest_session_decode(payload, 16 + (uint32_t)strlen(source), &id, decoded,
+                               &share_network) == 0 && share_network == 1,
+          "shared-network-policy-decoded");
+    payload[2] = 2;
+    CHECK(guest_session_decode(payload, 16 + (uint32_t)strlen(source), &id, decoded,
+                               &share_network) < 0,
           "unknown-network-policy-refused");
+    payload[2] = 0;
     CHECK(symlink("/etc", "/sessions/symlink") == 0 &&
           guest_session_open_workspace("/sessions/symlink") < 0, "workspace-symlink-refused");
     sentinel = open("/etc/passwd", O_RDONLY);
     CHECK(sentinel >= 0 && fstat(sentinel, &before) == 0, "agent-secret-fd");
-    CHECK(guest_session_create(1, source) == 0, "create-a");
-    CHECK(guest_session_create(2, path_b) == 0, "create-b");
+    CHECK(guest_session_create(1, source, 0) == 0, "create-a");
+    CHECK(guest_session_create(2, path_b, 0) == 0, "create-b");
     if (argc == 2 && strcmp(argv[1], "--scheduler") == 0) {
         CHECK(probe_parallel_slots() == 0, "production-scheduler-two-by-two-cgroups");
     }
@@ -308,8 +317,8 @@ int main(int argc, char **argv)
     CHECK(guest_session_destroy(guest_session_find(1)) == 0, "close-a");
     CHECK(run_in_session(2, "echo b >/tmp/alive; test \"$(cat /tmp/alive)\" = b") == 0,
           "b-survives-a-close");
-    CHECK(guest_session_create(1, source) < 0 && errno == ESTALE, "id-reuse-refused");
-    CHECK(guest_session_create(3, source) == 0, "reopen-new-id");
+    CHECK(guest_session_create(1, source, 0) < 0 && errno == ESTALE, "id-reuse-refused");
+    CHECK(guest_session_create(3, source, 0) == 0, "reopen-new-id");
     CHECK(run_in_session(3,
           "test ! -e /tmp/private; test ! -e /home/session/credentials; "
           "test ! -e /dev/shm/private; test \"$(cat /workspace/owner)\" = workspace") == 0,
@@ -319,17 +328,30 @@ int main(int argc, char **argv)
           !guest_session_broken, "cleanup-all");
     snprintf(command, sizeof(command), "%s/1", GUEST_SESSION_STORE);
     CHECK(access(command, F_OK) < 0 && errno == ENOENT, "session-directories-removed");
-    guest_session_legacy_used = 1;
-    CHECK(guest_session_create(4, source) < 0 && errno == EXDEV, "legacy-migration-refused");
-    guest_session_legacy_used = 0;
-    CHECK(guest_session_create(4, source) == 0, "fault-injection-session");
     {
-        struct guest_session *faulted = guest_session_find(4);
+        /* A session created with a shared network never leaves the VM's own namespace. */
+        char agent_net[64], check[256];
+        ssize_t length = readlink("/proc/self/ns/net", agent_net, sizeof(agent_net) - 1);
+        CHECK(length > 0, "agent-net-namespace");
+        agent_net[length] = '\0';
+        CHECK(guest_session_create(10, source, 1) == 0, "create-shared-network");
+        snprintf(check, sizeof(check),
+                 "test \"$(readlink /proc/self/ns/net)\" = '%s'", agent_net);
+        CHECK(run_in_session(10, check) == 0, "shared-network-is-the-vm-namespace");
+        CHECK(guest_session_destroy(guest_session_find(10)) == 0 && !guest_session_broken,
+              "cleanup-shared-network");
+    }
+    guest_session_legacy_used = 1;
+    CHECK(guest_session_create(11, source, 0) < 0 && errno == EXDEV, "legacy-migration-refused");
+    guest_session_legacy_used = 0;
+    CHECK(guest_session_create(11, source, 0) == 0, "fault-injection-session");
+    {
+        struct guest_session *faulted = guest_session_find(11);
         pid_t keeper = faulted->keeper;
         CHECK(kill(keeper, SIGKILL) == 0, "fault-injection-kill-keeper");
         CHECK(waitpid(keeper, NULL, 0) == keeper, "fault-injection-reap-keeper");
         guest_session_reaped(keeper);
-        CHECK(guest_session_broken && guest_session_find(4)->keeper == 0,
+        CHECK(guest_session_broken && guest_session_find(11)->keeper == 0,
               "keeper-loss-escalates-group-failure");
         guest_session_destroy_all();
     }

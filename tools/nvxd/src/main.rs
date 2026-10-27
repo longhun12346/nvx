@@ -79,6 +79,12 @@ struct Args {
     max_running: usize,
     /// Explicitly use guest session namespaces; unsupported images are rejected.
     session_isolation: bool,
+    /// Give the VM a network interface with unrestricted outbound access (`--network allow`).
+    /// `deny` (the default) leaves the guest with loopback only.
+    network_egress: bool,
+    /// Let the host reach whatever the guest listens on, on host loopback only
+    /// (`--ingress host-loopback`). Needs `--network allow`.
+    ingress_host_loopback: bool,
     /// Requests that may wait for a worker before the caller is refused.
     max_pending: usize,
     /// Workers that run the slow requests (open a session, start an execution).
@@ -116,6 +122,8 @@ fn parse_args() -> Result<Args, String> {
         // while claiming otherwise.
         max_running: MAX_RUNNING,
         session_isolation: false,
+        network_egress: false,
+        ingress_host_loopback: false,
         max_pending: DEFAULT_MAX_PENDING,
         work_workers: DEFAULT_WORK_WORKERS,
         outbound_capacity: outbound::DEFAULT_CAPACITY,
@@ -150,6 +158,22 @@ fn parse_args() -> Result<Args, String> {
                 args.max_running = value()?.parse().map_err(|e| format!("{e}"))?
             }
             "--session-isolation" => args.session_isolation = true,
+            "--ingress" => {
+                args.ingress_host_loopback = match value()?.as_str() {
+                    "host-loopback" => true,
+                    "none" => false,
+                    other => {
+                        return Err(format!("--ingress takes host-loopback or none, not {other:?}"))
+                    }
+                }
+            }
+            "--network" => {
+                args.network_egress = match value()?.as_str() {
+                    "allow" => true,
+                    "deny" => false,
+                    other => return Err(format!("--network takes allow or deny, not {other:?}")),
+                }
+            }
             "--exec-memory-mb" => {
                 args.exec_memory_mb = value()?.parse().map_err(|e| format!("{e}"))?
             }
@@ -198,6 +222,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if args.exec_pids > MAX_EXEC_PIDS {
         return Err(format!("--exec-pids must be at most {MAX_EXEC_PIDS}"));
+    }
+    if args.ingress_host_loopback && !args.network_egress {
+        return Err("--ingress host-loopback needs --network allow".to_string());
     }
     Ok(args)
 }
@@ -257,6 +284,8 @@ fn run() -> Result<(), String> {
         "maxQueue": args.max_queue,
         "maxRunning": args.max_running,
         "sessionIsolation": args.session_isolation,
+        "network": if args.network_egress { "allow" } else { "deny" },
+        "ingress": if args.ingress_host_loopback { "host-loopback" } else { "none" },
         "execLimits": {
             "memMb": args.exec_memory_mb,
             "cpuPercent": args.exec_cpu_percent,
@@ -297,6 +326,8 @@ fn run() -> Result<(), String> {
         args.max_sessions,
         args.max_running,
         args.session_isolation,
+        args.network_egress,
+        args.ingress_host_loopback,
         state_dir.join("export-anchor"),
     ));
 

@@ -22,6 +22,8 @@ struct guest_session {
     uint64_t id;
     pid_t keeper;
     uint32_t uid;
+    /* 1: the session uses the VM's own network namespace (the host asked for a shared network). */
+    int share_network;
     int root_fd;
     int namespace_fds[GUEST_SESSION_NS_COUNT];
     char directory[128];
@@ -84,13 +86,17 @@ static int guest_session_close_fds(int keep_a, int keep_b)
 }
 
 static int guest_session_decode(
-    const uint8_t *payload, uint32_t length, uint64_t *id, char *workspace)
+    const uint8_t *payload, uint32_t length, uint64_t *id, char *workspace,
+    int *share_network)
 {
     uint32_t path_length;
-    if (length < 16 || read_u16(payload) != 1 || read_u16(payload + 2) != 0) {
+    /* Network policy: 0 = private empty namespace, 1 = the VM's own network. Anything else is
+     * a newer policy this guest does not know, and must not be treated as either. */
+    if (length < 16 || read_u16(payload) != 1 || read_u16(payload + 2) > 1) {
         errno = EINVAL;
         return -1;
     }
+    *share_network = read_u16(payload + 2) == 1;
     *id = read_u64(payload + 4);
     path_length = read_u32(payload + 12);
     if (*id == 0 || path_length == 0 || path_length >= MAX_GUEST_PATH ||
@@ -249,6 +255,8 @@ static int guest_session_setup_root(const struct guest_session_start *start)
     close(fd);
     guest_session_setup_stage = "chroot-network";
     if (chroot(".") != 0 || chdir("/") != 0) return -1;
+    /* The VM's own namespace already has its interfaces up; touching them is not ours to do. */
+    if (start->context->share_network) return 0;
     /* A new netns has no external interfaces. Enable only its own loopback. */
     fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
@@ -380,7 +388,7 @@ static int guest_session_destroy(struct guest_session *context)
     return 0;
 }
 
-static int guest_session_create(uint64_t id, const char *workspace)
+static int guest_session_create(uint64_t id, const char *workspace, int share_network)
 {
     size_t i;
     struct guest_session *context = NULL;
@@ -414,6 +422,7 @@ static int guest_session_create(uint64_t id, const char *workspace)
     context->root_fd = -1;
     for (i = 0; i < GUEST_SESSION_NS_COUNT; ++i) context->namespace_fds[i] = -1;
     context->id = id;
+    context->share_network = share_network != 0;
     snprintf(context->source_parent, sizeof(context->source_parent), "%s", workspace);
     *strrchr(context->source_parent, '/') = '\0';
     context->uid = guest_session_next_uid++;
@@ -432,7 +441,8 @@ static int guest_session_create(uint64_t id, const char *workspace)
     start.workspace_fd = source;
     start.workspace_path = workspace;
     context->keeper = clone(guest_session_keeper, (char *)stack + GUEST_SESSION_STACK,
-        CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNET | CLONE_NEWPID | SIGCHLD,
+        CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWPID | SIGCHLD |
+            (context->share_network ? 0 : CLONE_NEWNET),
         &start);
     result = context->keeper < 0 ? errno : 0;
     munmap(stack, GUEST_SESSION_STACK);
@@ -480,6 +490,8 @@ static int guest_session_enter(
     pid_t child;
     int status;
     for (i = 0; i < GUEST_SESSION_NS_COUNT; ++i) {
+        /* A shared network means the session never left the VM's own namespace. */
+        if (context->share_network && guest_session_ns_flags[i] == CLONE_NEWNET) continue;
         if (setns(context->namespace_fds[i], guest_session_ns_flags[i]) != 0) return -1;
     }
     if (fchdir(context->root_fd) != 0 || chroot(".") != 0 || chdir("/") != 0)

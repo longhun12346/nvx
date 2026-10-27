@@ -33,10 +33,14 @@ pub const DEFAULT_FINISHED_RETENTION: usize = 256;
 
 /// How long a cancel that arrived before its start is remembered. A start that turns up
 /// afterwards must not run, and one query that finds nothing proves nothing.
-pub const CANCEL_TOMBSTONE_TTL: Duration = Duration::from_secs(600);
+///
+/// An hour is far beyond how late a start can be: the host bounds a `exec` call by its write
+/// deadline and the request deadline, both of them seconds to minutes. The margin is for a
+/// host that retries or a transport that stalls, and costs only a few KiB of memory.
+pub const CANCEL_TOMBSTONE_TTL: Duration = Duration::from_secs(3600);
 
 /// Bounded, so a caller cancelling invented ids cannot grow the sidecar without limit.
-pub const MAX_CANCEL_TOMBSTONES: usize = 256;
+pub const MAX_CANCEL_TOMBSTONES: usize = 4096;
 
 /// Where an execution is. `Queued` owns no run slot; `Running` owns the VM's only one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -536,6 +540,12 @@ impl Registry {
     }
 
     /// Closes a session: refuses it new work and takes away everything it already owns.
+    ///
+    /// Every running execution is marked cancel-requested *here, under the same lock that
+    /// removes the session*. The caller stops whatever process already exists; one that is still
+    /// being started has no canceller to reach yet and relies on this flag, which its worker
+    /// reads right after it registers the canceller. Without the flag that execution would run to
+    /// completion inside a session that no longer exists.
     pub fn close_session(&mut self, name: &str) -> Closed {
         let Some(mut entry) = self.sessions.remove(name) else {
             return Closed::default();
@@ -543,7 +553,7 @@ impl Registry {
         entry.closing = true;
         let mut closed = Closed::default();
         for id in entry.execs {
-            let Some(exec) = self.execs.get(&id) else {
+            let Some(exec) = self.execs.get_mut(&id) else {
                 continue;
             };
             match exec.phase {
@@ -552,7 +562,10 @@ impl Registry {
                     let _ = self.finish(&id, terminal);
                     closed.cancelled_queued.push(id);
                 }
-                Phase::Running => closed.running.push(id),
+                Phase::Running => {
+                    exec.cancel_requested = true;
+                    closed.running.push(id);
+                }
             }
         }
         closed
@@ -594,6 +607,19 @@ impl Registry {
         }
         self.tombstones.insert(id.to_owned(), now);
         self.tombstone_order.push_back(id.to_owned());
+        // Records past their lifetime go first; the count cap only bites on a burst of ids.
+        while let Some(oldest) = self.tombstone_order.front() {
+            let expired = self
+                .tombstones
+                .get(oldest)
+                .is_none_or(|recorded| now.saturating_duration_since(*recorded) > CANCEL_TOMBSTONE_TTL);
+            if !expired {
+                break;
+            }
+            if let Some(oldest) = self.tombstone_order.pop_front() {
+                self.tombstones.remove(&oldest);
+            }
+        }
         while self.tombstone_order.len() > MAX_CANCEL_TOMBSTONES {
             if let Some(oldest) = self.tombstone_order.pop_front() {
                 self.tombstones.remove(&oldest);
@@ -609,6 +635,16 @@ impl Registry {
         };
         self.tombstone_order.retain(|known| known != id);
         now.saturating_duration_since(recorded) <= CANCEL_TOMBSTONE_TTL
+    }
+
+    /// Whether a cancel for this id was recorded before any start for it arrived, and is still
+    /// remembered. Unlike [`Self::cancel_tombstone`] this does not consume the record: it
+    /// answers `exec.status`, where "cancelled before it arrived, will never run" is a
+    /// different fact from "never heard of it".
+    pub fn cancelled_before_start(&self, id: &str) -> bool {
+        self.tombstones
+            .get(id)
+            .is_some_and(|recorded| Instant::now().saturating_duration_since(*recorded) <= CANCEL_TOMBSTONE_TTL)
     }
 
     #[cfg(test)]
@@ -916,6 +952,66 @@ mod tests {
         );
         assert_eq!(registry.queued_len(), 0);
         assert_eq!(registry.dispatch_one(), None, "a cancelled id never runs");
+    }
+
+    /// `exec.status` must be able to tell "cancelled before it arrived" from "never heard of
+    /// it", and asking must not use the record up.
+    #[test]
+    fn a_remembered_cancel_is_visible_without_being_consumed() {
+        let mut registry = registry();
+        open(&mut registry, "A");
+
+        assert!(!registry.cancelled_before_start("A1"), "nothing recorded yet");
+        assert_eq!(registry.cancel("A1"), Cancel::Unknown);
+        assert!(registry.cancelled_before_start("A1"));
+        assert!(registry.cancelled_before_start("A1"), "asking twice changes nothing");
+        assert_eq!(registry.accept("A", "A1", DIGEST, 0, None), Accept::Cancelled);
+        assert!(
+            !registry.cancelled_before_start("A1"),
+            "the late start consumed the record"
+        );
+    }
+
+    #[test]
+    fn remembered_cancels_are_bounded_and_expire() {
+        let mut registry = registry();
+        let start = Instant::now();
+        for index in 0..MAX_CANCEL_TOMBSTONES + 10 {
+            registry.remember_tombstone(&format!("x{index}"), start);
+        }
+        assert_eq!(registry.tombstones.len(), MAX_CANCEL_TOMBSTONES);
+        assert!(!registry.tombstones.contains_key("x0"), "the oldest is evicted first");
+        assert!(registry
+            .tombstones
+            .contains_key(&format!("x{}", MAX_CANCEL_TOMBSTONES + 9)));
+
+        // Past their lifetime the old records are dropped when a new one is added.
+        let later = start + CANCEL_TOMBSTONE_TTL + Duration::from_secs(1);
+        registry.remember_tombstone("fresh", later);
+        assert_eq!(registry.tombstones.len(), 1);
+        assert!(registry.tombstones.contains_key("fresh"));
+        assert!(!registry.cancel_tombstone("gone", later), "an unknown id has no record");
+    }
+
+    /// A start already in `client.exec` has no canceller yet. Closing its session must leave the
+    /// request where that worker reads it, under the same lock that removed the session.
+    #[test]
+    fn closing_a_session_marks_a_running_execution_cancelled_before_it_has_a_canceller() {
+        let mut registry = registry();
+        open(&mut registry, "A");
+        accept(&mut registry, "A", "A1");
+        accept(&mut registry, "A", "A2");
+        assert_eq!(registry.dispatch_one().as_deref(), Some("A1"));
+        assert!(!registry.cancel_requested("A1"));
+
+        let closed = registry.close_session("A");
+
+        assert_eq!(closed.running, ["A1"]);
+        assert_eq!(closed.cancelled_queued, ["A2"]);
+        assert!(
+            registry.cancel_requested("A1"),
+            "the worker finds the request when it registers its canceller"
+        );
     }
 
     /// Ids from a replaced VM instance must not resolve against the new one.

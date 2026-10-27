@@ -1296,6 +1296,16 @@ impl Context {
         } {
             request = request.with_guest_session(guest_session);
         }
+        // A session closed (or the caller cancelled) while this execution was being prepared:
+        // nothing has been started yet, so it simply does not start.
+        let cancelled_early = {
+            let inner = self.inner.lock().unwrap();
+            inner.registry.cancel_requested(id)
+        };
+        if cancelled_early {
+            self.finish_and_emit(id, Terminal::new("cancelled", None, "cancelled before it started"));
+            return;
+        }
         vm.touch();
         let mut execution = match self.client.exec(&vm.sandbox, &request) {
             Ok(execution) => execution,
@@ -1308,23 +1318,18 @@ impl Context {
                 return;
             }
         };
-        {
-            let mut inner = self.inner.lock().unwrap();
-            inner.cancels.insert(id.to_owned(), execution.canceller());
-        }
-        // A cancel may have arrived while the process was being started; honour it now.
+        // Registering the canceller and reading the cancel request is one step under the lock.
+        // A cancel or a session close that came earlier left its flag in the registry and is
+        // seen here; one that comes later finds the canceller. Done in two steps, a cancel
+        // landing between them could find neither and be lost.
+        let canceller = execution.canceller();
         let cancel_requested = {
-            let inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap();
+            inner.cancels.insert(id.to_owned(), canceller.clone());
             inner.registry.cancel_requested(id)
         };
         if cancel_requested {
-            let canceller = {
-                let inner = self.inner.lock().unwrap();
-                inner.cancels.get(id).cloned()
-            };
-            if let Some(canceller) = canceller {
-                let _ = canceller.cancel();
-            }
+            let _ = canceller.cancel();
         }
         let (session, generation) = {
             let inner = self.inner.lock().unwrap();
@@ -1975,7 +1980,15 @@ impl Context {
                 "code": terminal.code,
                 "detail": terminal.detail,
             })),
-            // Not found is not a proof that a late start will never arrive.
+            // Two different "nothing running": a cancel that arrived first is remembered, and the
+            // start it overtook will be refused, so the caller may stop waiting for it. A plain
+            // `unknown` (no flag) is not that proof: a start that is still in flight can arrive
+            // later and run.
+            None if inner.registry.cancelled_before_start(id) => Ok(json!({
+                "execId": id,
+                "state": "unknown",
+                "cancelledBeforeStart": true,
+            })),
             None => Ok(json!({"execId": id, "state": "unknown"})),
         }
     }

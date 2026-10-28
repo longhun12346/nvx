@@ -6,6 +6,7 @@
 //! `--repo`, which is a development convenience), and the CPU profile is a required setting.
 //! Nothing is read from the environment, so what a VM runs with is what the caller configured.
 
+mod capability;
 mod control;
 mod frame;
 mod outbound;
@@ -58,6 +59,10 @@ struct Args {
     cpu_profile: Option<CpuProfile>,
     hypervisor: Option<Hypervisor>,
     state_dir: PathBuf,
+    /// Where the outcome of the capability check (a real boot of a small VM) is remembered across
+    /// runs. The default is under the user's local application data; `--capability-cache none`
+    /// keeps nothing, so every run boots the probe VM.
+    capability_cache: Option<PathBuf>,
     /// Seconds a session may sit idle before its VMM working set is trimmed; 0 turns it off.
     idle_trim_secs: u64,
     /// Seconds an idle session may live before it is closed; 0 keeps sessions open.
@@ -116,6 +121,8 @@ fn parse_args() -> Result<Args, String> {
         cpu_profile: None,
         hypervisor: None,
         state_dir: std::env::temp_dir().join(format!("nvxd-{}", std::process::id())),
+        capability_cache: std::env::var_os("LOCALAPPDATA")
+            .map(|root| PathBuf::from(root).join("nvxd").join("capability.json")),
         idle_trim_secs: 30,
         session_ttl_secs: 0,
         max_sessions: 0,
@@ -153,6 +160,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--hypervisor" => args.hypervisor = Some(value()?.parse().map_err(|e| format!("{e}"))?),
             "--state-dir" => args.state_dir = PathBuf::from(value()?),
+            "--capability-cache" => {
+                let text = value()?;
+                args.capability_cache = (text != "none").then(|| PathBuf::from(text));
+            }
             "--max-sessions" => {
                 args.max_sessions = value()?.parse().map_err(|e| format!("{e}"))?
             }
@@ -316,6 +327,28 @@ fn run() -> Result<(), String> {
     let _ = std::fs::remove_dir_all(&state_dir);
     let request_root = args.state_dir.join("requests");
     std::fs::create_dir_all(&request_root).map_err(|e| e.to_string())?;
+    let capability = {
+        let mut artifact_paths: Vec<&std::path::Path> =
+            vec![&artifacts.openvmm, &artifacts.kernel, &artifacts.initrd];
+        if let Some(distro) = &artifacts.distro {
+            artifact_paths.push(distro);
+        }
+        capability::Capability::new(
+            args.capability_cache.clone(),
+            capability::fingerprint(
+                &artifact_paths,
+                &format!(
+                    "{}|{}|{}|{}|{}|{}",
+                    cpu_profile.as_str(),
+                    args.network_egress,
+                    args.ingress_host_loopback,
+                    args.private_networks_allow,
+                    args.session_isolation,
+                    protocol::VERSION,
+                ),
+            ),
+        )
+    };
     let mut config =
         OpenVmmConfig::from_artifacts(artifacts, hypervisor, args.state_dir.join("state"));
     config.cpu_profile = cpu_profile;
@@ -345,7 +378,14 @@ fn run() -> Result<(), String> {
         args.ingress_host_loopback,
         args.private_networks_allow,
         state_dir.join("export-anchor"),
+        capability,
     ));
+    // Find out whether this machine can boot the VM while the caller is still starting up, so
+    // its first `probe` finds the answer instead of paying for the boot.
+    {
+        let context = Arc::clone(&context);
+        std::thread::spawn(move || context.check_capability());
+    }
 
     // One maintenance tick for everything time-based. It runs even with trimming and TTL off,
     // because a queued execution past its own deadline has to be reported either way; the

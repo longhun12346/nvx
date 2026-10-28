@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::capability::Capability;
+use crate::capability::Verdict;
 use aci_edge_sandboxes::nvx::host::filesystem::resolve_guest_path;
 use aci_edge_sandboxes::nvx::host::poc_live::LiveShare;
 use aci_edge_sandboxes::nvx::protocol::ExecLimits;
@@ -40,6 +42,9 @@ use crate::registry::{Accept, Cancel, Closed, Registry, Terminal};
 use crate::winmem::VmmMemory;
 
 const SHARE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `probe` waits for the capability check unless the caller names a bound. Long enough
+/// for the first check on a machine to boot its small VM.
+const PROBE_WAIT: Duration = Duration::from_secs(30);
 /// How long a close waits for the session's running execution to be cleaned up before it
 /// reports `closing` and keeps the responsibility in the background.
 const CLOSE_WAIT: Duration = Duration::from_secs(5);
@@ -84,6 +89,20 @@ fn fail(code: &'static str, message: impl ToString) -> Failure {
 
 /// A failed provision or start of the VM, with the cause named in the code: see
 /// [`protocol::classify_start_failure`]. The message stays the backend's own text.
+/// The start failure code a remembered verdict names, or the unclassified one.
+fn known_start_code(code: &str) -> &'static str {
+    [
+        protocol::REASON_START_ASSET,
+        protocol::REASON_START_VMM_EXIT,
+        protocol::REASON_START_TIMEOUT,
+        protocol::REASON_START_CONTROL,
+        protocol::REASON_START_HYPERVISOR,
+    ]
+    .into_iter()
+    .find(|known| *known == code)
+    .unwrap_or(protocol::REASON_START)
+}
+
 fn start_failure(error: &aci_edge_sandboxes::Error) -> Failure {
     fail(
         protocol::classify_start_failure(error.nvx_kind(), error.message()),
@@ -278,6 +297,8 @@ pub struct Context {
     /// Empty directory provisioned with every VM so the virtio-fs device (and therefore the
     /// export channel) exists before the first session's workspace is exported.
     export_anchor: PathBuf,
+    /// Whether this machine can boot the VM at all, learned by booting a small one once.
+    capability: Capability,
     /// Serialises VM creation and retirement against session open and close, so two opens
     /// cannot both decide to boot a VM.
     lifecycle: Mutex<()>,
@@ -313,6 +334,7 @@ impl Context {
         ingress_host_loopback: bool,
         private_networks_allow: bool,
         export_anchor: PathBuf,
+        capability: Capability,
     ) -> Self {
         Self {
             backend,
@@ -328,6 +350,7 @@ impl Context {
             private_networks_allow,
             allocated_ports: Mutex::new(std::collections::VecDeque::new()),
             export_anchor,
+            capability,
             lifecycle: Mutex::new(()),
             removals_lock: Mutex::new(()),
             vm: Mutex::new(None),
@@ -490,6 +513,12 @@ impl Context {
             protocol::OP_PROBE => self
                 .client
                 .probe()
+                .map_err(|error| fail(protocol::REASON_BACKEND_UNAVAILABLE, error))
+                .and_then(|()| {
+                    // A caller may bound how long it waits for the first, slow check.
+                    let wait = number(head.get("waitMs")).map_or(PROBE_WAIT, Duration::from_millis);
+                    self.ensure_capable(Some(wait))
+                })
                 .map(|()| {
                     let inner = self.inner.lock().unwrap();
                     let generation = inner.registry.generation();
@@ -514,8 +543,7 @@ impl Context {
                                "sessionIsolation": self.session_isolation
                                    && features & GUEST_FEATURE_SESSION_ISOLATION != 0,
                            }})
-                })
-                .map_err(|error| fail(protocol::REASON_BACKEND_UNAVAILABLE, error)),
+                }),
             protocol::OP_SESSION_OPEN => {
                 validate_session_policy(head, self.session_isolation, self.network_egress)?;
                 let memory = match head.get("memoryMiB") {
@@ -1024,6 +1052,60 @@ impl Context {
     /// provisioned with at least one path. The anchor is empty on purpose: the guest may read
     /// it, so it must never hold the sidecar's state or capability.
     fn boot_vm(&self, name: &str, _workspace: &str, memory_mib: u32) -> Result<Arc<Vm>, Failure> {
+        self.ensure_capable(None)?;
+        let request = self.provision_request(memory_mib)?;
+        let sandbox = self
+            .client
+            .provision(&request)
+            .map_err(|error| start_failure(&error))?
+            .sandbox_id;
+        self.start_vm(name, sandbox)
+    }
+
+    /// Runs the capability check now; the answer is kept for `probe` and for the first boot.
+    pub fn check_capability(&self) {
+        if let Err(failure) = self.ensure_capable(None) {
+            eprintln!(
+                "nvxd: capability check failed: {} {}",
+                failure.code, failure.message
+            );
+        }
+    }
+
+    /// Whether this machine can boot the VM, found out once by booting a small one. `None` waits
+    /// for an unfinished check; `Some` gives up after that long with `E_NVX_CAPABILITY_PENDING`.
+    fn ensure_capable(&self, wait: Option<Duration>) -> Result<(), Failure> {
+        match self.capability.resolve(wait, &|| {
+            self.boot_probe()
+                .map_err(|failure| (failure.code.to_owned(), failure.message))
+        }) {
+            Some(Verdict::Capable) => Ok(()),
+            Some(Verdict::Incapable { code, message }) => Err(fail(
+                known_start_code(&code),
+                format!("this machine cannot boot the microVM: {message}"),
+            )),
+            None => Err(fail(
+                protocol::REASON_CAPABILITY_PENDING,
+                "the capability check is still running",
+            )),
+        }
+    }
+
+    /// Boots the smallest VM and stops it again. Runs the same provision and start as a session
+    /// would, so whatever stops a session's VM from booting stops this one too.
+    fn boot_probe(&self) -> Result<(), Failure> {
+        let request = self.provision_request(protocol::MIN_MEMORY_MIB as u32)?;
+        let sandbox = self
+            .client
+            .provision(&request)
+            .map_err(|error| start_failure(&error))?
+            .sandbox_id;
+        let started = self.client.start(&sandbox);
+        let _ = self.client.deprovision(&sandbox);
+        started.map(|_| ()).map_err(|error| start_failure(&error))
+    }
+
+    fn provision_request(&self, memory_mib: u32) -> Result<ProvisionRequest, Failure> {
         std::fs::create_dir_all(&self.export_anchor)
             .map_err(|error| fail(protocol::REASON_PROTOCOL, error))?;
         let anchor = self.export_anchor.display().to_string();
@@ -1042,13 +1124,11 @@ impl Context {
         ) {
             provision["network"] = network;
         }
-        let request: ProvisionRequest = serde_json::from_value(provision)
-            .map_err(|error| fail(protocol::REASON_PROTOCOL, error))?;
-        let sandbox = self
-            .client
-            .provision(&request)
-            .map_err(|error| start_failure(&error))?
-            .sandbox_id;
+        serde_json::from_value(provision).map_err(|error| fail(protocol::REASON_PROTOCOL, error))
+    }
+
+    /// Starts the provisioned sandbox and registers it as the shared VM.
+    fn start_vm(&self, name: &str, sandbox: SandboxId) -> Result<Arc<Vm>, Failure> {
         let started = match self.client.start(&sandbox) {
             Ok(started) => started,
             Err(error) => {

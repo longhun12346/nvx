@@ -78,6 +78,9 @@ pub const REASON_START_CONTROL: &str = "E_BACKEND_START_CONTROL";
 /// The hypervisor (Windows Hypervisor Platform) is missing or reports that none is present.
 pub const REASON_START_HYPERVISOR: &str = "E_BACKEND_START_HYPERVISOR";
 
+/// The machine's capability check (a real boot of a small VM) has not finished yet.
+pub const REASON_CAPABILITY_PENDING: &str = "E_NVX_CAPABILITY_PENDING";
+
 /// Names the reason a VM did not come up. Every code it returns means the machine or the VM
 /// image cannot boot, as opposed to one session's request being refused, so a caller may treat
 /// the whole family (`E_BACKEND_START*`) as "do not keep retrying this VM".

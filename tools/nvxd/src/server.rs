@@ -1094,7 +1094,7 @@ impl Context {
     /// Boots the smallest VM and stops it again. Runs the same provision and start as a session
     /// would, so whatever stops a session's VM from booting stops this one too.
     fn boot_probe(&self) -> Result<(), Failure> {
-        let request = self.provision_request(protocol::MIN_MEMORY_MIB as u32)?;
+        let request = self.provision_request(protocol::PROBE_MEMORY_MIB)?;
         let sandbox = self
             .client
             .provision(&request)

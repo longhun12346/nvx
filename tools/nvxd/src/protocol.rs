@@ -78,6 +78,11 @@ pub const REASON_START_CONTROL: &str = "E_BACKEND_START_CONTROL";
 /// The hypervisor (Windows Hypervisor Platform) is missing or reports that none is present.
 pub const REASON_START_HYPERVISOR: &str = "E_BACKEND_START_HYPERVISOR";
 
+/// Guest memory of the VM that the capability check boots, in MiB. It only has to reach "ready",
+/// so it is far below [`MIN_MEMORY_MIB`], which exists for the workloads sessions run. Measured
+/// on Windows 11 and Windows 10: the guest boots down to 64 MiB and fails at 32.
+pub const PROBE_MEMORY_MIB: u32 = 128;
+
 /// The machine's capability check (a real boot of a small VM) has not finished yet.
 pub const REASON_CAPABILITY_PENDING: &str = "E_NVX_CAPABILITY_PENDING";
 

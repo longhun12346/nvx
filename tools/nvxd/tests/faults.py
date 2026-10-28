@@ -384,7 +384,10 @@ def case_stalled_reader(nvxd, repo, initrd, root):
             "argv": ["python3", "-c",
                      "import sys\nchunk='x'*32768\nfor _ in range(256): sys.stdout.write(chunk)\nsys.stdout.flush()"],
         })
-        time.sleep(3)
+        # Long enough for a freshly booted guest to start python and produce the output even on a
+        # busy host: a shorter wait made this case fail when the guest was merely slow, without
+        # the queue ever having been tested.
+        time.sleep(15)
         # Reading resumes: whatever was dropped, the sidecar must still be here and answering.
         send_frame(process.stdin, {"id": 3, "op": "diagnostics"})
         deadline = time.monotonic() + 120

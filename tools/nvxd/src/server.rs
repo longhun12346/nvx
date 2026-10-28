@@ -1101,6 +1101,10 @@ impl Context {
             .map_err(|error| start_failure(&error))?
             .sandbox_id;
         let started = self.client.start(&sandbox);
+        if started.is_ok() {
+            // A started VM must be stopped before it is deprovisioned, or its VMM keeps running.
+            let _ = self.client.stop(&sandbox);
+        }
         let _ = self.client.deprovision(&sandbox);
         started.map(|_| ()).map_err(|error| start_failure(&error))
     }

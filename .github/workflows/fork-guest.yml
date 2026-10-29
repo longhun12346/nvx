@@ -9,13 +9,13 @@ name: Fork guest assets
 # the guest's python3.14 (scripts/nvx_tools/ubuntu.py), so the Docker target cannot build them.
 #
 # verify-guest-determinism is not run: it builds the artifacts twice in one process and the second build
-# differs in its .pyc files (see the productization plan), so a failure there would say nothing new.
+# differs in its .pyc files. The Ubuntu artifacts of two separate runs of this workflow were identical;
+# the kernel was not.
 
 on:
   push:
     branches:
       - productization
-      - ci-guest-test
     paths:
       - kernel/**
       - guest/**

@@ -173,6 +173,22 @@ jobs:
           restore-keys: |
             fork-package-${{ runner.os }}-${{ steps.rust.outputs.channel }}-
 
+      # OpenVMM's cargo config points PROTOC at a package that its own tooling restores; the release
+      # binary needs protoc, so install the same release (27.1) directly and let PROTOC override it.
+      - name: Install protoc 27.1
+        run: |
+          set -euo pipefail
+          zip="${RUNNER_TEMP}/protoc.zip"
+          curl --fail --location --silent --show-error \
+            --output "${zip}" \
+            https://github.com/protocolbuffers/protobuf/releases/download/v27.1/protoc-27.1-win64.zip
+          echo "da531c51ccd1290d8d34821f0ce4e219c7fbaa6f9825f5a3fb092a9d03fe6206 *${zip}" | sha256sum --check
+          dir="${RUNNER_TEMP}/protoc"
+          mkdir -p "${dir}"
+          unzip -q "${zip}" -d "${dir}"
+          echo "PROTOC=$(cygpath -w "${dir}/bin/protoc.exe")" >> "${GITHUB_ENV}"
+          echo "PROTOC_INCLUDE=$(cygpath -w "${dir}/include")" >> "${GITHUB_ENV}"
+
       - name: Build openvmm and the probe helper (release)
         working-directory: openvmm
         run: >

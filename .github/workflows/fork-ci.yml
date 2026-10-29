@@ -134,3 +134,86 @@ jobs:
       - name: Check that the probe helper was produced
         working-directory: openvmm
         run: test -f target/debug/whp-legacy-cpuid-probe.exe
+
+  package:
+    name: 64-bit Windows binaries / windows
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout (with the OpenVMM submodule)
+        uses: actions/checkout@v5
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Install the pinned Rust release for x86_64
+        id: rust
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "${channel}"
+          rustup toolchain install "${channel}" --profile minimal
+          host=$(rustc "+${channel}" -vV | sed -n 's/^host: //p')
+          test "${host}" = "x86_64-pc-windows-msvc"
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            openvmm/target/release
+            tools/nvxd/target/release
+          key: fork-package-${{ runner.os }}-${{ steps.rust.outputs.channel }}-${{ hashFiles('openvmm/Cargo.lock', 'tools/nvxd/Cargo.lock', 'nvx-rs/Cargo.lock') }}
+          restore-keys: |
+            fork-package-${{ runner.os }}-${{ steps.rust.outputs.channel }}-
+
+      - name: Build openvmm and the probe helper (release)
+        working-directory: openvmm
+        run: >
+          cargo "+${{ steps.rust.outputs.channel }}" build --locked --release
+          -p openvmm --bin openvmm -p whp --bin whp-legacy-cpuid-probe
+
+      - name: Build nvxd (release)
+        working-directory: tools/nvxd
+        run: >
+          cargo "+${{ steps.rust.outputs.channel }}" build --locked --release
+
+      - name: Collect the binaries and prove they are 64-bit
+        run: |
+          set -euo pipefail
+          out=dist/nvx-windows-x64
+          mkdir -p "${out}"
+          cp openvmm/target/release/openvmm.exe "${out}/"
+          cp openvmm/target/release/whp-legacy-cpuid-probe.exe "${out}/"
+          cp tools/nvxd/target/release/nvxd.exe "${out}/"
+          cp LICENSE THIRD_PARTY_NOTICES.md "${out}/"
+          # PE header: the machine field must be 0x8664 (x86-64) in every executable.
+          for exe in "${out}"/*.exe; do
+            offset=$(od -An -tu4 -j60 -N4 "${exe}" | tr -d ' ')
+            machine=$(od -An -tx2 -j$((offset + 4)) -N2 "${exe}" | tr -d ' ')
+            echo "${exe}: PE machine 0x${machine}"
+            test "${machine}" = "8664"
+          done
+          (cd "${out}" && sha256sum *.exe > SHA256SUMS && cat SHA256SUMS)
+          {
+            echo "nvx_revision=$(git rev-parse HEAD)"
+            echo "openvmm_revision=$(git -C openvmm rev-parse HEAD)"
+            echo "rust=${{ steps.rust.outputs.channel }}"
+            echo "target=x86_64-pc-windows-msvc"
+          } > "${out}/BUILD-INFO.txt"
+          cat "${out}/BUILD-INFO.txt"
+
+      - name: Upload the 64-bit Windows binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: nvx-windows-x64
+          path: dist/nvx-windows-x64
+          if-no-files-found: error
+          retention-days: 30
+

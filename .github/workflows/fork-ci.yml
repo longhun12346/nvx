@@ -1,0 +1,136 @@
+name: Fork CI
+
+# CI for what this fork adds to NVX: the nvxd sidecar and the OpenVMM changes it
+# relies on (Windows 10 WHP compatibility, pipe readiness). The upstream workflows in this
+# directory only run for the `dev` branch and need self-hosted runners and secrets this fork does
+# not have, so this one stands on its own: GitHub-hosted runners, no secrets.
+#
+# Nothing here boots a VM (GitHub-hosted runners have no hypervisor). VM acceptance is the P8 gate,
+# sandbox/tools/nvx-runtime/verify-nvx-vm.ps1 in the engine repository, run on a WHP machine.
+
+on:
+  push:
+    branches:
+      - productization
+  pull_request:
+    branches:
+      - productization
+  workflow_dispatch:
+
+concurrency:
+  group: fork-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  sidecar:
+    name: nvxd / windows
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+        working-directory: tools/nvxd
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust release
+        id: rust
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' ../../rust-toolchain.toml)
+          test -n "${channel}"
+          rustup toolchain install "${channel}" --profile minimal --component clippy,rustfmt
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            tools/nvxd/target
+          key: nvxd-${{ runner.os }}-${{ steps.rust.outputs.channel }}-${{ hashFiles('tools/nvxd/Cargo.lock', 'aci_edge_sandboxes/Cargo.lock', 'nvx-rs/Cargo.lock') }}
+          restore-keys: |
+            nvxd-${{ runner.os }}-${{ steps.rust.outputs.channel }}-
+
+      - name: Build
+        run: cargo "+${{ steps.rust.outputs.channel }}" build --locked --release
+
+      - name: Test
+        run: cargo "+${{ steps.rust.outputs.channel }}" test --locked --release
+
+      # The crate was not formatted or linted before this workflow existed, so these two report
+      # without failing the run until the existing findings are cleaned up in a commit of their own.
+      - name: Check formatting (report only)
+        continue-on-error: true
+        run: cargo "+${{ steps.rust.outputs.channel }}" fmt --check
+
+      - name: Lint (report only)
+        continue-on-error: true
+        run: cargo "+${{ steps.rust.outputs.channel }}" clippy --locked --release --all-targets
+
+  openvmm:
+    name: OpenVMM Windows changes / windows
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout (with the OpenVMM submodule)
+        uses: actions/checkout@v5
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: Show the pinned OpenVMM revision
+        run: git submodule status openvmm
+
+      - name: Install the pinned Rust release
+        id: rust
+        working-directory: openvmm
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' ../rust-toolchain.toml)
+          test -n "${channel}"
+          rustup toolchain install "${channel}" --profile minimal
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            openvmm/target
+          key: fork-openvmm-${{ runner.os }}-${{ steps.rust.outputs.channel }}-${{ hashFiles('openvmm/Cargo.lock') }}
+          restore-keys: |
+            fork-openvmm-${{ runner.os }}-${{ steps.rust.outputs.channel }}-
+
+      # The pipe readiness fix: a read of an empty pipe must be woken by data that arrives later.
+      - name: Test the pipe readiness handling
+        working-directory: openvmm
+        run: cargo "+${{ steps.rust.outputs.channel }}" test --locked -p pal_async pipe
+
+      # The Windows 10 compatibility path and the doorbell probe: they must build, and the probe
+      # helper that ships next to openvmm.exe must exist. The probe itself needs a hypervisor and
+      # is exercised on a real machine.
+      - name: Build the WHP crates and the probe helper
+        working-directory: openvmm
+        run: cargo "+${{ steps.rust.outputs.channel }}" build --locked -p whp -p virt_whp --bin whp-legacy-cpuid-probe
+
+      - name: Check that the probe helper was produced
+        working-directory: openvmm
+        run: test -f target/debug/whp-legacy-cpuid-probe.exe

@@ -1,0 +1,113 @@
+name: Fork guest assets
+
+# Builds the guest assets the nvxd sidecar boots: the Linux kernel, the Ubuntu initramfs, the thin stage
+# initramfs and the EROFS distro layer. Runs on its own so that the heavier binary build in fork-ci.yml
+# does not rerun for a guest-only change, and can be started by hand (workflow_dispatch).
+#
+# The kernel is built in Docker, as the upstream workflows do. The Ubuntu parts are built natively: the
+# Docker base image carries Python 3.11, and the builder needs a final-release Python 3.14 to byte-compile
+# the guest's python3.14 (scripts/nvx_tools/ubuntu.py), so the Docker target cannot build them.
+#
+# verify-guest-determinism is not run: it builds the artifacts twice in one process and the second build
+# differs in its .pyc files (see the productization plan), so a failure there would say nothing new.
+
+on:
+  push:
+    branches:
+      - productization
+      - ci-guest-test
+    paths:
+      - kernel/**
+      - guest/**
+      - ubuntu/**
+      - docker/**
+      - SOURCE-MANIFEST.json
+      - scripts/nvx.py
+      - scripts/nvx_tools/**
+      - .github/workflows/fork-guest.yml
+  workflow_dispatch:
+
+concurrency:
+  group: fork-guest-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  guest:
+    name: Guest assets / ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Build the Linux kernel (Docker)
+        run: >
+          docker build --file docker/Dockerfile --target kernel-artifacts
+          --output type=local,dest=build .
+
+      - name: Install a final-release Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install the EROFS, zstd and musl tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends zstd erofs-utils musl-tools
+          mkfs.erofs --version || true
+          python3 --version
+
+      - name: Build the Ubuntu initramfs, distro layer and stage initramfs
+        run: |
+          set -euo pipefail
+          python3 scripts/nvx.py build-initramfs --guest ubuntu
+          python3 scripts/nvx.py build-distro-layer --guest ubuntu --output build/ubuntu-distro.erofs
+          python3 scripts/nvx.py build-stage-initramfs --guest ubuntu
+
+      - name: Collect the assets the sidecar uses
+        run: |
+          set -euo pipefail
+          out=dist/nvx-guest-assets
+          mkdir -p "${out}"
+          for file in vmlinux vmlinux.config vmlinux.provenance.json \
+              initramfs-ubuntu-stage.cpio.gz initramfs-ubuntu-stage.cpio.gz.manifest.json \
+              ubuntu-distro.erofs ubuntu-distro.erofs.manifest.json \
+              initramfs-ubuntu.cpio.gz initramfs-ubuntu.cpio.gz.packages.json; do
+            cp "build/${file}" "${out}/"
+          done
+          (cd "${out}" && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          {
+            echo "nvx_revision=$(git rev-parse HEAD)"
+            echo "python=$(python3 --version)"
+            echo "mkfs_erofs=$(mkfs.erofs --version 2>&1 | head -1)"
+            echo "built_by=github-actions"
+          } > "${out}/GUEST-INFO.txt"
+          cat "${out}/GUEST-INFO.txt"
+          cat build/vmlinux.provenance.json
+
+      # The checksums and manifests are small; they can be read without downloading the 200 MB of images.
+      - name: Upload the guest asset metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: nvx-guest-meta
+          path: |
+            dist/nvx-guest-assets/SHA256SUMS
+            dist/nvx-guest-assets/GUEST-INFO.txt
+            dist/nvx-guest-assets/*.json
+            dist/nvx-guest-assets/vmlinux.config
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload the guest assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: nvx-guest-assets
+          path: dist/nvx-guest-assets
+          if-no-files-found: error
+          retention-days: 90

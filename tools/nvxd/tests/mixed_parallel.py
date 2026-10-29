@@ -187,12 +187,16 @@ def _drain(stream):
         pass
 
 
-def rendezvous(need_markers):
+def rendezvous(need_markers, hold=False):
     """A guest-side barrier over `need_markers` executions.
 
     Each execution touches its own marker, then waits until every marker exists. Only executions
     that are all running at the same time can get past it, and the wait is bounded so a serialized
     implementation reports `missed` instead of hanging the suite.
+
+    With `hold`, an execution that has met the others keeps running until a `release` file shows
+    up in its working directory. Without it they all finish within about a tenth of a second of
+    the last one starting, which is shorter than a caller needs to observe them all running.
 
     Markers live in the guest's `/tmp`, not in a session workspace: the sessions of one VM do not
     share a workspace directory, and the point of the barrier is the VM's process and file space,
@@ -202,7 +206,12 @@ def rendezvous(need_markers):
         "touch /tmp/{mine}; for i in $(seq 1 600); do "
         "missing=0; for one in {others}; do [ -f \"/tmp/$one\" ] || missing=1; done; "
         "[ $missing -eq 0 ] && break; sleep 0.1; done; "
-        "missing=0; for one in {others}; do [ -f \"/tmp/$one\" ] || missing=1; done; "
+        + (
+            "for i in $(seq 1 600); do [ -f release ] && break; sleep 0.1; done; "
+            if hold
+            else ""
+        )
+        + "missing=0; for one in {others}; do [ -f \"/tmp/$one\" ] || missing=1; done; "
         "if [ $missing -eq 0 ]; then echo met; else echo missed; fi"
     )
     return template
@@ -254,7 +263,7 @@ def phase_eight_at_once(args, root, environment):
                     "op": "exec",
                     "session": session,
                     "execId": marker,
-                    "argv": ["sh", "-c", rendezvous(8).format(
+                    "argv": ["sh", "-c", rendezvous(8, hold=True).format(
                         mine=marker, others=" ".join(others))],
                     "cwd": str(workspace_a if session == "E1" else workspace_b),
                 },
@@ -273,6 +282,10 @@ def phase_eight_at_once(args, root, environment):
                     f"only {len(running)} of 8 executions were running: {running}"
                 )
             time.sleep(0.2)
+
+        # They have all been seen running; let them go.
+        for workspace in (workspace_a, workspace_b):
+            (workspace / "release").write_text("go", encoding="utf-8")
 
         ids = [marker for marker, _ in members]
         sidecar.await_exits(ids, time.monotonic() + 240)

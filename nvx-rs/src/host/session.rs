@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -507,6 +507,9 @@ fn check_unmap_reply(kind: u8, status: i32, payload: &[u8]) -> Result<(), Sessio
 /// read; the guest's own cancel poll interval is the same order of magnitude.
 const SHARED_READ_SLICE: Duration = Duration::from_millis(20);
 
+/// The most the reader waits, per slice, for a writer that is queued for the session lock.
+const WRITER_PRIORITY_MAX_MS: u32 = 5;
+
 /// What one request receives from a [`SharedSession`].
 pub enum Delivery {
     /// An event of the execution whose request id the frame repeats.
@@ -545,6 +548,10 @@ pub struct SharedSession {
     waiters: Mutex<HashMap<u64, Sender<Delivery>>>,
     /// Whether the reader thread is still serving this session.
     running: AtomicBool,
+    /// Writers waiting for `session`. The reader holds the lock for a whole read slice and
+    /// `std::sync::Mutex` is not fair: a reader that unlocks and locks again at once can keep a
+    /// waiting writer out for seconds. The reader therefore stays away while this is not zero.
+    writers_waiting: AtomicUsize,
 }
 
 impl SharedSession {
@@ -561,6 +568,7 @@ impl SharedSession {
         let session = ControlSession::attach(transport, capability, deadline)?;
         let shared = Arc::new(Self {
             session: Mutex::new(session),
+            writers_waiting: AtomicUsize::new(0),
             waiters: Mutex::new(HashMap::new()),
             running: AtomicBool::new(true),
         });
@@ -591,7 +599,7 @@ impl SharedSession {
         deadline: Instant,
     ) -> Result<(), SessionError> {
         let sent = {
-            let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut session = self.lock_for_write();
             session.send_app(kind, request_id, payload, Some(deadline))
         };
         match sent {
@@ -862,9 +870,25 @@ impl SharedSession {
         check_unmap_reply(kind, status, &reply)
     }
 
+    /// Takes the session lock for a write, ahead of the reader.
+    fn lock_for_write(&self) -> MutexGuard<'_, ControlSession> {
+        self.writers_waiting.fetch_add(1, Ordering::AcqRel);
+        let guard = self.session.lock().unwrap_or_else(PoisonError::into_inner);
+        self.writers_waiting.fetch_sub(1, Ordering::AcqRel);
+        guard
+    }
+
     /// Reads frames until the session ends, handing each to the execution that asked for it.
     fn read_forever(self: Arc<Self>) {
         loop {
+            // Bounded, so a steady stream of writers cannot keep the reader (and every
+            // execution's output) out for longer than a few milliseconds per slice.
+            for _ in 0..WRITER_PRIORITY_MAX_MS {
+                if self.writers_waiting.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
             let read = {
                 let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
                 session.read_app(Some(Instant::now() + SHARED_READ_SLICE))
@@ -1378,6 +1402,7 @@ mod tests {
         (
             SharedSession {
                 session: Mutex::new(session),
+                writers_waiting: AtomicUsize::new(0),
                 waiters: Mutex::new(HashMap::new()),
                 running: AtomicBool::new(true),
             },
@@ -1404,6 +1429,7 @@ mod tests {
         let (session, requests) = attached_recording(answer);
         let shared = SharedSession {
             session: Mutex::new(session),
+            writers_waiting: AtomicUsize::new(0),
             waiters: Mutex::new(HashMap::new()),
             running: AtomicBool::new(true),
         };
@@ -1423,6 +1449,73 @@ mod tests {
         });
         let recorded = requests.lock().unwrap().clone();
         (result, recorded)
+    }
+
+    /// Transport whose reads block for the whole timeout, as a pipe with nothing to read does,
+    /// and whose writes always succeed. Reading stops (as a closed pipe) once `stop` is set.
+    struct Idle {
+        input: VecDeque<u8>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Transport for Idle {
+        fn read(&mut self, buffer: &mut [u8], timeout: Option<Duration>) -> io::Result<usize> {
+            if !self.input.is_empty() {
+                let count = buffer.len().min(self.input.len());
+                for byte in &mut buffer[..count] {
+                    *byte = self.input.pop_front().unwrap();
+                }
+                return Ok(count);
+            }
+            thread::sleep(timeout.unwrap_or(Duration::from_millis(20)));
+            if self.stop.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            Err(io::ErrorKind::TimedOut.into())
+        }
+
+        fn write_all(&mut self, _data: &[u8], _timeout: Option<Duration>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The reader holds the session lock for each whole read slice. A request must still get the
+    /// lock within about one slice: `std::sync::Mutex` is not fair, so without the reader backing
+    /// off for waiting writers a request can be kept out for seconds.
+    #[test]
+    fn a_request_is_not_starved_by_the_reader() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let transport = Idle {
+            input: outer(OUTER_READY, 1, 0, &[]).into(),
+            stop: Arc::clone(&stop),
+        };
+        let session =
+            ControlSession::attach(Box::new(transport), &[1; CAPABILITY_LEN], deadline()).unwrap();
+        let shared = Arc::new(SharedSession {
+            session: Mutex::new(session),
+            writers_waiting: AtomicUsize::new(0),
+            waiters: Mutex::new(HashMap::new()),
+            running: AtomicBool::new(true),
+        });
+        let reader = thread::spawn({
+            let shared = Arc::clone(&shared);
+            move || shared.read_forever()
+        });
+        let mut slowest = Duration::ZERO;
+        for _ in 0..100 {
+            let started = Instant::now();
+            shared
+                .start_scoped_exec(None, &true_workload(), deadline())
+                .unwrap();
+            slowest = slowest.max(started.elapsed());
+            thread::sleep(Duration::from_millis(3));
+        }
+        stop.store(true, Ordering::Release);
+        reader.join().unwrap();
+        assert!(
+            slowest < Duration::from_millis(250),
+            "the slowest request waited {slowest:?}"
+        );
     }
 
     #[test]

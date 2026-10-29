@@ -867,7 +867,7 @@ impl Context {
             if let Err(error) =
                 self.backend.remove_share(&vm.sandbox, &export.child, &export.target, SHARE_TIMEOUT)
             {
-                self.mark_vm_lost(format!("isolated session rollback failed: {error}"));
+                self.mark_vm_lost(vm.generation, format!("isolated session rollback failed: {error}"));
             }
         }
     }
@@ -919,7 +919,7 @@ impl Context {
                     error,
                 );
                 if lost {
-                    self.mark_vm_lost(failure.message.clone());
+                    self.mark_vm_lost(vm.generation, failure.message.clone());
                 }
                 failure
             });
@@ -1002,10 +1002,20 @@ impl Context {
     ///
     /// The next `session.open` boots a new generation. Old exec ids and sessions are not
     /// reused (plan 3.3: an old generation is never revived, and no command is replayed).
-    fn mark_vm_lost(&self, detail: String) {
+    fn mark_vm_lost(&self, lost_generation: u64, detail: String) {
         let victims: Vec<(String, String, u64)> = {
             let inner = self.inner.lock().unwrap();
             let generation = inner.registry.generation();
+            // The report names the VM that failed. A thread that was talking to an earlier VM can
+            // learn of its end after a new VM has replaced it, and must not condemn the new one:
+            // that failed the new generation's sessions with "isolated export cleanup retired the
+            // failed group" whenever the report happened to arrive after the reopen.
+            if generation != lost_generation {
+                eprintln!(
+                    "nvxd: ignoring a late report that generation {lost_generation} was                      lost ({detail}); generation {generation} is current"
+                );
+                return;
+            }
             inner
                 .registry
                 .views()
@@ -1429,7 +1439,7 @@ impl Context {
                 let lost = self.vm_is_gone(&error);
                 self.finish_and_emit(id, Terminal::new("failed", None, error.to_string()));
                 if lost {
-                    self.mark_vm_lost(error.to_string());
+                    self.mark_vm_lost(vm.generation, error.to_string());
                 }
                 return;
             }
@@ -1499,7 +1509,7 @@ impl Context {
         };
         self.finish_and_emit(id, terminal_of(outcome, cancelled));
         if let Some(detail) = lost {
-            self.mark_vm_lost(detail);
+            self.mark_vm_lost(vm.generation, detail);
         }
     }
 
@@ -1596,7 +1606,7 @@ impl Context {
                     &vm.sandbox, id, &target
                 ) {
                     self.stats.lock().unwrap().shares_remove_failed += 1;
-                    self.mark_vm_lost(format!(
+                    self.mark_vm_lost(vm.generation, format!(
                         "isolated session deferred unmount failed for {target}: {error}"
                     ));
                     return;
@@ -1615,7 +1625,7 @@ impl Context {
                 Err(error) => {
                     if self.session_isolation {
                         self.stats.lock().unwrap().shares_remove_failed += 1;
-                        self.mark_vm_lost(format!(
+                        self.mark_vm_lost(vm.generation, format!(
                             "isolated export {child} cleanup failed: {error}"
                         ));
                         return;
@@ -1652,7 +1662,7 @@ impl Context {
                             REMOVAL_DEADLINE.as_secs()
                         );
                         if guest_session.is_some() {
-                            self.mark_vm_lost(format!(
+                            self.mark_vm_lost(vm.generation, format!(
                                 "isolated session mapping {} could not be revoked: {error}",
                                 target
                             ));
@@ -1688,7 +1698,7 @@ impl Context {
                                 &share.target,
                             )
                             .map_err(|error| {
-                                self.mark_vm_lost(format!(
+                                self.mark_vm_lost(vm.generation, format!(
                                     "isolated session unmount failed for {}: {error}",
                                     share.target
                                 ));
@@ -1707,7 +1717,7 @@ impl Context {
                         Err(error) => {
                             if guest_session.is_some() {
                                 self.stats.lock().unwrap().shares_remove_failed += 1;
-                                self.mark_vm_lost(format!(
+                                self.mark_vm_lost(vm.generation, format!(
                                     "isolated source export {} cleanup failed: {error}",
                                     share.child
                                 ));
@@ -1805,7 +1815,7 @@ impl Context {
                             if let Err(cleanup) = self.backend.remove_share(
                                 &vm.sandbox, &child, &source_target, SHARE_TIMEOUT
                             ) {
-                                self.mark_vm_lost(format!(
+                                self.mark_vm_lost(vm.generation, format!(
                                     "isolated bind rollback for {child} failed: {cleanup}"
                                 ));
                             } else {
@@ -2288,14 +2298,14 @@ impl Context {
         // the pinned workspace inside that namespace.
         if let Some(id) = guest_session {
             if cleanup_pending {
-                self.mark_vm_lost(format!(
+                self.mark_vm_lost(generation, format!(
                     "isolated session {name} did not stop before its close deadline"
                 ));
                 return Err(fail("E_SESSION_CLOSE_FAILED", "isolated session cleanup timed out"));
             }
             if let Some(vm) = self.vm_now() {
                 if let Err(error) = self.backend.close_guest_session(&vm.sandbox, id) {
-                    self.mark_vm_lost(format!("isolated session {name} close failed: {error}"));
+                    self.mark_vm_lost(generation, format!("isolated session {name} close failed: {error}"));
                     return Err(fail("E_SESSION_CLOSE_FAILED", error));
                 }
             }

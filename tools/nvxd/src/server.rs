@@ -2931,7 +2931,7 @@ fn spawn_pump(
                         "session": session,
                         "generation": generation,
                     });
-                    if writer.send(&head, &buffer[..count]).is_err() {
+                    if writer.send_output(&head, &buffer[..count]).is_err() {
                         break;
                     }
                 }

@@ -7,13 +7,18 @@
 //!   costs a fixed amount of memory instead of growing the sidecar until it dies. A full queue
 //!   is reported to the sender, which is what lets the control plane notice that the connection
 //!   is no longer usable instead of pretending the output was delivered.
+//! * **Replies are not shed with output.** Command output is the only high-volume traffic, so
+//!   only it is limited to `capacity` waiting frames. Replies and lifecycle events are small and
+//!   one per request or state change; they have `RESERVE` more slots. Without that, a caller
+//!   that stalled and then asked a question could find its reply dropped, with nothing to say
+//!   the question had been answered at all.
 //! * **Frames never interleave.** One thread owns the output, so the byte-level framing cannot
 //!   be split by a concurrent writer — the reason the mutex around the writer existed before,
 //!   replaced here because it also made a stalled reader block every producer.
 
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -26,9 +31,15 @@ use serde_json::Value;
 /// protocol (`MAX_JSON_BYTES`, `MAX_PAYLOAD_BYTES`); capacity × frame size is the worst case.
 pub const DEFAULT_CAPACITY: usize = 256;
 
+/// Extra slots for replies and lifecycle events, on top of the output capacity. More than the
+/// requests and events a caller can have outstanding, so a full output queue never costs a reply.
+pub const RESERVE: usize = 256;
+
 struct Frame {
     json: Vec<u8>,
     payload: Vec<u8>,
+    /// Counted against the output limit and released by the writer thread once it is written.
+    output: bool,
 }
 
 /// Counters a support case can read without attaching a debugger.
@@ -58,31 +69,50 @@ impl Stats {
 pub struct Writer {
     sender: SyncSender<Frame>,
     stats: Arc<Stats>,
+    output_limit: usize,
+    queued_output: Arc<AtomicUsize>,
 }
 
 impl Writer {
-    /// Queues one frame, or says why it could not be queued.
+    /// Queues a reply or event, or says why it could not be queued.
     ///
     /// Never blocks: a producer that cannot enqueue learns immediately, which is what keeps a
     /// slow reader from turning into an unbounded backlog or a deadlock between two producers.
+    /// It is refused only when even the reserve is used up.
     pub fn send(&self, head: &Value, payload: &[u8]) -> io::Result<()> {
+        self.enqueue(head, payload, false)
+    }
+
+    /// Queues a chunk of command output. Limited to the output capacity, so a caller that stops
+    /// reading loses output, never replies.
+    pub fn send_output(&self, head: &Value, payload: &[u8]) -> io::Result<()> {
+        self.enqueue(head, payload, true)
+    }
+
+    fn enqueue(&self, head: &Value, payload: &[u8], output: bool) -> io::Result<()> {
         let json = serde_json::to_vec(head)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let frame = Frame {
             json,
             payload: payload.to_vec(),
+            output,
         };
+        if output && self.queued_output.fetch_add(1, Ordering::AcqRel) >= self.output_limit {
+            self.queued_output.fetch_sub(1, Ordering::AcqRel);
+            return Err(self.refuse_full());
+        }
         match self.sender.try_send(frame) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
-                self.stats.refused.fetch_add(1, Ordering::Relaxed);
-                self.stats.broken.store(true, Ordering::Relaxed);
-                Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "the caller is not reading; the outbound queue is full",
-                ))
+                if output {
+                    self.queued_output.fetch_sub(1, Ordering::AcqRel);
+                }
+                Err(self.refuse_full())
             }
             Err(TrySendError::Disconnected(_)) => {
+                if output {
+                    self.queued_output.fetch_sub(1, Ordering::AcqRel);
+                }
                 self.stats.refused.fetch_add(1, Ordering::Relaxed);
                 self.stats.broken.store(true, Ordering::Relaxed);
                 Err(io::Error::new(
@@ -91,6 +121,15 @@ impl Writer {
                 ))
             }
         }
+    }
+
+    fn refuse_full(&self) -> io::Error {
+        self.stats.refused.fetch_add(1, Ordering::Relaxed);
+        self.stats.broken.store(true, Ordering::Relaxed);
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "the caller is not reading; the outbound queue is full",
+        )
     }
 
     pub fn stats(&self) -> Arc<Stats> {
@@ -105,20 +144,32 @@ impl Writer {
 
 /// Serialized writer with a bounded queue. Returns the handle and the thread that drains it.
 pub fn spawn(output: Box<dyn Write + Send>, capacity: usize) -> (Writer, JoinHandle<()>) {
-    let (sender, receiver) = sync_channel(capacity.max(1));
+    let capacity = capacity.max(1);
+    let (sender, receiver) = sync_channel(capacity + RESERVE);
     let stats = Arc::new(Stats::default());
+    let queued_output = Arc::new(AtomicUsize::new(0));
     let writer = Writer {
         sender,
         stats: Arc::clone(&stats),
+        output_limit: capacity,
+        queued_output: Arc::clone(&queued_output),
     };
-    let thread = std::thread::spawn(move || drain(output, receiver, stats));
+    let thread = std::thread::spawn(move || drain(output, receiver, stats, queued_output));
     (writer, thread)
 }
 
-fn drain(mut output: Box<dyn Write + Send>, receiver: Receiver<Frame>, stats: Arc<Stats>) {
+fn drain(
+    mut output: Box<dyn Write + Send>,
+    receiver: Receiver<Frame>,
+    stats: Arc<Stats>,
+    queued_output: Arc<AtomicUsize>,
+) {
     // Frames already accepted must be written even if the reader disappears: dropping them
     // here would make an accepted request look unanswered with nothing to point at.
     while let Ok(frame) = receiver.recv() {
+        if frame.output {
+            queued_output.fetch_sub(1, Ordering::AcqRel);
+        }
         let mut buffer = Vec::with_capacity(8 + frame.json.len() + frame.payload.len());
         buffer.extend_from_slice(&(frame.json.len() as u32).to_le_bytes());
         buffer.extend_from_slice(&(frame.payload.len() as u32).to_le_bytes());
@@ -189,15 +240,11 @@ mod tests {
     /// unbounded queue and a producer that quietly waits forever.
     #[test]
     fn a_stalled_reader_is_refused_rather_than_buffered_without_limit() {
-        let sink = Sink::default();
-        let (writer, thread) = spawn(Box::new(sink), 2);
-        // Fill the queue faster than the writer thread can drain it by holding the sink's
-        // lock: two frames fit, the rest are refused.
-        let guard = Arc::new(StdMutex::new(()));
-        let _hold = guard.lock().unwrap();
+        let gate = Gate::default();
+        let (writer, thread) = spawn(Box::new(gate.clone()), 2);
         let mut refused = false;
         for id in 0..64 {
-            if writer.send(&json!({"id": id}), &[]).is_err() {
+            if writer.send_output(&json!({"id": id}), b"x").is_err() {
                 refused = true;
                 break;
             }
@@ -205,7 +252,68 @@ mod tests {
         assert!(refused, "a full queue must be reported");
         assert!(writer.broken(), "a refused send marks the connection broken");
         assert!(writer.stats().refused() >= 1);
+        gate.open();
         drop(writer);
         let _ = thread.join();
+    }
+
+    /// The case that used to hang a caller: output has filled the queue, the caller asks a
+    /// question, and the answer must not be shed with the output.
+    #[test]
+    fn a_reply_is_not_shed_while_output_is_refused() {
+        let gate = Gate::default();
+        let (writer, thread) = spawn(Box::new(gate.clone()), 2);
+        let mut output_refused = false;
+        for id in 0..64 {
+            if writer.send_output(&json!({"id": id}), b"x").is_err() {
+                output_refused = true;
+                break;
+            }
+        }
+        assert!(output_refused, "the output limit must be reached first");
+        assert!(RESERVE >= 16, "the reserve must hold more than a few replies");
+        for id in 0..16 {
+            writer
+                .send(&json!({"id": 1000 + id, "ok": true}), &[])
+                .unwrap_or_else(|error| panic!("reply {id} was refused: {error}"));
+        }
+        // The reserve is itself bounded.
+        let mut exhausted = false;
+        for id in 0..(RESERVE + 8) {
+            if writer.send(&json!({"id": 5000 + id}), &[]).is_err() {
+                exhausted = true;
+                break;
+            }
+        }
+        assert!(exhausted, "replies must not grow the queue without limit");
+        gate.open();
+        drop(writer);
+        thread.join().unwrap();
+    }
+
+    /// A sink that accepts nothing until it is opened, so the queue behind it can be filled
+    /// deterministically.
+    #[derive(Clone, Default)]
+    struct Gate(Arc<(StdMutex<bool>, std::sync::Condvar)>);
+
+    impl Gate {
+        fn open(&self) {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+        }
+    }
+
+    impl Write for Gate {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut open = self.0 .0.lock().unwrap();
+            while !*open {
+                open = self.0 .1.wait(open).unwrap();
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }

@@ -22,6 +22,7 @@ import pathlib
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 
 from p8_support import vmm_processes
@@ -388,20 +389,30 @@ def case_stalled_reader(nvxd, repo, initrd, root):
         # busy host: a shorter wait made this case fail when the guest was merely slow, without
         # the queue ever having been tested.
         time.sleep(15)
-        # Reading resumes: whatever was dropped, the sidecar must still be here and answering.
+        # The question is asked while the reader is still stalled and the output queue is full:
+        # whatever output was dropped, the answer must not be. Reading blocks, so a timer ends the
+        # wait by killing the sidecar; the 120 s deadline would otherwise only be checked between
+        # frames and an unanswered request would hang the suite.
         send_frame(process.stdin, {"id": 3, "op": "diagnostics"})
-        deadline = time.monotonic() + 120
+        timed_out = []
+        watchdog = threading.Timer(120, lambda: (timed_out.append(True), process.kill()))
+        watchdog.start()
         diagnostics = None
-        while time.monotonic() < deadline:
-            frame = read_frame(process.stdout)
-            if frame is None:
-                raise RuntimeError("the sidecar died while its reader was stalled")
-            head, _ = frame
-            if head.get("id") == 3:
-                diagnostics = head
-                break
+        try:
+            while True:
+                frame = read_frame(process.stdout)
+                if frame is None:
+                    break
+                head, _ = frame
+                if head.get("id") == 3:
+                    diagnostics = head
+                    break
+        finally:
+            watchdog.cancel()
+        if timed_out:
+            raise RuntimeError("the sidecar did not answer a request sent while its reader was stalled")
         if diagnostics is None:
-            raise RuntimeError("the sidecar stopped answering after a stalled reader")
+            raise RuntimeError("the sidecar died while its reader was stalled")
         if not diagnostics.get("ok"):
             raise RuntimeError(f"diagnostics was refused: {diagnostics}")
         outbound = diagnostics.get("outbound") or {}

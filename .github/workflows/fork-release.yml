@@ -3,7 +3,7 @@ name: Fork release
 # Publishes the CI outputs of one commit as a GitHub Release, so that they outlive the 90-day artifact
 # retention. It builds nothing: it takes the 64-bit binaries from the successful "Fork CI" run and the guest
 # assets from the successful "Fork guest assets" run of the same commit, checks that both were built from that
-# commit and that their checksums hold, and attaches them to a release tagged nvx-runtime-<8 hex>.
+# commit and that their checksums hold, and attaches them to the draft release nvx-runtime-<8 hex>.
 #
 # Start it by hand with the full commit hash. An existing tag is never overwritten: a published release is the
 # record that the release lock (sandbox/tools/nvx-runtime/nvx_dependency.json in the engine) points at.
@@ -47,9 +47,10 @@ jobs:
       - name: Find the successful runs of this commit
         run: |
           set -euo pipefail
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "release ${TAG} already exists; published releases are not overwritten"; exit 1
-          fi
+          # The release itself is created beforehand, as a draft, by a person: the workflow token cannot create
+          # the tag (HTTP 403 "Resource not accessible by integration"), but it can attach files to a draft.
+          draft=$(gh release view "${TAG}" --json isDraft,assets --jq 'select(.isDraft and (.assets | length == 0)) | "yes"' 2>/dev/null || true)
+          test "${draft}" = "yes" || { echo "release ${TAG} must exist as an empty draft; a published release is never changed"; exit 1; }
           binaries=$(gh run list --workflow fork-ci.yml --commit "${SHA}" --status success --json databaseId --jq '.[0].databaseId // empty')
           guest=$(gh run list --workflow fork-guest.yml --commit "${SHA}" --status success --json databaseId --jq '.[0].databaseId // empty')
           test -n "${binaries}" || { echo "no successful Fork CI run for ${SHA}"; exit 1; }
@@ -89,8 +90,8 @@ jobs:
           - A rebuild of the same commit gives identical Ubuntu assets but a different vmlinux and different PE timestamps in the executables, so these files are the record to use, not a rebuild.
           EOF
 
-      - name: Create the release
+      - name: Attach the files to the draft release
         run: |
           set -euo pipefail
-          gh release create "${TAG}" out/nvx-windows-x64.zip out/nvx-guest-assets.zip out/SHA256SUMS out/CONTENT-SHA256SUMS.txt \
-            --target "${SHA}" --title "NVX runtime assets ${SHA:0:8}" --notes-file out/NOTES.md --latest=false
+          gh release upload "${TAG}" out/nvx-windows-x64.zip out/nvx-guest-assets.zip out/SHA256SUMS out/CONTENT-SHA256SUMS.txt
+          gh release edit "${TAG}" --title "NVX runtime assets ${SHA:0:8}" --notes-file out/NOTES.md

@@ -9,6 +9,13 @@ name: Fork release
 # record that the release lock (sandbox/tools/nvx-runtime/nvx_dependency.json in the engine) points at.
 
 on:
+  # A push that touches this file starts a run that does nothing (the job below only runs for a manual start);
+  # GitHub lists a workflow for manual starts only once it exists on the default branch or has run.
+  push:
+    branches:
+      - productization
+    paths:
+      - .github/workflows/fork-release.yml
   workflow_dispatch:
     inputs:
       sha:
@@ -23,6 +30,7 @@ permissions:
 jobs:
   publish:
     name: Publish release
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:

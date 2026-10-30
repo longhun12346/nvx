@@ -1,0 +1,88 @@
+name: Fork release
+
+# Publishes the CI outputs of one commit as a GitHub Release, so that they outlive the 90-day artifact
+# retention. It builds nothing: it takes the 64-bit binaries from the successful "Fork CI" run and the guest
+# assets from the successful "Fork guest assets" run of the same commit, checks that both were built from that
+# commit and that their checksums hold, and attaches them to a release tagged nvx-runtime-<8 hex>.
+#
+# Start it by hand with the full commit hash. An existing tag is never overwritten: a published release is the
+# record that the release lock (sandbox/tools/nvx-runtime/nvx_dependency.json in the engine) points at.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full commit hash (40 hex) of the commit whose CI outputs to publish
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    name: Publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SHA: ${{ inputs.sha }}
+    steps:
+      - name: Check the input
+        run: |
+          set -euo pipefail
+          [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "sha must be a full lowercase commit hash"; exit 1; }
+          echo "TAG=nvx-runtime-${SHA:0:8}" >> "${GITHUB_ENV}"
+
+      - name: Find the successful runs of this commit
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists; published releases are not overwritten"; exit 1
+          fi
+          binaries=$(gh run list --workflow fork-ci.yml --commit "${SHA}" --status success --json databaseId --jq '.[0].databaseId // empty')
+          guest=$(gh run list --workflow fork-guest.yml --commit "${SHA}" --status success --json databaseId --jq '.[0].databaseId // empty')
+          test -n "${binaries}" || { echo "no successful Fork CI run for ${SHA}"; exit 1; }
+          test -n "${guest}" || { echo "no successful Fork guest assets run for ${SHA}"; exit 1; }
+          echo "BINARIES_RUN=${binaries}" >> "${GITHUB_ENV}"
+          echo "GUEST_RUN=${guest}" >> "${GITHUB_ENV}"
+
+      - name: Download and check both sets
+        run: |
+          set -euo pipefail
+          gh run download "${BINARIES_RUN}" --name nvx-windows-x64 --dir dl/nvx-windows-x64
+          gh run download "${GUEST_RUN}" --name nvx-guest-assets --dir dl/nvx-guest-assets
+          grep -qx "nvx_revision=${SHA}" dl/nvx-windows-x64/BUILD-INFO.txt
+          grep -qx "nvx_revision=${SHA}" dl/nvx-guest-assets/GUEST-INFO.txt
+          (cd dl/nvx-windows-x64 && sha256sum --check SHA256SUMS)
+          (cd dl/nvx-guest-assets && sha256sum --check SHA256SUMS)
+
+      - name: Assemble the release files
+        run: |
+          set -euo pipefail
+          mkdir out
+          (cd dl/nvx-windows-x64 && zip -qr ../../out/nvx-windows-x64.zip .)
+          (cd dl/nvx-guest-assets && zip -qr ../../out/nvx-guest-assets.zip .)
+          {
+            echo "Binaries (run ${BINARIES_RUN}):"; cat dl/nvx-windows-x64/SHA256SUMS
+            echo; echo "Guest assets (run ${GUEST_RUN}):"; cat dl/nvx-guest-assets/SHA256SUMS
+          } > out/CONTENT-SHA256SUMS.txt
+          (cd out && sha256sum nvx-windows-x64.zip nvx-guest-assets.zip > SHA256SUMS)
+          cat > out/NOTES.md <<EOF
+          64-bit Windows binaries and Ubuntu guest assets built by GitHub Actions from commit ${SHA}.
+
+          - Binaries: run ${BINARIES_RUN} of Fork CI (nvx-windows-x64.zip: nvxd.exe, openvmm.exe, whp-legacy-cpuid-probe.exe).
+          - Guest assets: run ${GUEST_RUN} of Fork guest assets (nvx-guest-assets.zip: vmlinux, Ubuntu initramfs, stage initramfs, EROFS distro layer, manifests).
+          - SHA256SUMS covers the two zip files; CONTENT-SHA256SUMS.txt lists the files inside them.
+          - Nothing here is signed.
+          - The Linux kernel (vmlinux) is GPL-2.0-only. Its corresponding source is Linux 6.18.38 (the archive named in vmlinux.provenance.json) with the patches in kernel/patches and the configuration kernel/config-microvm of this commit. The Ubuntu userland keeps its own licenses; its package list is in ubuntu-distro.erofs.manifest.json, and the sources are in the Ubuntu archive.
+          - A rebuild of the same commit gives identical Ubuntu assets but a different vmlinux and different PE timestamps in the executables, so these files are the record to use, not a rebuild.
+          EOF
+
+      - name: Create the release
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" out/nvx-windows-x64.zip out/nvx-guest-assets.zip out/SHA256SUMS out/CONTENT-SHA256SUMS.txt \
+            --target "${SHA}" --title "NVX runtime assets ${SHA:0:8}" --notes-file out/NOTES.md --latest=false

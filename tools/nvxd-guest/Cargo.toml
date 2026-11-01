@@ -26,6 +26,9 @@ host = ["nvx/host", "dep:serde_json"]
 guest = ["nvx/guest", "dep:nix", "dep:libc"]
 # A diagnostic agent that injects the faults of the cleanup suite (never part of a product build).
 fault-observer = ["guest"]
+# The P8 guest probe: a privileged integration probe of the session isolation, booted by
+# tools/nvxd/tests/guest_probe_report.py (never part of a product build).
+session-probe = ["guest"]
 
 [dependencies]
 nvx = { path = "../../nvx-rs", default-features = false }
@@ -61,6 +64,12 @@ nix = { version = "0.31.3", default-features = false, features = ["ptrace", "ter
 name = "nvxd-guest"
 path = "src/bin/nvxd-guest.rs"
 required-features = ["guest"]
+test = false
+
+[[bin]]
+name = "nvxd-guest-probe"
+path = "src/bin/nvxd-guest-probe.rs"
+required-features = ["session-probe"]
 test = false
 
 [lints.rust]

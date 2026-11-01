@@ -62,3 +62,31 @@ suite passes it as `--diagnostic-agent`; the product agent is built without the 
 
 Limits kept from the C implementation: 64 resident sessions per VM, identities are monotonic and never
 reused, one UID per session starting at 100000, the 5 s bound on keeper readiness and mount changes.
+
+## Probe
+
+`tools/nvxd/tests/guest_probe_report.py` builds `nvxd-guest-probe` (feature `session-probe`, static musl,
+from Windows with `rust-lld`, no WSL), appends it with a boot script to the base initramfs and boots that
+as `nvx_exec=/p8-probe-boot`. It runs as root in the guest and drives the production `Sessions` type with
+real namespaces, mounts and cgroups. It prints `P8-PROBE-PASS <check>` for each check and
+`P8-PROBE-COMPLETE`; the report requires all 49 check names, unchanged from the C probe.
+
+What changed against the C probe:
+
+- The three decode checks (`session-wire`, `shared-network-policy-decoded`, `unknown-network-policy-refused`)
+  run `session::decode_open`, the one decoder of the session open request. It now refuses any network
+  value but `0` and `1`; before, any other value was taken as a private network.
+- `production-scheduler-two-by-two-cgroups` starts four programs in two sessions, each in its own
+  `ExecutionCgroup` leaf, and requires the leaves occupied together, the programs of a session to meet
+  in its private `/tmp`, and the leaves gone afterwards.
+- `fault-injection-reap-keeper` waits for the agent to notice the dead keeper through `Sessions::health`;
+  the launcher reaps it.
+- Python is gone: the checks that ran Python (SysV IPC, loopback) run the probe binary itself inside the
+  session (`__in-session`).
+- Found by the port and fixed: the enter helper left the caller's descriptors open for the program
+  (`agent-secret-fd`, `identity-proc-capabilities-fds`); it now closes every descriptor above 2 first.
+
+Negative proofs (a deliberately broken agent fails the named check): no IPC namespace
+(`cross-session-sysv-ipc-denied`), lazy instead of strict unmount (`busy-revoke-escalates-group-failure`),
+unknown network policy granted (`unknown-network-policy-refused`), inherited descriptors kept
+(`identity-proc-capabilities-fds`).

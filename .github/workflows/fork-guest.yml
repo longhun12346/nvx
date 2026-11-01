@@ -21,6 +21,7 @@ on:
       - kernel/**
       - guest/**
       - ubuntu/**
+      - tools/nvxd-guest/**
       - docker/**
       - SOURCE-MANIFEST.json
       - scripts/nvx.py

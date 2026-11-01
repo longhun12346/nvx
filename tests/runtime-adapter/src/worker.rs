@@ -312,6 +312,7 @@ use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
+use nix::mount::{MntFlags, umount2};
 use nix::poll::{self, PollFd, PollFlags, PollTimeout};
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{self, Id, WaitPidFlag, WaitStatus};
@@ -325,7 +326,7 @@ use nvx::guest::clone::{self, Activation, ApplyError, RootTemplate};
 use nvx::guest::entry::{self, Entry, Identity, Prepared, Publication};
 #[cfg(target_arch = "x86_64")]
 use nvx::guest::ingress::Announcer;
-use nvx::guest::mappings::{Mapping, SourceRoot};
+use nvx::guest::mappings::{self as mappings, Access, Mapping, SourceRoot, TargetRoot};
 use nvx::guest::nvxs::GuestConnectionError;
 use nvx::guest::process::Child;
 use nvx::guest::root::{
@@ -471,6 +472,19 @@ pub trait RootOperations: EntryOperations {
     /// through `apply`, started, if any, and removed the runtime's binds that the application made
     /// on it, which keep the root's mount busy.
     fn teardown(&mut self) -> Result<(), String>;
+
+    /// Fork extension: binds `source`, a child of the host export, at the absolute `target` in the
+    /// assembled root once the sandbox started, without the table's order or its latch. Fails with
+    /// the problem, as text, and leaves nothing bound.
+    fn bind_live(&mut self, _source: &str, _target: &str, _read_only: bool) -> Result<(), String> {
+        Err("this root cannot bind live mounts".to_owned())
+    }
+
+    /// Fork extension: unmounts the absolute `target` in the assembled root that
+    /// [`bind_live`](Self::bind_live) bound. Fails with the problem, as text.
+    fn unbind_live(&mut self, _target: &str) -> Result<(), String> {
+        Err("this root cannot unbind live mounts".to_owned())
+    }
 
     /// Returns the pidfd of the announcer of the workload's listeners that a clone's application,
     /// through `apply`, started for a record whose network publishes them, which polls readable
@@ -1006,6 +1020,13 @@ fn serve_root<S: Read + Write + AsFd>(
             Step::Continue(vec![order.map(operations, &body)])
         }
         Message::Start if order.may_start() => Step::Continue(vec![order.start()]),
+        // Fork extension: mounts that come and go after the start, which the table cannot take.
+        Message::MountAdd(body) if order.is_started() => {
+            Step::Continue(vec![live_mount(operations, &body)])
+        }
+        Message::MountRemove(body) if order.is_started() => {
+            Step::Continue(vec![live_unmount(operations, &body)])
+        }
         Message::Stop => {
             executions.clear();
             match operations.teardown() {
@@ -1021,6 +1042,41 @@ fn serve_root<S: Read + Write + AsFd>(
         }
         message => return Err(ServeError::Unexpected(message.kind())),
     })
+}
+
+/// Fork extension: answers a [`Message::MountAdd`] whose body is `source\ntarget\nro|rw`.
+fn live_mount(operations: &mut dyn RootOperations, body: &[u8]) -> Message {
+    let failed = |problem: String| Message::MountFailed(truncated(&problem, MAX_TEXT_BODY).as_bytes().to_vec());
+    let Ok(text) = std::str::from_utf8(body) else {
+        return failed("the mount request is not UTF-8".to_owned());
+    };
+    let mut fields = text.split('\n');
+    let (Some(source), Some(target), Some(mode), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return failed("the mount request is not source, target and mode".to_owned());
+    };
+    let read_only = match mode {
+        "ro" => true,
+        "rw" => false,
+        other => return failed(format!("unknown mount mode {other:?}")),
+    };
+    match operations.bind_live(source, target, read_only) {
+        Ok(()) => Message::Mounted,
+        Err(problem) => failed(problem),
+    }
+}
+
+/// Fork extension: answers a [`Message::MountRemove`] whose body is the target.
+fn live_unmount(operations: &mut dyn RootOperations, body: &[u8]) -> Message {
+    let failed = |problem: String| Message::MountFailed(truncated(&problem, MAX_TEXT_BODY).as_bytes().to_vec());
+    match std::str::from_utf8(body) {
+        Ok(target) => match operations.unbind_live(target) {
+            Ok(()) => Message::Mounted,
+            Err(problem) => failed(problem),
+        },
+        Err(_) => failed("the unmount request is not UTF-8".to_owned()),
+    }
 }
 
 /// Checks the root configuration `body`, reads the boot layout of the root and the host export,
@@ -1154,6 +1210,9 @@ pub struct LibraryRoot {
     export: Option<SourceRoot>,
     /// The root, from its assembly until its teardown.
     root: Option<Assembled>,
+    /// The targets of the live binds that [`RootOperations::bind_live`] made, in order, which the
+    /// teardown unmounts first: they keep the root's mount busy.
+    live: Vec<String>,
 }
 
 /// A root that the worker assembled: a cold boot's, from its root configuration, or a clone's,
@@ -1210,6 +1269,7 @@ impl LibraryRoot {
             held: Vec::new(),
             export: None,
             root: None,
+            live: Vec::new(),
         }
     }
 }
@@ -1332,6 +1392,33 @@ impl RootOperations for LibraryRoot {
         Ok(())
     }
 
+    /// Binds a child of the host export at a target in the root, with `nvx::guest::mappings::bind`,
+    /// which checks the walk, the kinds and the mounts as a table's mapping does, and tracks nothing.
+    fn bind_live(&mut self, source: &str, target: &str, read_only: bool) -> Result<(), String> {
+        let (Some(assembled), Some(export)) = (self.root.as_ref(), self.export.as_ref()) else {
+            return Err("the worker holds no host export to bind from".to_owned());
+        };
+        let access = if read_only { Access::ReadOnly } else { Access::ReadWrite };
+        let mapping = Mapping::new(source, target, access).map_err(|error| error.to_string())?;
+        let root = TargetRoot::open(assembled.root().path())
+            .map_err(|error| format!("cannot open the root: {error}"))?;
+        mappings::bind(&root, export, &mapping).map_err(|error| error.to_string())?;
+        self.live.push(target.to_owned());
+        Ok(())
+    }
+
+    /// Detaches the mount at a target that [`bind_live`](Self::bind_live) bound.
+    fn unbind_live(&mut self, target: &str) -> Result<(), String> {
+        let Some(assembled) = self.root.as_ref() else {
+            return Err("the worker holds no root to unmount from".to_owned());
+        };
+        let path = assembled.root().path().join(target.trim_start_matches('/'));
+        umount2(&path, MntFlags::MNT_DETACH)
+            .map_err(|error| format!("cannot unmount {}: {error}", path.display()))?;
+        self.live.retain(|live| live != target);
+        Ok(())
+    }
+
     /// Returns the cgroups that the bootstrap prepared: those of the root configuration.
     fn cgroups(&self) -> Option<Layout> {
         self.bootstrap
@@ -1386,6 +1473,11 @@ impl RootOperations for LibraryRoot {
     /// teardown failed keeps its mounts.
     fn teardown(&mut self) -> Result<(), String> {
         self.export = None;
+        let left: Vec<String> = std::mem::take(&mut self.live);
+        for target in left.iter().rev() {
+            // Best effort: a target that is gone already is no failure of the teardown.
+            let _ = self.unbind_live(target);
+        }
         match self.root.take() {
             Some(root) => root.teardown(),
             None => Ok(()),

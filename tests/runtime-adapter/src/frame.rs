@@ -119,6 +119,21 @@ pub enum Message {
     /// `nvx::activation::ActivationRecord::encode` writes, and which the guest decodes and checks
     /// itself. The guest answers it with [`Message::Ready`] once it activated the clone.
     Activate(Vec<u8>),
+    /// Fork extension: asks the guest, once the sandbox started, to bind a child of the host export
+    /// at a target in its root, as `source\ntarget\nro|rw` in UTF-8 (the source is the child's name
+    /// below the export's root, the target an absolute path in the root). The guest answers with
+    /// [`Message::Mounted`] or [`Message::MountFailed`].
+    MountAdd(Vec<u8>),
+    /// Fork extension: asks the guest to unmount the target `body` names, UTF-8, that a
+    /// [`Message::MountAdd`] bound. The guest answers with [`Message::Mounted`] or
+    /// [`Message::MountFailed`].
+    MountRemove(Vec<u8>),
+    /// Fork extension: the guest's answer to a [`Message::MountAdd`] or [`Message::MountRemove`]
+    /// that succeeded.
+    Mounted,
+    /// Fork extension: the guest's answer to a [`Message::MountAdd`] or [`Message::MountRemove`]
+    /// that failed, with the problem as UTF-8 text.
+    MountFailed(Vec<u8>),
 }
 
 impl Message {
@@ -180,6 +195,10 @@ impl Message {
             Self::Start => (Kind::Start, &[]),
             Self::Started => (Kind::Started, &[]),
             Self::Activate(body) => (Kind::Activate, body),
+            Self::MountAdd(body) => (Kind::MountAdd, body),
+            Self::MountRemove(body) => (Kind::MountRemove, body),
+            Self::Mounted => (Kind::Mounted, &[]),
+            Self::MountFailed(body) => (Kind::MountFailed, body),
         }
     }
 }
@@ -238,6 +257,15 @@ const KIND_START: u8 = 25;
 const KIND_STARTED: u8 = 26;
 /// Kind of a [`Message::Activate`].
 const KIND_ACTIVATE: u8 = 27;
+/// Kind of a [`Message::MountAdd`]. The fork's extensions start at 100, clear of the codes that the
+/// upstream adapter assigns next.
+const KIND_MOUNT_ADD: u8 = 100;
+/// Kind of a [`Message::MountRemove`].
+const KIND_MOUNT_REMOVE: u8 = 101;
+/// Kind of a [`Message::Mounted`].
+const KIND_MOUNTED: u8 = 102;
+/// Kind of a [`Message::MountFailed`].
+const KIND_MOUNT_FAILED: u8 = 103;
 
 /// Kind of a [`Message`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,6 +325,14 @@ enum Kind {
     Started = KIND_STARTED,
     /// [`Message::Activate`].
     Activate = KIND_ACTIVATE,
+    /// [`Message::MountAdd`].
+    MountAdd = KIND_MOUNT_ADD,
+    /// [`Message::MountRemove`].
+    MountRemove = KIND_MOUNT_REMOVE,
+    /// [`Message::Mounted`].
+    Mounted = KIND_MOUNTED,
+    /// [`Message::MountFailed`].
+    MountFailed = KIND_MOUNT_FAILED,
 }
 
 impl Kind {
@@ -330,6 +366,10 @@ impl Kind {
             KIND_START => Some(Self::Start),
             KIND_STARTED => Some(Self::Started),
             KIND_ACTIVATE => Some(Self::Activate),
+            KIND_MOUNT_ADD => Some(Self::MountAdd),
+            KIND_MOUNT_REMOVE => Some(Self::MountRemove),
+            KIND_MOUNTED => Some(Self::Mounted),
+            KIND_MOUNT_FAILED => Some(Self::MountFailed),
             _ => None,
         }
     }
@@ -353,7 +393,10 @@ impl Kind {
             | Self::RootFailed
             | Self::Probe
             | Self::ProbeFailed
-            | Self::MapFailed => MAX_TEXT_BODY,
+            | Self::MapFailed
+            | Self::MountAdd
+            | Self::MountRemove
+            | Self::MountFailed => MAX_TEXT_BODY,
             Self::ExecInputEnd
             | Self::ExecCancel
             | Self::ExecCredit
@@ -367,6 +410,7 @@ impl Kind {
             | Self::Stop
             | Self::Stopped
             | Self::Mapped
+            | Self::Mounted
             | Self::Start
             | Self::Started => 0,
         }
@@ -403,6 +447,10 @@ impl Kind {
             Self::Start => Message::Start,
             Self::Started => Message::Started,
             Self::Activate => Message::Activate(body),
+            Self::MountAdd => Message::MountAdd(body),
+            Self::MountRemove => Message::MountRemove(body),
+            Self::Mounted => Message::Mounted,
+            Self::MountFailed => Message::MountFailed(body),
         }
     }
 }
@@ -602,6 +650,11 @@ mod tests {
             Message::Activate(Vec::new()),
             Message::Activate(b"\x01\x00record".to_vec()),
             Message::Activate(vec![b'a'; MAX_ACTIVATE_BODY]),
+            Message::MountAdd(b"ws-1\n/sessions/a/workspace\nrw".to_vec()),
+            Message::MountAdd(vec![b'a'; MAX_TEXT_BODY]),
+            Message::MountRemove(b"/sessions/a/workspace".to_vec()),
+            Message::Mounted,
+            Message::MountFailed(vec![b'x'; MAX_TEXT_BODY]),
             Message::Stop,
             Message::Stopped,
         ]
@@ -744,7 +797,7 @@ mod tests {
     #[test]
     fn each_kind_decodes_from_its_code_alone() {
         for code in 0..=u8::MAX {
-            let defined = (1..=27).contains(&code).then_some(code);
+            let defined = ((1..=27).contains(&code) || (100..=103).contains(&code)).then_some(code);
             assert_eq!(Kind::from_code(code).map(Kind::code), defined, "{code}");
         }
     }

@@ -1,20 +1,30 @@
-"""Exercise production sidecar/agent cleanup with an external guest observer."""
+"""Exercise production sidecar/agent cleanup with an external guest observer.
 
-from runtime_assets import artifact_args, distro_path
+The observer is a diagnostic guest agent built with the `fault-observer` feature
+(`cargo build --features guest,fault-observer`, see tools/nvxd-guest/README.md); the product agent has
+none. It injects each fault from outside the workload namespaces and cgroups.
+"""
+
+from runtime_assets import artifact_args
 
 import argparse
+import hashlib
 import json
+import os
 import pathlib
 import subprocess
 import tempfile
 import time
 import uuid
 
-from guest_probe_report import linux_path, sha256
 from p8_support import BoundedSidecar, stop_sidecar, vmm_processes
 
 
-def check_fault(args, diagnostic, mode, output, diagnostic_distro=None):
+def sha256(path):
+    return hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
+
+
+def check_fault(args, mode, output):
     root = output / mode
     root.mkdir()
     workspaces = {name: root / name for name in ("a", "b", "c")}
@@ -24,8 +34,9 @@ def check_fault(args, diagnostic, mode, output, diagnostic_distro=None):
     mount = root / "data"
     mount.mkdir()
     (mount / "marker").write_text("authorized")
+    os.environ["NVX_GUEST_AGENT"] = str(args.diagnostic_agent)
     process = subprocess.Popen([
-        str(args.nvxd), *artifact_args(args.repo, diagnostic, distro=diagnostic_distro),
+        str(args.nvxd), *artifact_args(args.repo, args.initrd),
         "--hypervisor", "whp", "--cpu-profile", "host", "--session-isolation",
         "--max-running", "2", "--state-dir", str(root / "state"),
     ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -129,30 +140,18 @@ def main():
     parser = argparse.ArgumentParser()
     for key in ("nvxd", "repo", "initrd"):
         parser.add_argument("--" + key, required=True, type=pathlib.Path)
+    parser.add_argument("--diagnostic-agent", required=True, type=pathlib.Path)
     parser.add_argument("--output-dir", type=pathlib.Path)
     args = parser.parse_args()
     output = args.output_dir or pathlib.Path(tempfile.mkdtemp(prefix="nvx-p8-cleanup-"))
     output.mkdir(parents=True, exist_ok=True)
-    inputs = [args.initrd, args.repo / "scripts/build_p8_fault_runtime.sh",
-              args.repo / "scripts/p8_fault_observer.py", args.nvxd]
-    distro = distro_path()
-    if distro:
-        inputs += [distro, args.repo / "scripts/diagnostic_erofs.sh"]
+    inputs = [args.initrd, args.diagnostic_agent, args.nvxd]
     before = {str(path): sha256(path) for path in inputs}
-    diagnostic = output / "fault.cpio.gz"
-    subprocess.run(["wsl", "--exec", "sh", linux_path(inputs[1]),
-                    linux_path(args.initrd), linux_path(diagnostic),
-                    *([linux_path(distro)] if distro else [])],
-                   check=True, timeout=120)
-    diagnostic_distro = pathlib.Path(str(diagnostic) + ".erofs") if distro else None
     for mode in ("keeper", "strict-revoke", "source-unmap", "close-directory", "close-export"):
-        check_fault(args, diagnostic, mode, output, diagnostic_distro)
+        check_fault(args, mode, output)
     if before != {str(path): sha256(path) for path in inputs}:
         raise RuntimeError("inputs changed while testing")
-    (output / "assets.json").write_text(json.dumps({
-        "inputs": before, "diagnostic": sha256(diagnostic),
-        "diagnosticDistro": sha256(diagnostic_distro) if diagnostic_distro else None,
-    }, indent=2))
+    (output / "assets.json").write_text(json.dumps({"inputs": before}, indent=2))
 
 
 if __name__ == "__main__":

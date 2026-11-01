@@ -1069,7 +1069,7 @@ impl Context {
                 if failure.code == protocol::REASON_BACKEND_UNAVAILABLE {
                     self.mark_vm_lost(vm.generation, failure.message.clone());
                 }
-                self.finish_and_emit(id, Terminal::new("failed", None, failure.message));
+                self.finish_and_emit(id, Terminal::new("failed", None, format!("{}: {}", failure.code, failure.message)));
                 return;
             }
         }
@@ -1462,6 +1462,7 @@ impl Context {
                     return Err(fail("E_SESSION_CLOSE_FAILED", problem));
                 }
             }
+            let mut export_fault = None;
             let mut leftovers = info.shares;
             leftovers.extend(info.workspace_share);
             for share in leftovers {
@@ -1476,15 +1477,22 @@ impl Context {
                             vm.generation,
                             format!("isolated export cleanup failed for {}", share.child),
                         );
+                        export_fault.get_or_insert_with(|| format!("export {} could not be taken back", share.child));
                     }
-                    self.inner.lock().unwrap().removals.push(Removal {
-                        session: name.to_owned(),
-                        mount_id: share.mount.id.clone(),
-                        child: share.child.clone(),
-                        target: share.source_target.clone(),
-                        generation: vm.generation,
-                    });
+                    // The lost VM takes its exports with it; a retry would have no VM to ask.
+                    if guest_session.is_none() {
+                        self.inner.lock().unwrap().removals.push(Removal {
+                            session: name.to_owned(),
+                            mount_id: share.mount.id.clone(),
+                            child: share.child.clone(),
+                            target: share.source_target.clone(),
+                            generation: vm.generation,
+                        });
+                    }
                 }
+            }
+            if let Some(problem) = export_fault {
+                return Err(fail("E_SESSION_CLOSE_FAILED", problem));
             }
         }
         self.retire_if_idle();

@@ -522,6 +522,17 @@ pub trait RootOperations: EntryOperations {
         Err("this root cannot hold isolated sessions".to_owned())
     }
 
+    /// Fork extension: whether the root holds isolated sessions whose keepers must be watched.
+    fn watching(&self) -> bool {
+        false
+    }
+
+    /// Fork extension: fails with the problem, as text, once a session's keeper went away, which
+    /// leaves the isolation unproven; the worker then ends and takes the VM with it.
+    fn health(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Fork extension: binds the guest's runtime files, the time status of the guest's time daemon
     /// at `/run/nvx/time`, into the assembled root for every execution that enters it, once the
     /// root is ready, as a clone's application does. The teardown removes the binds first. Fails
@@ -846,6 +857,7 @@ fn serve<S: Read + Write + AsFd>(
         }
         executions.run(Instant::now(), &mut connection)?;
         connection.credit()?;
+        operations.health().map_err(ServeError::Execution)?;
         // A clone's activation fails once its deadline passed before the clone was ready, whether
         // the host sent anything or not.
         if let Some(worked) = phase.tick() {
@@ -864,7 +876,7 @@ fn serve<S: Read + Write + AsFd>(
         // Once a clone's announcer ended, whenever it ends, the gateway keeps publishing the
         // listeners that it last announced, and learns of no later change of them: the clone's
         // activation fails finally with the network's class, which ends the clone.
-        if wait(&connection, &executions, phase.deadline(), announcer)?
+        if wait(&connection, &executions, phase.deadline(), announcer, operations.watching())?
             && let Some(problem) = operations.announcer_ended()
         {
             executions.clear();
@@ -954,6 +966,7 @@ fn wait<S: Read + Write + AsFd>(
     executions: &Executions,
     deadline: Option<Instant>,
     announcer: Option<BorrowedFd<'_>>,
+    watching: bool,
 ) -> Result<bool, ServeError> {
     let overloaded = connection.is_overloaded();
     let mut events = PollFlags::empty();
@@ -969,7 +982,8 @@ fn wait<S: Read + Write + AsFd>(
         descriptors.push(PollFd::new(pidfd, PollFlags::POLLIN));
         descriptors.len() - 1
     });
-    let deadline = [executions.deadline(), deadline]
+    let watch = watching.then(|| Instant::now() + Duration::from_millis(50));
+    let deadline = [executions.deadline(), deadline, watch]
         .into_iter()
         .flatten()
         .min();
@@ -1535,8 +1549,21 @@ impl RootOperations for LibraryRoot {
             return Err("the worker holds no root to unmount from".to_owned());
         };
         let path = assembled.root().path().join(target.trim_start_matches('/'));
-        umount2(&path, MntFlags::MNT_DETACH)
-            .map_err(|error| format!("cannot unmount {}: {error}", path.display()))?;
+        if target.starts_with("/sessions/") {
+            // A session's export is unmounted strictly: a lazy unmount would hide a handle that
+            // is still open. The kernel may release a just-closed namespace's mounts a moment late.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match umount2(&path, MntFlags::empty()) {
+                    Ok(()) => break,
+                    Err(Errno::EBUSY) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                    Err(error) => return Err(format!("cannot unmount {}: {error}", path.display())),
+                }
+            }
+        } else {
+            umount2(&path, MntFlags::MNT_DETACH)
+                .map_err(|error| format!("cannot unmount {}: {error}", path.display()))?;
+        }
         self.live.retain(|live| live != target);
         Ok(())
     }
@@ -1627,6 +1654,14 @@ impl RootOperations for LibraryRoot {
             Some(root) => root.teardown(),
             None => Ok(()),
         }
+    }
+
+    fn watching(&self) -> bool {
+        self.sessions.has_sessions()
+    }
+
+    fn health(&mut self) -> Result<(), String> {
+        self.sessions.health()
     }
 
     fn session_open(&mut self, id: u64, workspace: &str, share_network: bool) -> Result<(), String> {

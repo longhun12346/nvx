@@ -24,6 +24,8 @@ host = ["nvx/host", "dep:serde_json"]
 # The guest agent: the guest API of `nvx` and the `runtime-adapter-guest` binary, which builds as a
 # static `x86_64-unknown-linux-musl` executable.
 guest = ["nvx/guest", "dep:nix", "dep:libc"]
+# A diagnostic agent that injects the faults of the cleanup suite (never part of a product build).
+fault-observer = ["guest"]
 
 [dependencies]
 nvx = { path = "../../nvx-rs", default-features = false }

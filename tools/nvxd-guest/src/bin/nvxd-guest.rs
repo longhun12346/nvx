@@ -55,7 +55,7 @@ fn main() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     // The helpers of the session isolation are this binary started again with a hidden command.
     if let Some(command) = arguments.first().and_then(|command| command.to_str()) {
-        if command.starts_with("__session-") {
+        if command.starts_with("__") {
             let rest = arguments[1..]
                 .iter()
                 .map(|argument| argument.to_string_lossy().into_owned())

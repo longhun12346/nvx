@@ -9,6 +9,8 @@
 mod enter;
 mod keeper;
 mod mountctl;
+#[cfg(feature = "fault-observer")]
+mod observer;
 mod sys;
 
 use std::collections::BTreeMap;
@@ -31,7 +33,8 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const STORE: &str = "/run/nvxd-sessions";
 
 /// The hidden commands of this binary that act as session helpers.
-pub const HELPER_COMMANDS: [&str; 4] = ["__session-keeper", "__session-enter", "__session-bind", "__session-unbind"];
+pub const HELPER_COMMANDS: [&str; 5] =
+    ["__session-keeper", "__session-enter", "__session-bind", "__session-unbind", "__p8-observer"];
 
 /// Runs the helper named `command` with `arguments`, if it is one, and returns its exit status.
 pub fn run_helper(command: &str, arguments: &[String]) -> Option<i32> {
@@ -40,6 +43,8 @@ pub fn run_helper(command: &str, arguments: &[String]) -> Option<i32> {
         "__session-enter" => enter::helper_main(arguments),
         "__session-bind" => mountctl::bind_main(arguments),
         "__session-unbind" => mountctl::unbind_main(arguments),
+        #[cfg(feature = "fault-observer")]
+        "__p8-observer" => observer::run(arguments),
         _ => return None,
     })
 }
@@ -67,6 +72,9 @@ pub struct Sessions {
     broken: bool,
     /// Set once a program ran outside a session; private sessions then need a new VM.
     legacy_used: bool,
+    /// The fault observer of a diagnostic agent, started with the first session.
+    #[cfg(feature = "fault-observer")]
+    observer: Option<Child>,
 }
 
 impl Sessions {
@@ -83,6 +91,22 @@ impl Sessions {
     /// Whether any session was ever created in this VM.
     pub fn ever_used(&self) -> bool {
         self.highest != 0
+    }
+
+    /// Whether any session is resident.
+    pub fn has_sessions(&self) -> bool {
+        !self.table.is_empty()
+    }
+
+    /// Fails once a resident session's keeper went away.
+    pub fn health(&mut self) -> Result<(), String> {
+        for (id, session) in &mut self.table {
+            if !matches!(session.launcher.try_wait(), Ok(None)) {
+                self.broken = true;
+                return Err(format!("the keeper of session {id} ended; its isolation is unproven"));
+            }
+        }
+        Ok(())
     }
 
     /// Records that a program ran outside every session.
@@ -128,6 +152,12 @@ impl Sessions {
             .map(|(parent, _)| parent.to_owned())
             .filter(|parent| parent.starts_with("/sessions/"))
             .ok_or_else(|| errno_text(libc::EINVAL, "bad workspace path"))?;
+        #[cfg(feature = "fault-observer")]
+        if self.observer.is_none() {
+            self.observer = std::env::current_exe().ok().and_then(|executable| {
+                Command::new(executable).arg0("nvxd-guest").arg("__p8-observer").arg(root).stdin(Stdio::null()).spawn().ok()
+            });
+        }
         let uid = self.next_uid;
         self.next_uid += 1;
         // A failed attempt cannot reuse the identity.

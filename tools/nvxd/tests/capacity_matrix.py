@@ -4,7 +4,7 @@ This workload-specific report does not promise arbitrary eight-task memory safet
 It measures each VM through its own sidecar, and records SHA256 for all inputs.
 """
 
-from runtime_assets import artifact_args, distro_path
+from runtime_assets import _named, artifact_args, distro_path
 
 import argparse
 import ctypes
@@ -220,14 +220,22 @@ def main():
     for name in ("repo", "nvxd", "initrd", "output"):
         parser.add_argument("--" + name, type=pathlib.Path, required=True)
     parser.add_argument("--repetitions", type=int, default=2)
+    parser.add_argument(
+        "--modes", default="shared,isolated",
+        help="comma-separated rows to measure; the gate's case needs both",
+    )
     args = parser.parse_args()
+    modes = [mode.strip() for mode in args.modes.split(",") if mode.strip()]
+    if not modes or any(mode not in ("shared", "isolated") for mode in modes):
+        raise ValueError("--modes names shared, isolated or both")
     if args.repetitions < 1:
         raise ValueError("at least one complete matrix repetition is required")
     if args.output.exists():
         raise RuntimeError("choose a new report path")
     sources = {
-        "sidecar": args.nvxd, "runtime": args.initrd, "kernel": args.repo / "build/vmlinux",
-        "openvmm": args.repo / "openvmm/target/release/openvmm.exe",
+        "sidecar": args.nvxd, "runtime": _named("NVX_INITRD") or args.initrd,
+        "kernel": _named("NVX_KERNEL") or args.repo / "build/vmlinux",
+        "openvmm": _named("NVX_OPENVMM") or args.repo / "openvmm/target/release/openvmm.exe",
         "helper": args.repo / "tools/nvxd/tests/p8_support.py",
         "measurement": pathlib.Path(__file__),
     }
@@ -239,8 +247,9 @@ def main():
         "nvxRevision": subprocess.check_output(["git", "-C", str(args.repo), "rev-parse", "HEAD"],
                                               text=True).strip(),
         "recordedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "openvmmRevision": subprocess.check_output(
-            ["git", "-C", str(args.repo / "openvmm"), "rev-parse", "HEAD"], text=True).strip(),
+        "openvmmRevision": subprocess.run(
+            ["git", "-C", str(args.repo / "openvmm"), "rev-parse", "HEAD"],
+            capture_output=True, text=True).stdout.strip() or "unavailable",
         "workingTree": subprocess.check_output(
             ["git", "-C", str(args.repo), "status", "--short"], text=True).splitlines(),
         "host": json.loads(subprocess.check_output([
@@ -261,13 +270,18 @@ def main():
         for memory in (1024, 2048, 3072, 4096):
             for repetition in range(args.repetitions):
                 for isolated in (False, True):
+                    if ("isolated" if isolated else "shared") not in modes:
+                        continue
                     result = measure(args, isolated, memory, repetition)
                     report["results"].append(result)
                     print(json.dumps(result), flush=True)
         if hashes != {name: digest(path) for name, path in sources.items()}:
             raise RuntimeError("input assets changed during measurement")
         report["passed"] = True
-        print("CASE p8.capacity.eight_sessions_four_tiers PASS", flush=True)
+        if sorted(modes) == ["isolated", "shared"]:
+            print("CASE p8.capacity.eight_sessions_four_tiers PASS", flush=True)
+        else:
+            print(f"capacity matrix rows {modes} passed; the gate's case needs both", flush=True)
     finally:
         args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
 

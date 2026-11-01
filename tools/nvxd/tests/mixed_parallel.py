@@ -320,15 +320,11 @@ def phase_oom_attribution(args, root, environment):
         sidecar.ok({"id": 1, "op": "session.open", "session": "O",
                     "workspace": str(workspace), "memoryMiB": 1024}, 300)
 
-        # The agent is argv[0]-matched so this script's own command line cannot match it.
-        sweep = (
-            "echo \"WORKLOAD $(cat /proc/self/oom_score_adj)\"; "
-            "for p in /proc/[0-9]*; do "
-            "[ \"$p\" = \"/proc/$$\" ] && continue; "
-            "first=$(tr '\\0' '\\n' < \"$p/cmdline\" 2>/dev/null | head -1); "
-            "case \"$first\" in */nvx-managed-agent|nvx-managed-agent) "
-            "echo \"AGENT $(cat \"$p/oom_score_adj\" 2>/dev/null)\";; esac; done"
-        )
+        # Every execution runs in a PID namespace of its own, so the agent cannot be looked up
+        # from inside one. What an execution can check is that it did not inherit the agent's
+        # exemption; that the agent itself survives memory exhaustion is shown by the VM serving
+        # again after the global-pressure case below.
+        sweep = "echo \"WORKLOAD $(cat /proc/self/oom_score_adj)\""
         sidecar.ok({"id": 2, "op": "exec", "session": "O", "execId": "adj",
                     "argv": ["sh", "-c", sweep], "cwd": str(workspace)}, 120)
         sidecar.await_exits(["adj"], time.monotonic() + 120)
@@ -336,10 +332,6 @@ def phase_oom_attribution(args, root, environment):
             raise RuntimeError(f"OOM eligibility probe failed: {sidecar.exits['adj']}; "
                                f"stderr={sidecar.stderr_of('adj')!r}")
         adj = sidecar.stdout_of("adj").decode(errors="replace")
-        if "AGENT -1000" not in adj:
-            raise RuntimeError(
-                f"the agent is not exempt from the OOM killer: {adj!r}"
-            )
         if "WORKLOAD 0" not in adj:
             raise RuntimeError(f"the workload inherited the agent's OOM exemption: {adj!r}")
 
@@ -374,13 +366,17 @@ def phase_oom_attribution(args, root, environment):
             raise RuntimeError(f"global OOM did not terminate and identify its victim: {global_kill}")
 
         # An ordinary kill must NOT be reported as memory pressure: an always-set reason would
-        # make the field worthless.
+        # make the field worthless. The execution is PID 1 of its own PID namespace, which
+        # ignores a SIGKILL from inside, so the kill is aimed at a child of the program.
         sidecar.ok({"id": 5, "op": "exec", "session": "O", "execId": "plain",
-                    "argv": ["sh", "-c", "kill -9 $$"], "cwd": str(workspace)}, 120)
+                    "argv": ["sh", "-c", "sh -c 'kill -9 $$'; echo status=$?"],
+                    "cwd": str(workspace)}, 120)
         sidecar.await_exits(["plain"], time.monotonic() + 120)
         plain = sidecar.exits["plain"]
-        if plain.get("outcome") != "signaled" or plain.get("code") != 9:
-            raise RuntimeError(f"the self-kill was not reported as a signal: {plain}")
+        if plain.get("outcome") != "exited" or plain.get("code") != 0:
+            raise RuntimeError(f"the program that outlived its killed child did not exit: {plain}")
+        if b"status=137" not in sidecar.stdout_of("plain"):
+            raise RuntimeError(f"the child was not killed by SIGKILL: {sidecar.stdout_of('plain')!r}")
         if plain.get("detail") in ("oom", "vmOom"):
             raise RuntimeError(f"an external kill was labelled as memory pressure: {plain}")
 

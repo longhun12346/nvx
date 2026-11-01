@@ -16,7 +16,6 @@ on:
   push:
     branches:
       - productization
-      - migration/**
     paths:
       - kernel/**
       - guest/**

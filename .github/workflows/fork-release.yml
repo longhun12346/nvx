@@ -83,7 +83,7 @@ jobs:
           64-bit Windows binaries and Ubuntu guest assets built by GitHub Actions from commit ${SHA}.
 
           - Binaries: run ${BINARIES_RUN} of Fork CI (nvx-windows-x64.zip: nvxd.exe, openvmm.exe, whp-legacy-cpuid-probe.exe).
-          - Guest assets: run ${GUEST_RUN} of Fork guest assets (nvx-guest-assets.zip: vmlinux, Ubuntu initramfs, stage initramfs, EROFS distro layer, manifests).
+          - Guest assets: run ${GUEST_RUN} of Fork guest assets (nvx-guest-assets.zip: vmlinux, base initramfs, nvxd-guest agent, EROFS distro layer, manifests).
           - SHA256SUMS covers the two zip files; CONTENT-SHA256SUMS.txt lists the files inside them.
           - Nothing here is signed.
           - The Linux kernel (vmlinux) is GPL-2.0-only. Its corresponding source is Linux 6.18.38 (the archive named in vmlinux.provenance.json) with the patches in kernel/patches and the configuration kernel/config-microvm of this commit. The Ubuntu userland keeps its own licenses; its package list is in ubuntu-distro.erofs.manifest.json, and the sources are in the Ubuntu archive.

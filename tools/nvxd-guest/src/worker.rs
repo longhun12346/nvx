@@ -389,6 +389,8 @@ pub const MAX_HISTORY: usize = 1024;
 
 /// The kernel command line, from which the worker reads the boot layout of the root.
 const COMMAND_LINE: &str = "/proc/cmdline";
+/// Where the guest's time daemon publishes its status, which executions see at the same path.
+const TIME_STATUS: &str = "/run/nvx/time";
 
 /// How one execution enters the assembled root: the inputs of its `nvx::guest::entry::Entry` that
 /// the worker chooses. The entry keeps its defaults for the rest: new mount, PID, and UTS
@@ -484,6 +486,14 @@ pub trait RootOperations: EntryOperations {
     /// [`bind_live`](Self::bind_live) bound. Fails with the problem, as text.
     fn unbind_live(&mut self, _target: &str) -> Result<(), String> {
         Err("this root cannot unbind live mounts".to_owned())
+    }
+
+    /// Fork extension: binds the guest's runtime files, the time status of the guest's time daemon
+    /// at `/run/nvx/time`, into the assembled root for every execution that enters it, once the
+    /// root is ready, as a clone's application does. The teardown removes the binds first. Fails
+    /// with the problem, as text.
+    fn bind_runtime(&mut self, _sandbox: &Sandbox) -> Result<(), String> {
+        Ok(())
     }
 
     /// Returns the pidfd of the announcer of the workload's listeners that a clone's application,
@@ -970,6 +980,10 @@ fn configure_root(
     match message {
         Message::RootConfig(body) => Ok(match assemble(operations, &body) {
             Ok((config, sandbox)) => {
+                if let Err(problem) = operations.bind_runtime(&sandbox) {
+                    // The executions run without the time status; nothing else depends on it.
+                    eprintln!("nvxd-guest: cannot bind the runtime files: {problem}");
+                }
                 executions.run_in(operations.cgroups(), sandbox);
                 let ready = Ready::new(GUEST_BUILD).expect("this crate's version is a build");
                 let step = Step::Continue(vec![Message::Ready(ready.encode())]);
@@ -1026,6 +1040,11 @@ fn serve_root<S: Read + Write + AsFd>(
         }
         Message::MountRemove(body) if order.is_started() => {
             Step::Continue(vec![live_unmount(operations, &body)])
+        }
+        // Fork extension: the limits of an execution come just before its start, without an answer.
+        Message::ExecLimits(body) if order.is_started() => {
+            executions.set_limits(&body)?;
+            Step::Continue(Vec::new())
         }
         Message::Stop => {
             executions.clear();
@@ -1213,6 +1232,9 @@ pub struct LibraryRoot {
     /// The targets of the live binds that [`RootOperations::bind_live`] made, in order, which the
     /// teardown unmounts first: they keep the root's mount busy.
     live: Vec<String>,
+    /// The binds of the runtime files that [`RootOperations::bind_runtime`] made, which the
+    /// teardown removes first.
+    runtime_binds: Option<nvx::guest::entry::RuntimeBinds>,
 }
 
 /// A root that the worker assembled: a cold boot's, from its root configuration, or a clone's,
@@ -1270,6 +1292,7 @@ impl LibraryRoot {
             export: None,
             root: None,
             live: Vec::new(),
+            runtime_binds: None,
         }
     }
 }
@@ -1471,7 +1494,26 @@ impl RootOperations for LibraryRoot {
     /// announcer that the application started, if any, and removes the runtime's binds that the
     /// application made on the root first, since they keep the root's mount busy too. A root whose
     /// teardown failed keeps its mounts.
+    fn bind_runtime(&mut self, sandbox: &Sandbox) -> Result<(), String> {
+        let Some(root) = self.root.as_ref().map(Assembled::root) else {
+            return Err("the worker holds no root".to_owned());
+        };
+        let (uid, gid) = sandbox.identity.unwrap_or((0, 0));
+        let binds = Entry::new(root.path(), entry::Identity::new(uid, gid))
+            .hostname(sandbox.hostname.clone())
+            .publication(sandbox.publication)
+            .time_status(TIME_STATUS)
+            .bind_runtime()
+            .map_err(|error| error.to_string())?;
+        self.runtime_binds = Some(binds);
+        Ok(())
+    }
+
     fn teardown(&mut self) -> Result<(), String> {
+        if let Some(binds) = self.runtime_binds.take() {
+            // Best effort: a bind that is gone already is no failure of the teardown.
+            let _ = binds.remove();
+        }
         self.export = None;
         let left: Vec<String> = std::mem::take(&mut self.live);
         for target in left.iter().rev() {

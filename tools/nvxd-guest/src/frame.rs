@@ -134,6 +134,15 @@ pub enum Message {
     /// Fork extension: the guest's answer to a [`Message::MountAdd`] or [`Message::MountRemove`]
     /// that failed, with the problem as UTF-8 text.
     MountFailed(Vec<u8>),
+    /// Fork extension: sent before an execution's [`Start`](crate::exec::Start), the resource limits
+    /// of the execution as UTF-8 `id\nmemory_bytes\ncpu_percent\npids`, where `id` is the decimal ID
+    /// of the execution's key and each limit is a decimal number, 0 for none. The guest keeps them
+    /// until the start, and refuses a start whose limits it cannot apply. It answers nothing.
+    ExecLimits(Vec<u8>),
+    /// Fork extension: sent by the guest before the terminal record of an execution that a kill by
+    /// the kernel's out-of-memory killer ended, as UTF-8 `id\noom|vmOom`: `oom` when the execution's
+    /// own memory limit was reached, `vmOom` when the guest as a whole ran out of memory.
+    ExecOom(Vec<u8>),
 }
 
 impl Message {
@@ -199,6 +208,8 @@ impl Message {
             Self::MountRemove(body) => (Kind::MountRemove, body),
             Self::Mounted => (Kind::Mounted, &[]),
             Self::MountFailed(body) => (Kind::MountFailed, body),
+            Self::ExecLimits(body) => (Kind::ExecLimits, body),
+            Self::ExecOom(body) => (Kind::ExecOom, body),
         }
     }
 }
@@ -266,6 +277,10 @@ const KIND_MOUNT_REMOVE: u8 = 101;
 const KIND_MOUNTED: u8 = 102;
 /// Kind of a [`Message::MountFailed`].
 const KIND_MOUNT_FAILED: u8 = 103;
+/// Kind of a [`Message::ExecLimits`].
+const KIND_EXEC_LIMITS: u8 = 104;
+/// Kind of a [`Message::ExecOom`].
+const KIND_EXEC_OOM: u8 = 105;
 
 /// Kind of a [`Message`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,6 +348,10 @@ enum Kind {
     Mounted = KIND_MOUNTED,
     /// [`Message::MountFailed`].
     MountFailed = KIND_MOUNT_FAILED,
+    /// [`Message::ExecLimits`].
+    ExecLimits = KIND_EXEC_LIMITS,
+    /// [`Message::ExecOom`].
+    ExecOom = KIND_EXEC_OOM,
 }
 
 impl Kind {
@@ -370,6 +389,8 @@ impl Kind {
             KIND_MOUNT_REMOVE => Some(Self::MountRemove),
             KIND_MOUNTED => Some(Self::Mounted),
             KIND_MOUNT_FAILED => Some(Self::MountFailed),
+            KIND_EXEC_LIMITS => Some(Self::ExecLimits),
+            KIND_EXEC_OOM => Some(Self::ExecOom),
             _ => None,
         }
     }
@@ -396,7 +417,9 @@ impl Kind {
             | Self::MapFailed
             | Self::MountAdd
             | Self::MountRemove
-            | Self::MountFailed => MAX_TEXT_BODY,
+            | Self::MountFailed
+            | Self::ExecLimits
+            | Self::ExecOom => MAX_TEXT_BODY,
             Self::ExecInputEnd
             | Self::ExecCancel
             | Self::ExecCredit
@@ -451,6 +474,8 @@ impl Kind {
             Self::MountRemove => Message::MountRemove(body),
             Self::Mounted => Message::Mounted,
             Self::MountFailed => Message::MountFailed(body),
+            Self::ExecLimits => Message::ExecLimits(body),
+            Self::ExecOom => Message::ExecOom(body),
         }
     }
 }
@@ -655,6 +680,8 @@ mod tests {
             Message::MountRemove(b"/sessions/a/workspace".to_vec()),
             Message::Mounted,
             Message::MountFailed(vec![b'x'; MAX_TEXT_BODY]),
+            Message::ExecLimits(b"7\n536870912\n150\n64".to_vec()),
+            Message::ExecOom(b"7\noom".to_vec()),
             Message::Stop,
             Message::Stopped,
         ]

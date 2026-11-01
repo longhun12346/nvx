@@ -29,6 +29,7 @@ use nvx::guest::spawn::Command;
 use super::connection::{BACKLOG, Connection};
 use super::{Entrance, EntryOperations, MAX_EXECUTION_MEMORY, MAX_EXECUTIONS, MAX_HISTORY};
 use crate::exec::{AccountMode, GuestMessage, HostMessage, Identity, MAX_CHUNK, Start, name};
+use crate::frame::Message;
 use crate::guest::ServeError;
 
 /// The device that a program without the host's input reads.
@@ -86,6 +87,99 @@ pub(super) struct Executions {
     history: VecDeque<u64>,
     /// The buffer into which each read of an output stream goes: a chunk at most.
     buffer: Vec<u8>,
+    /// Fork extension: the resource limits that the host announced for the executions it has not
+    /// started yet, by ID.
+    limits: BTreeMap<u64, Resources>,
+    /// Fork extension: whether the worker exempted itself from the kernel's out-of-memory killer,
+    /// so that it lifts the exemption while it spawns a program, which would inherit it.
+    exempt: bool,
+}
+
+/// Fork extension: the resource limits of one execution, as the host announces them: each is 0
+/// for none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Resources {
+    /// The most memory that the execution's processes use together, in bytes.
+    memory: u64,
+    /// The share of one processor that the execution gets, in percent, which may exceed 100.
+    cpu_percent: u64,
+    /// The most processes and threads that the execution has.
+    pids: u64,
+}
+
+impl Resources {
+    /// Parses the body of a [`Message::ExecLimits`], `id\nmemory\ncpu\npids`, and returns the
+    /// execution's ID with its limits.
+    fn parse(body: &[u8]) -> Option<(u64, Self)> {
+        let text = std::str::from_utf8(body).ok()?;
+        let mut fields = text.split('\n').map(|field| field.parse::<u64>().ok());
+        let id = fields.next()??;
+        let memory = fields.next()??;
+        let cpu_percent = fields.next()??;
+        let pids = fields.next()??;
+        if fields.next().is_some() {
+            return None;
+        }
+        Some((id, Self { memory, cpu_percent, pids }))
+    }
+
+    /// Returns the controller files to write in the execution's cgroup. The group kill and the
+    /// no-swap rule go with every execution, so that the kernel's events tell whether it hit its
+    /// limit, and an execution never takes swap from its neighbours.
+    fn files(&self) -> Vec<(&'static str, String)> {
+        let mut files = vec![("memory.oom.group", "1".to_owned())];
+        if self.memory > 0 {
+            files.push(("memory.max", self.memory.to_string()));
+            files.push(("memory.swap.max", "0".to_owned()));
+        }
+        if self.cpu_percent > 0 {
+            files.push(("cpu.max", format!("{} {CPU_PERIOD}", self.cpu_percent * CPU_PERIOD / 100)));
+        }
+        if self.pids > 0 {
+            files.push(("pids.max", self.pids.to_string()));
+        }
+        files
+    }
+
+    /// Returns whether the execution has a limit that needs a controller beyond the memory events.
+    fn any(&self) -> bool {
+        self.memory > 0 || self.cpu_percent > 0 || self.pids > 0
+    }
+}
+
+/// The period of the processor limit of an execution, in microseconds.
+const CPU_PERIOD: u64 = 100_000;
+
+/// The file through which a process lowers its own exemption from the kernel's out-of-memory
+/// killer.
+const OOM_SCORE_ADJUSTMENT: &str = "/proc/self/oom_score_adj";
+
+/// Writes the out-of-memory score adjustment of this process.
+fn adjust_oom_score(value: &str) -> bool {
+    std::fs::write(OOM_SCORE_ADJUSTMENT, value).is_ok()
+}
+
+/// Lifts the worker's exemption from the out-of-memory killer while it spawns a program, which
+/// inherits the score, and restores it afterwards.
+struct Unexempt {
+    /// Whether the worker was exempt before, so that it restores the exemption.
+    was: bool,
+}
+
+impl Unexempt {
+    /// Lifts the exemption if `exempt` says the worker has one.
+    fn lift(exempt: bool) -> Self {
+        let was = exempt && adjust_oom_score("0");
+        Self { was }
+    }
+}
+
+impl Drop for Unexempt {
+    fn drop(&mut self) {
+        if self.was {
+            adjust_oom_score("-1000");
+        }
+    }
 }
 
 /// The sandbox in which the executions run once the root is ready: what every execution's
@@ -138,6 +232,30 @@ struct Run {
     settled: bool,
 }
 
+impl Run {
+    /// Fork extension: returns `oom` if the kernel killed a process of the execution because the
+    /// execution reached its own memory limit, `vmOom` if it killed one because the guest ran out
+    /// of memory, and none otherwise, from the `memory.events` of the execution's cgroup.
+    fn oom_class(&self) -> Option<&'static str> {
+        let cgroup = self.cgroup.as_ref()?;
+        let events = std::fs::read_to_string(cgroup.path().join("memory.events")).ok()?;
+        let count = |name: &str| {
+            events
+                .lines()
+                .filter_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+                .find_map(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        if count("oom_kill") == 0 {
+            None
+        } else if count("oom") > 0 {
+            Some("oom")
+        } else {
+            Some("vmOom")
+        }
+    }
+}
+
 impl Executions {
     /// Returns no executions, which run in process groups alone, with the default hostname,
     /// without a workload identity, and with published listeners, until
@@ -158,7 +276,18 @@ impl Executions {
             generations: BTreeMap::new(),
             history: VecDeque::new(),
             buffer: vec![0; MAX_CHUNK as usize],
+            limits: BTreeMap::new(),
+            exempt: false,
         }
+    }
+
+    /// Fork extension: keeps the limits that the host announced in `body` until it starts the
+    /// execution they name.
+    pub(super) fn set_limits(&mut self, body: &[u8]) -> Result<(), ServeError> {
+        let (id, resources) = Resources::parse(body)
+            .ok_or_else(|| ServeError::Execution("malformed execution limits".to_owned()))?;
+        self.limits.insert(id, resources);
+        Ok(())
     }
 
     /// Runs the executions that start from now on in `cgroups`, and in `sandbox`: each in a
@@ -167,6 +296,10 @@ impl Executions {
     pub(super) fn run_in(&mut self, cgroups: Option<Layout>, sandbox: Sandbox) {
         self.cgroups = cgroups;
         self.sandbox = sandbox;
+        // Fork extension: the worker is the agent. The kernel's out-of-memory killer never picks
+        // it, so a program that exhausts the guest costs the program, not the host's control of
+        // the guest. Programs get the default score back when they are spawned.
+        self.exempt = adjust_oom_score("-1000");
     }
 
     /// Hands `message` from the host to its execution at `now`, and queues on `connection` the
@@ -528,18 +661,29 @@ impl Executions {
         start: &Start,
         operations: &mut dyn EntryOperations,
     ) -> io::Result<(Execution, Option<Child>, Option<ExecutionCgroup>)> {
+        let resources = self.limits.remove(&start.key.id()).unwrap_or_default();
         let entrance = self.entrance(start)?;
         let prepared = operations
             .prepare(&entrance)
             .map_err(|error| io::Error::from(refusal(&error)))?;
+        let exempt = self.exempt;
         let Some(cgroups) = &self.cgroups else {
+            // Fork extension: limits that the worker cannot apply refuse the execution, which
+            // never runs without them.
+            if resources.any() {
+                return Err(Errno::EOPNOTSUPP.into());
+            }
+            let _lifted = Unexempt::lift(exempt);
             let (execution, program) = spawn(start, prepared, None, operations, &mut self.reaping)
                 .map_err(|unstarted| unstarted.error)?;
             return Ok((execution, program, None));
         };
         self.prepared += 1;
         let name = format!("execution-{}", self.prepared);
-        let cgroup = ExecutionCgroup::prepare(cgroups, Some(&name), &[])?;
+        let files = resources.files();
+        let files: Vec<(&str, &str)> = files.iter().map(|(file, value)| (*file, value.as_str())).collect();
+        let cgroup = ExecutionCgroup::prepare(cgroups, Some(&name), &files)?;
+        let _lifted = Unexempt::lift(exempt);
         match spawn(
             start,
             prepared,
@@ -694,7 +838,15 @@ impl Run {
                 Event::Message(message) => {
                     match message {
                         runner::Message::Output { length: bytes, .. } => read += bytes,
-                        runner::Message::Terminal(outcome) => self.settled = outcome.is_reusable(),
+                        runner::Message::Terminal(outcome) => {
+                            self.settled = outcome.is_reusable();
+                            // Fork extension: tell the host why the kernel killed the execution,
+                            // before the terminal record that it is attached to.
+                            if let Some(class) = self.oom_class() {
+                                let body = format!("{}\n{class}", key.id()).into_bytes();
+                                connection.send(&Message::ExecOom(body))?;
+                            }
+                        }
                         _ => {}
                     }
                     if let Some(message) = GuestMessage::from_runner(key, message, lent) {

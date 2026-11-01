@@ -90,11 +90,24 @@ jobs:
           python3 scripts/nvx.py build-initramfs
           python3 scripts/nvx.py build-distro-layer --guest ubuntu --output build/ubuntu-distro.erofs
 
+      # The guest agent the sidecar adds to a copy of the base initramfs at every VM start: a static
+      # musl executable of the fork-owned crate.
+      - name: Build the guest agent (static musl)
+        working-directory: tools/nvxd-guest
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' ../../rust-toolchain.toml)
+          cargo "+${channel}" build --locked --release --features guest \
+            --target x86_64-unknown-linux-musl --bin nvxd-guest
+          test -x target/x86_64-unknown-linux-musl/release/nvxd-guest
+          file target/x86_64-unknown-linux-musl/release/nvxd-guest || true
+
       - name: Collect the assets the sidecar uses
         run: |
           set -euo pipefail
           out=dist/nvx-guest-assets
           mkdir -p "${out}"
+          cp tools/nvxd-guest/target/x86_64-unknown-linux-musl/release/nvxd-guest "${out}/"
           for file in vmlinux vmlinux.config vmlinux.provenance.json \
               ubuntu-distro.erofs ubuntu-distro.erofs.manifest.json \
               initramfs.cpio.gz initramfs.cpio.gz.packages.json; do

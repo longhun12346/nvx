@@ -12,6 +12,7 @@ on:
   push:
     branches:
       - productization
+      - migration/**
   pull_request:
     branches:
       - productization
@@ -207,11 +208,16 @@ jobs:
           cargo "+${{ steps.rust.outputs.channel }}" build --locked --release
           -p openvmm --bin openvmm -p whp --bin whp-legacy-cpuid-probe
 
+      - name: Build nvxd (release)
+        working-directory: tools/nvxd
+        run: cargo "+${{ steps.rust.outputs.channel }}" build --locked --release
+
       - name: Collect the binaries and prove they are 64-bit
         run: |
           set -euo pipefail
           out=dist/nvx-windows-x64
           mkdir -p "${out}"
+          cp tools/nvxd/target/release/nvxd.exe "${out}/"
           cp openvmm/target/release/openvmm.exe "${out}/"
           cp openvmm/target/release/whp-legacy-cpuid-probe.exe "${out}/"
           cp LICENSE THIRD_PARTY_NOTICES.md "${out}/"

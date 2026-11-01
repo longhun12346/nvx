@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Final
 
@@ -157,13 +158,23 @@ class GuestRustBuildConstants:
     """Pinned inputs and outputs of the Rust guest-binary build."""
 
     DIRECTORY: Final = BuildConstants.REPO_ROOT / "nvx-rs"
-    MANIFEST: Final = DIRECTORY / "Cargo.toml"
-    LOCKFILE: Final = DIRECTORY / "Cargo.lock"
-    BUILD_SCRIPT: Final = DIRECTORY / "build.rs"
-    SOURCE_DIRECTORIES: Final = (DIRECTORY / "src",)
-    BUILD_RECIPE_FILES: Final = (
-        BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "build_constants.py",
-        BuildConstants.REPO_ROOT / "scripts" / "nvx_tools" / "guest_binaries.py",
+    # The inputs of every guest executable, relative to a checkout's root: these
+    # files, and every file under SOURCE_DIRECTORIES that SOURCE_PATTERN matches.
+    SOURCE_FILES: Final = (
+        Path("nvx-rs") / "Cargo.toml",
+        Path("nvx-rs") / "Cargo.lock",
+        Path("nvx-rs") / "build.rs",
+        Path("rust-toolchain.toml"),
+        Path("scripts") / "nvx_tools" / "build_constants.py",
+        Path("scripts") / "nvx_tools" / "guest_binaries.py",
+    )
+    SOURCE_DIRECTORY: Final = Path("nvx-rs") / "src"
+    # The Cargo configuration that a build in the crate reads, and the sources.
+    SOURCE_DIRECTORIES: Final = (Path("nvx-rs") / ".cargo", SOURCE_DIRECTORY)
+    # Test-only modules that no guest build compiles, besides `tests.rs` files and
+    # `tests` directories.
+    TEST_MODULES: Final = (
+        SOURCE_DIRECTORY / "guest" / "managed_agent" / "loopback.rs",
     )
     TOOLCHAIN_FILE: Final = BuildConstants.REPO_ROOT / "rust-toolchain.toml"
     TOOLCHAIN: Final = OpenVMMBuildConstants.RUST_TOOLCHAIN
@@ -171,21 +182,52 @@ class GuestRustBuildConstants:
     PROFILE: Final = "guest"
     FEATURE: Final = "guest"
     BINARIES_VARIABLE: Final = "NVX_GUEST_BINARIES"
-    SOURCE_DIGEST_FORMAT: Final = 1
+    SOURCE_DIGEST_FORMAT: Final = 2
     SOURCE_DIGEST_DOMAIN: Final = "nvx-rust-guest-binaries"
     BUILD_MANIFEST_NAME: Final = "manifest.json"
     BUILD_MANIFEST_FORMAT: Final = 1
     BUILD_MANIFEST_DOMAIN: Final = "nvx-rust-guest-binary-build"
+    OUTPUT_DIRECTORY_NAME: Final = "guest-binaries"
+    SOURCE_PATHS: Final = ("nvx-rs", "rust-toolchain.toml")
     BINARIES: Final = (
         "nvx-console-pending",
         "nvx-mmio-write",
         "nvx-reseed",
         "nvx-exit",
         "nvx-device-io",
+        "nvx-managed-agent",
+        "nvx-ingress",
+        "nvx-time",
+        "nvx-time-probe",
     )
     # Executables that earlier builds produced. A build removes them from the output
     # of an earlier build whose manifest records them.
     RETIRED_BINARIES: Final = ("nvx-port-io",)
+    # Executables that earlier builds lacked. A build adds them to the output of an
+    # earlier build whose manifest does not record them.
+    ADDED_BINARIES: Final = (
+        "nvx-managed-agent",
+        "nvx-ingress",
+        "nvx-time",
+        "nvx-time-probe",
+    )
+    # Matches the path, relative to a checkout's root, of every input of the guest
+    # executables: SOURCE_FILES, the Cargo configuration, and every source file
+    # but the host side, that is, the `host` and `testing` modules and the
+    # binaries other than BINARIES, and the test modules. A guest build fails when
+    # Cargo's dep-info lists a file outside the set that it selects.
+    SOURCE_PATTERN: Final = re.compile(
+        "|".join(re.escape(path.as_posix()) for path in SOURCE_FILES)
+        + r"|nvx-rs/\.cargo/.+"
+        + r"|nvx-rs/src/bin/(?:"
+        + "|".join(re.escape(binary) for binary in BINARIES)
+        + r")\.rs"
+        + r"|(?!(?:"
+        + "|".join(re.escape(path.as_posix()) for path in TEST_MODULES)
+        + r")$)"
+        + r"nvx-rs/src/(?!bin/|(?:host|testing)(?:/|\.rs$))"
+        + r"(?!(?:[^/]+/)*tests(?:/|\.rs$)).+"
+    )
 
 
 class AlpineBuildConstants:
@@ -253,10 +295,6 @@ class UbuntuBuildConstants:
     PACKAGE_LOCK: Final = BuildConstants.REPO_ROOT / PACKAGE_LOCK_RELATIVE_PATH
     PACKAGE_LOCK_FORMAT: Final = 1
     INITRAMFS_NAME: Final = "initramfs-ubuntu.cpio.gz"
-    STAGE_INITRAMFS_NAME: Final = "initramfs-ubuntu-stage.cpio.gz"
-    STAGE_INITRAMFS_MANIFEST_NAME: Final = (
-        f"{STAGE_INITRAMFS_NAME}{BuildConstants.DISTRO_MANIFEST_SUFFIX}"
-    )
     PACKAGE_MANIFEST_NAME: Final = (
         f"{INITRAMFS_NAME}{BuildConstants.PACKAGE_MANIFEST_SUFFIX}"
     )
@@ -269,6 +307,42 @@ class UbuntuBuildConstants:
     EROFS_FORMAT: Final = 1
     EROFS_COMPRESSION: Final = "lz4hc"
     EROFS_TIMESTAMP: Final = 0
+    # The sandbox scratch template: an empty ext4 file system, of which the
+    # sandbox scenarios boot a copy as their scratch. Every parameter that
+    # shapes its bytes is given to mkfs.ext4, rather than taken from
+    # mke2fs.conf and the defaults that distributions patch, and
+    # E2FSPROGS_FAKE_TIME and the hash seed replace its clock and its random
+    # seed, so e2fsprogs 1.46.5 and 1.47.0 of Debian 12, Ubuntu 22.04 and
+    # 24.04, and Azure Linux 3 format the bytes of SCRATCH_TEMPLATE_SHA256.
+    SCRATCH_TEMPLATE_NAME: Final = "ubuntu-smoke-scratch.ext4"
+    SCRATCH_TEMPLATE_SIZE: Final = 64 * 1024 * 1024
+    SCRATCH_TEMPLATE_UUID: Final = "4f3c8bf7-1959-47b4-8811-62b17bbddaf4"
+    SCRATCH_TEMPLATE_BLOCK_SIZE: Final = 4096
+    SCRATCH_TEMPLATE_INODE_SIZE: Final = 256
+    SCRATCH_TEMPLATE_INODES: Final = 16384
+    SCRATCH_TEMPLATE_RESERVED_PERCENT: Final = 0
+    SCRATCH_TEMPLATE_FEATURES: Final = (
+        "has_journal",
+        "ext_attr",
+        "resize_inode",
+        "dir_index",
+        "filetype",
+        "extent",
+        "64bit",
+        "flex_bg",
+        "sparse_super",
+        "large_file",
+        "huge_file",
+        "dir_nlink",
+        "extra_isize",
+        "metadata_csum",
+    )
+    # mke2fs writes this time, in seconds since the epoch, for its clock; it
+    # ignores 0.
+    SCRATCH_TEMPLATE_TIMESTAMP: Final = 1
+    SCRATCH_TEMPLATE_SHA256: Final = (
+        "1d0d8c8994eb023d34e03d1cc6f591b223dfd576c8b8c0e07ccb8b2293f05f5f"
+    )
     SOURCE_MANIFEST_FORMAT: Final = 1
     SOURCE_CACHE_DIRECTORY_NAME: Final = "ubuntu-source-indexes"
     PACKAGE_CACHE_DIRECTORY_NAME: Final = "ubuntu-packages"
@@ -379,53 +453,14 @@ class InitramfsBuildConstants:
     TIMESTAMP: Final = 0
     CPIO_FORMAT: Final = "newc"
     GZIP_COMPRESSION_LEVEL: Final = 9
-    STATIC_HELPER_CFLAGS: Final = (
-        "-static",
-        "-Os",
-        "-s",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-    )
-    DEVICE_IO_CFLAGS: Final = (
-        "-nostdlib",
-        "-static",
-        "-Os",
-        "-fno-builtin",
-        "-fno-pie",
-        "-fno-stack-protector",
-        "-no-pie",
-        "-Wl,--build-id=none",
-        "-Wl,-z,noexecstack",
-        "-s",
-    )
-    STATIC_HELPERS: Final = (
-        "nvx-reseed",
-        "nvx-mmio-write",
-        "nvx-console-pending",
-        "nvx-managed-agent",
-    )
-    # Time tools, nvx-exit, and nvx-ingress are linked against musl: a static
-    # glibc binary adds about 700 KB to the initramfs, and every unpacked
-    # kilobyte delays cold boot. nvx-exit is also a restored guest's usual
-    # first exec.
-    MUSL_COMPILER: Final = "musl-gcc"
-    MUSL_STATIC_HELPERS: Final = ("nvx-time", "nvx-exit", "nvx-ingress")
-    TIME_PROBE_NAME: Final = "nvx-time-probe"
-    TIME_PROBE_CFLAGS: Final = (
-        "-std=gnu11",
-        "-static",
-        "-O2",
-        "-pthread",
-        "-s",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-    )
 
 
 class DockerBuildConstants:
     DOCKERFILE: Final = Path("docker") / "Dockerfile"
+    RUST_BUILDER_IMAGE: Final = (
+        f"rust:{GuestRustBuildConstants.TOOLCHAIN}-slim-bookworm@"
+        "sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082"
+    )
     ALPINE_TARGET: Final = "artifacts"
     UBUNTU_TARGET: Final = "ubuntu-guest-artifacts"
     AZURELINUX_TARGET: Final = "azurelinux-guest-artifacts"
@@ -448,10 +483,9 @@ class DockerBuildConstants:
         InitramfsBuildConstants.PROVENANCE_NAME,
         UbuntuBuildConstants.INITRAMFS_NAME,
         UbuntuBuildConstants.PACKAGE_MANIFEST_NAME,
-        UbuntuBuildConstants.STAGE_INITRAMFS_NAME,
-        UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME,
         UbuntuBuildConstants.DISTRO_NAME,
         UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
+        UbuntuBuildConstants.SCRATCH_TEMPLATE_NAME,
         AzureLinuxBuildConstants.INITRAMFS_NAME,
         AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME,
     )
@@ -473,6 +507,7 @@ class ReleaseBuildConstants:
     PROJECT_SOURCE_PATHS: Final = (
         ".github/agents/nvx-adversary.md",
         "guest",
+        "nvx-rs",
         "ubuntu",
         "azurelinux",
         "data/linux-kvm-virtual-machine.csv",
@@ -494,6 +529,7 @@ class ReleaseBuildConstants:
         "requirements-dev.txt",
         "rust-toolchain.toml",
     )
+    PROJECT_SOURCE_EXCLUDES: Final = (Path("nvx-rs") / "target",)
     GUEST_ARTIFACT_NAMES: Final = (
         KernelBuildConstants.BINARY_NAME,
         KernelBuildConstants.CONFIG_NAME,
@@ -501,10 +537,9 @@ class ReleaseBuildConstants:
         AlpineBuildConstants.PACKAGE_MANIFEST_NAME,
         UbuntuBuildConstants.INITRAMFS_NAME,
         UbuntuBuildConstants.PACKAGE_MANIFEST_NAME,
-        UbuntuBuildConstants.STAGE_INITRAMFS_NAME,
-        UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME,
         UbuntuBuildConstants.DISTRO_NAME,
         UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
+        UbuntuBuildConstants.SCRATCH_TEMPLATE_NAME,
         AzureLinuxBuildConstants.INITRAMFS_NAME,
         AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME,
     )

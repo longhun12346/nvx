@@ -7,21 +7,20 @@ use std::num::NonZeroUsize;
 use std::process::ExitCode;
 
 use super::parse::parse_u64;
-use super::status::{CommandError, ExitStatus};
+use super::status::{CommandError, run_main};
 use super::sys::{self, Errno, Mode, OpenFlags};
 
 /// Runs `nvx-mmio-write` with the process's arguments. It exits with 0, 1 when an operation
 /// fails, or 2 for a usage error, and prints nothing on success.
 pub fn main() -> ExitCode {
-    sys::restore_sigpipe();
-    ExitStatus::from(run(&sys::args(), c"/dev/mem", &mut io::stderr())).into()
+    run_main(|args| run(args, c"/dev/mem", &mut io::stderr()))
 }
 
 /// Validates the command, maps one physical page of `memory`, which stands for `/dev/mem`,
 /// stores the value, and releases its resources.
 fn run(args: &[CString], memory: &CStr, err: &mut dyn Write) -> Result<(), CommandError> {
     let parsed = match args {
-        [_, address, value] => parse_u64(address).zip(parse_u64(value)),
+        [_, address, value] => parse_u64(address.as_bytes()).zip(parse_u64(value.as_bytes())),
         _ => None,
     };
     let Some((address, value)) = parsed.filter(|&(_, value)| value <= u64::from(u32::MAX)) else {
@@ -43,36 +42,30 @@ fn run(args: &[CString], memory: &CStr, err: &mut dyn Write) -> Result<(), Comma
     }
 
     let descriptor = sys::open(memory, OpenFlags::O_RDWR | OpenFlags::O_SYNC, Mode::empty())
-        .map_err(|error| {
-            perror(err, b"open /dev/mem", error);
-            CommandError::Operation
-        })?;
+        .map_err(|error| perror(err, b"open /dev/mem", error))?;
     let length = NonZeroUsize::new(page_size).expect("a valid page size is nonzero");
     let mut mapping = sys::MemoryMapping::shared_read_write(&descriptor, length, page_base)
-        .map_err(|error| {
-            perror(err, b"mmap /dev/mem", error);
-            CommandError::Operation
-        })?;
+        .map_err(|error| perror(err, b"mmap /dev/mem", error))?;
     if !mapping.write_u32(page_offset as usize, value) {
         // The boundary validation above proves this unreachable, but preserve a typed failure if
         // the mapping abstraction and validation ever diverge.
         sys::report(err, &[b"MMIO write crosses a page boundary\n"]);
         return Err(CommandError::Operation);
     }
-    mapping.unmap().map_err(|error| {
-        perror(err, b"munmap /dev/mem", error);
-        CommandError::Operation
-    })?;
-    descriptor.close().map_err(|error| {
-        perror(err, b"close /dev/mem", error);
-        CommandError::Operation
-    })?;
+    mapping
+        .unmap()
+        .map_err(|error| perror(err, b"munmap /dev/mem", error))?;
+    descriptor
+        .close()
+        .map_err(|error| perror(err, b"close /dev/mem", error))?;
     Ok(())
 }
 
-/// Reports `errno` as C's `perror(prefix)` does, with `nix`'s description.
-fn perror(err: &mut dyn Write, prefix: &[u8], errno: Errno) {
+/// Reports `errno` as C's `perror(prefix)` does, with `nix`'s description, and returns the
+/// operation failure.
+fn perror(err: &mut dyn Write, prefix: &[u8], errno: Errno) -> CommandError {
     sys::report(err, &[prefix, b": ", errno.desc().as_bytes(), b"\n"]);
+    CommandError::Operation
 }
 
 #[cfg(test)]
@@ -82,18 +75,14 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::guest::status::{ExitStatus, command_line};
 
     fn page_size() -> u64 {
         sys::page_size().expect("tests need a page size") as u64
     }
 
     fn mmio_write(memory: &Path, arguments: &[&str]) -> (u8, Vec<u8>) {
-        let mut args = vec![CString::new("nvx-mmio-write").unwrap()];
-        args.extend(
-            arguments
-                .iter()
-                .map(|argument| CString::new(*argument).unwrap()),
-        );
+        let args = command_line("nvx-mmio-write", arguments);
         let memory = CString::new(memory.as_os_str().as_bytes()).unwrap();
         let mut err = Vec::new();
         let status = ExitStatus::from(run(&args, &memory, &mut err));
@@ -160,7 +149,7 @@ mod tests {
             (format!("{}", page - 4), "4294967295", page as usize - 4),
         ] {
             assert_eq!(mmio_write(file.path(), &[&address, value]), (0, Vec::new()));
-            let stored = parse_u64(&CString::new(value).unwrap()).unwrap() as u32;
+            let stored = parse_u64(value.as_bytes()).unwrap() as u32;
             let contents = fs::read(file.path()).unwrap();
             assert_eq!(&contents[offset..offset + 4], &stored.to_ne_bytes());
         }

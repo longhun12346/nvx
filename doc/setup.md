@@ -2,10 +2,12 @@
 
 ## Initialize
 
-Clone with submodules, or initialize after cloning:
+Building from source and `nvx.py verify` need the `openvmm` submodule, which the
+[Quick Start](../README.md#quick-start) clone omits because its prebuilt package
+does not need it. Clone with submodules, or initialize after cloning:
 
 ```bash
-git clone --recurse-submodules <umbrella-repository-url> nvx
+git clone --recurse-submodules https://github.com/microsoft/nvx.git nvx
 cd nvx
 python3 scripts/nvx.py verify
 ```
@@ -14,7 +16,7 @@ On Windows PowerShell, use `python` in place of `python3` if that is the
 installed launcher:
 
 ```powershell
-git clone --recurse-submodules <umbrella-repository-url> nvx
+git clone --recurse-submodules https://github.com/microsoft/nvx.git nvx
 Set-Location nvx
 python scripts\nvx.py verify
 ```
@@ -27,10 +29,14 @@ python3 scripts/nvx.py init
 
 ## Prerequisites
 
-Python 3.10 or newer and Git are required on every platform. Building OpenVMM
-or the Rust crates also requires [rustup](https://rustup.rs/), which installs
-the Rust release that [`rust-toolchain.toml`](../rust-toolchain.toml) pins on
-first use.
+Git is required on every platform, and Python 3.10 or newer to build, test,
+benchmark, or package NVX. Building `nvx-rs`, OpenVMM, or the other Rust crates
+requires [rustup](https://rustup.rs/), which installs the Rust release that
+[`rust-toolchain.toml`](../rust-toolchain.toml) pins on first use. NVX runs its
+microVMs and sandboxes with `nvx-rs`, which Cargo builds; see
+[Usage](usage.md#nvx-rs). Its [`download`](usage.md#download) of a release, and
+the download of a checkout's first run, use the host's `curl` and `tar`, which
+Windows 10 and later include.
 
 By default, a microVM boots on the built-in
 [CPU profile](usage.md#cpu-profiles) of its host's CPU: four Intel
@@ -38,7 +44,7 @@ generations and AMD's EPYC Milan, Genoa, and Turin, on a hypervisor that
 supports that profile. On another Intel or AMD CPU, `--cpu-profile auto`, the
 default, falls back to a development profile derived from the host and warns
 at every cold boot, asking for the CPU's fingerprint so that a built-in
-profile can serve it; `nvx.py run --cpu-profile host` selects that profile
+profile can serve it; `nvx-rs run --cpu-profile host` selects that profile
 explicitly, for example where the hypervisor does not support the built-in
 profile (`E_PROFILE_UNSUPPORTED`, whose message names this option). OpenVMM
 verifies a host profile as it verifies a built-in profile: the cold boot
@@ -51,12 +57,22 @@ For Debian/Ubuntu hosts:
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-  bc binutils bison build-essential ca-certificates cpio curl erofs-utils flex \
-  gzip libelf-dev libssl-dev musl-tools python3 rsync tar xz-utils zstd
+  bc binutils bison build-essential ca-certificates cpio curl e2fsprogs \
+  erofs-utils flex gzip libelf-dev libssl-dev python3 rsync tar xz-utils zstd
 ```
 
-`musl-tools` provides `musl-gcc`, which native initramfs builds use for the
-guest time tools; Docker builds install it in the build image.
+Native guest builds use the exact Rust release in `rust-toolchain.toml` and
+its musl standard-library target:
+
+```bash
+toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+rustup toolchain install "$toolchain" --profile minimal
+rustup target add --toolchain "$toolchain" x86_64-unknown-linux-musl
+```
+
+Both modes of the Linux setup script, and Copilot setup, install this target
+automatically. `build-essential` remains necessary for the kernel and as
+Rust's linker driver; no separate guest libc compiler is required.
 
 ### Linux / KVM
 
@@ -98,6 +114,17 @@ cargo install --locked cargo-nextest --version \
   "$(sed -n 's/^cargo_nextest\.version=//p' scripts/setup/tool-versions.conf)"
 ```
 
+The hypervisor and the kernel also decide what NVX's benchmarks measure. CI measures the
+Linux/MSHV series on Azure Linux 3 with hypervisor build `10.0.26100.9444`, from `mshv`
+`26100.9444.2609032029.1`, and the `6.18.34.mshv3-1.azl3` kernel: the releases that
+[`linux_mshv.py`](../scripts/setup/azure/nvx_azure/linux_mshv.py) pins and that the
+[expected benchmark host](benchmarks.md#expected-benchmark-hosts) requires. The older `mshv2`
+software of #415, such as the `6.6.137.mshv2-2.azl3` kernel, measured snapshot-restore
+guest-exit teardown about four times slower than the `6.6.148-200.azl3` kernel, and the 8-vCPU
+512 MiB shell restore 1.7 times slower, so compare a host's results with CI's only on the same
+software. On Azure Linux, `rpm -q mshv kernel-mshv` reports the installed releases, and
+benchmark results record the running hypervisor's build.
+
 ### Windows / WHP
 
 Enable hardware virtualization in the host firmware. Then enable **Windows Hypervisor Platform**
@@ -113,9 +140,12 @@ SDK, and Docker Desktop using Linux containers.
 ## Automated environment bootstrap
 
 The scripts in [`scripts/setup`](../scripts/setup/README.md) prepare Linux/KVM, Linux/MSHV, and
-Windows/WHP development or GitHub Actions hosts. They install the platform build prerequisites,
-configure hypervisor access, and provide non-mutating validation modes. Runner registration
-tokens are read from standard input so they do not appear in command history.
+Windows/WHP development or GitHub Actions hosts. On Linux, `setup-linux.sh` configures a
+development host for the selected backend by default and an Actions runner with
+`--runner-only`, as `setup-windows-whp.ps1` does on Windows with `-RunnerOnly`. They install the
+platform build prerequisites, configure hypervisor access, and provide non-mutating validation
+modes. Runner registration tokens are read from standard input so they do not appear in command
+history.
 
 Linux can also emit a revision-bound, checksummed guest artifact bundle for Windows. The Windows
 script verifies that bundle before copying it into the checkout and building OpenVMM natively.
@@ -194,7 +224,7 @@ shellcheck --shell=sh \
   guest/common/nvx-container-launch-azurelinux \
   guest/common/nvx-sandbox-smoke \
   guest/common/nvx-snapshot guest/common/nvx-virtio-restore-probe \
-  scripts/setup/setup-linux-mshv.sh scripts/setup/setup-linux-runner.sh
+  scripts/setup/setup-linux.sh
 shellcheck --shell=bash \
   .github/specula/setup-runner.sh guest/ubuntu/nvx-bashrc
 python3 -m pyright --pythonplatform Linux
@@ -209,12 +239,14 @@ shfmt -d -ln posix -i 4 -ci \
   guest/common/nvx-container-launch-azurelinux \
   guest/common/nvx-sandbox-smoke \
   guest/common/nvx-snapshot guest/common/nvx-virtio-restore-probe \
-  scripts/setup/setup-linux-mshv.sh scripts/setup/setup-linux-runner.sh
+  scripts/setup/setup-linux.sh
 shfmt -d -ln bash -i 4 -ci \
   .github/specula/setup-runner.sh guest/ubuntu/nvx-bashrc
+python3 scripts/check_markdown_links.py
 ```
 
-Pyright runs in strict mode for both Linux and Windows platform APIs.
+Pyright runs in strict mode for both Linux and Windows platform APIs. The link
+check reads the files that Git tracks, so stage a new file before you run it.
 
 ### Adversarial campaign controller
 
@@ -237,7 +269,8 @@ Production campaigns also require an administrator-owned, no-argument
 executor wrapper that provisions a separate disposable target and forwards
 the bounded executor protocol. See
 [Copilot-driven adversarial testing](adversarial-testing.md)
-for the containment and credential requirements.
+for the containment and credential requirements, and for the Rust toolchain
+and nvx-rs that the target needs.
 
 Apply the configured Python and POSIX shell formatters with:
 
@@ -252,7 +285,7 @@ shfmt -w -ln posix -i 4 -ci \
   guest/common/nvx-container-launch-azurelinux \
   guest/common/nvx-sandbox-smoke \
   guest/common/nvx-snapshot guest/common/nvx-virtio-restore-probe \
-  scripts/setup/setup-linux-mshv.sh scripts/setup/setup-linux-runner.sh
+  scripts/setup/setup-linux.sh
 shfmt -w -ln bash -i 4 -ci \
   .github/specula/setup-runner.sh guest/ubuntu/nvx-bashrc
 ```

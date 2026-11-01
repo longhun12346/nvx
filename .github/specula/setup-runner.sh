@@ -127,7 +127,7 @@ if ! sudo -u "$RUNNER_USER" -H bash -lc "command -v rustup >/dev/null 2>&1"; the
 fi
 sudo -u "$RUNNER_USER" -H bash -lc "
     export PATH=\"\$HOME/.cargo/bin:\$PATH\"
-    rustup toolchain install '$RUST_VERSION' --profile minimal
+    rustup toolchain install '$RUST_VERSION' --profile minimal --no-self-update
     rustup default '$RUST_VERSION'
     if ! cargo nextest --version 2>/dev/null | grep -Fq '$CARGO_NEXTEST_VERSION'; then
         cargo install --locked cargo-nextest --version '$CARGO_NEXTEST_VERSION'

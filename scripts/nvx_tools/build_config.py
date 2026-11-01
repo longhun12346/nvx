@@ -43,7 +43,6 @@ class InitramfsBuildConfig:
         )
     )
     output: Path | None = None
-    source: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +55,12 @@ class DistroLayerBuildConfig:
         )
     )
     output: Path = artifact_path(UbuntuBuildConstants.DISTRO_NAME)
+    replace: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ScratchTemplateBuildConfig:
+    output: Path = artifact_path(UbuntuBuildConstants.SCRATCH_TEMPLATE_NAME)
     replace: bool = False
 
 
@@ -139,14 +144,6 @@ class BuildConfig:
                 )
             ),
             output=artifact_path(descriptor.initramfs_name),
-        )
-
-    @staticmethod
-    def stage_initramfs_config() -> InitramfsBuildConfig:
-        return InitramfsBuildConfig(
-            guest=UbuntuBuildConstants.GUEST_NAME,
-            source=artifact_path(UbuntuBuildConstants.INITRAMFS_NAME),
-            output=artifact_path(UbuntuBuildConstants.STAGE_INITRAMFS_NAME),
         )
 
     @staticmethod

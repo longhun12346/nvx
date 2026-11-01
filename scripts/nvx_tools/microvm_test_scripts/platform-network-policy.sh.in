@@ -1,0 +1,87 @@
+set -eu
+on_exit() {
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        nvx-exit "$status"
+    fi
+}
+trap on_exit EXIT
+fail() {
+    echo "NVX-PLATFORM-NETWORK-FAIL $1"
+    exit "$2"
+}
+# The clone's NIC keeps the template's identity: its MAC address and its IPv4
+# and IPv6 addresses.
+ndev=
+for npath in /sys/class/net/*; do
+    [ "${npath##*/}" = lo ] || ndev=${npath##*/}
+done
+[ -n "$ndev" ] || fail "no network interface" 80
+mac=$(cat "/sys/class/net/$ndev/address")
+ipv4=$(busybox ip -o -4 addr show dev "$ndev" | awk '{ print $4 }')
+ipv6=$(busybox ip -o -6 addr show dev "$ndev" |
+    awk '/ scope global / { print $4 }')
+echo "NVX-PLATFORM-NETWORK-IDENTITY mac=$mac ipv4=$ipv4 ipv6=$ipv6"
+# Sets result to whether the guest reached the host service that answers $1
+# at port $2 of the gateway, which the endpoint maps to host loopback.
+probe() {
+    rm -f /tmp/nvx-platform-network-probe
+    if wget -T @PROBE_TIMEOUT@ -qO /tmp/nvx-platform-network-probe \
+        "http://@GATEWAY_IPV4@:$2/$1" 2>/dev/null; then
+        [ "$(cat /tmp/nvx-platform-network-probe)" = "NVX-PLATFORM-NETWORK-$1" ] ||
+            fail "unexpected $1 answer" 81
+        result=reached
+    else
+        result=denied
+    fi
+}
+probe allowed @ALLOWED_PORT@
+allowed=$result
+probe other @OTHER_PORT@
+other=$result
+# The guest's TCP server answers the host through a host-loopback forward,
+# when the clone's policy has one, until the host has checked it.
+rm -f /tmp/nvx-platform-network-inbound
+printf 'NVX-HOST-LOOPBACK-TCP-ACK\n' |
+    nc -l -p @GUEST_PORT@ -w 20 >/tmp/nvx-platform-network-inbound 2>/dev/null &
+listener=$!
+port_hex=$(printf '%04X' @GUEST_PORT@)
+tries=0
+while ! awk -v pattern=":$port_hex\$" \
+    '$2 ~ pattern && $4 == "0A" { found = 1 } END { exit !found }' \
+    /proc/net/tcp /proc/net/tcp6; do
+    [ "$tries" -lt 100 ] || fail "the TCP server did not listen" 82
+    tries=$((tries + 1))
+    sleep 0.05
+done
+# The terminal would echo the host's release into the lines after it.
+stty -echo || fail "the terminal kept echoing" 85
+echo NVX-PLATFORM-NETWORK-LISTENING
+# The host's release says whether it exchanged a line with the server through
+# a forward. Its request may still be on the way when the release arrives, so
+# the guest waits for it before stopping the server.
+read -r release exchange || fail "the host did not release the guest" 83
+[ "$release" = NVX-PLATFORM-NETWORK-CHECKED ] || fail "release $release" 84
+case "$exchange" in
+forward)
+    tries=0
+    while ! grep -qx NVX-HOST-LOOPBACK-INBOUND /tmp/nvx-platform-network-inbound \
+        2>/dev/null; do
+        [ "$tries" -lt 100 ] || break
+        tries=$((tries + 1))
+        sleep 0.05
+    done
+    ;;
+none) ;;
+*)
+    fail "release $release $exchange" 84
+    ;;
+esac
+kill "$listener" 2>/dev/null || true
+wait "$listener" 2>/dev/null || true
+if grep -qx NVX-HOST-LOOPBACK-INBOUND /tmp/nvx-platform-network-inbound; then
+    inbound=reached
+else
+    inbound=none
+fi
+echo "NVX-PLATFORM-NETWORK-PROBE allowed=$allowed other=$other inbound=$inbound"

@@ -3,9 +3,12 @@
 
 """Tests for benchmark host provenance and storage telemetry."""
 
+import argparse
 import contextlib
+import datetime
 import http.client
 import http.server
+import io
 import json
 import os
 import platform
@@ -23,11 +26,22 @@ from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from nvx_tools import host_telemetry  # noqa: E402
+from nvx_tools import host_telemetry, performance, storage_events  # noqa: E402
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
 TICKS_PER_SECOND = 10_000_000
+
+
+def word(text: bytes) -> int:
+    """Return the CPUID register that holds ``text``, padded with NULs."""
+    return int.from_bytes(text.ljust(4, b"\0"), "little")
+
+
+CpuidLeaves = dict[int, tuple[int, int, int, int]]
+"""The EAX, EBX, ECX, and EDX that CPUID returns for each leaf."""
+
+
 SUBSCRIPTION = "00000000-1111-2222-3333-444444444444"
 RESOURCE_GROUP = f"/subscriptions/{SUBSCRIPTION}/resourceGroups/nvx-runners-rg"
 IMDS_COMPUTE: dict[str, object] = {
@@ -107,6 +121,17 @@ class AzureProvenanceTests(unittest.TestCase):
     def setUp(self) -> None:
         host_telemetry._azure_vm_provenance.cache_clear()
         self.addCleanup(host_telemetry._azure_vm_provenance.cache_clear)
+        snapshots = tempfile.TemporaryDirectory()
+        self.addCleanup(snapshots.cleanup)
+        for name in (
+            "WINDOWS_AZURE_METADATA_SNAPSHOT",
+            "LINUX_AZURE_METADATA_SNAPSHOT",
+        ):
+            snapshot_patch = patch.object(
+                host_telemetry, name, Path(snapshots.name) / name / "compute.json"
+            )
+            snapshot_patch.start()
+            self.addCleanup(snapshot_patch.stop)
 
     def test_keeps_only_vm_size_and_disk_performance_settings(self):
         provenance = host_telemetry.azure_compute_provenance(IMDS_COMPUTE)
@@ -172,6 +197,75 @@ class AzureProvenanceTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "no vmSize"),
             ):
                 host_telemetry.azure_compute_provenance(compute)
+
+    def test_provisioned_runner_uses_only_the_trusted_snapshot(self):
+        safe: dict[str, object] = {
+            "vmSize": IMDS_COMPUTE["vmSize"],
+            "storageProfile": {
+                "osDisk": {
+                    "diskSizeGB": "128",
+                    "managedDisk": {"storageAccountType": "Premium_LRS"},
+                    "caching": "ReadWrite",
+                    "writeAcceleratorEnabled": "false",
+                    "diffDiskSettings": {"option": ""},
+                },
+                "dataDisks": [
+                    {
+                        "lun": "0",
+                        "diskSizeGB": "512",
+                        "managedDisk": {"storageAccountType": "Premium_LRS"},
+                        "caching": "None",
+                        "writeAcceleratorEnabled": "false",
+                        "bytesPerSecondThrottle": "",
+                        "opsPerSecondThrottle": "",
+                    }
+                ],
+                "resourceDisk": {"size": "614400"},
+            },
+        }
+        for platform_name, constant in (
+            ("win32", "WINDOWS_AZURE_METADATA_SNAPSHOT"),
+            ("linux", "LINUX_AZURE_METADATA_SNAPSHOT"),
+        ):
+            with self.subTest(platform=platform_name):
+                self.check_trusted_snapshot(platform_name, constant, safe)
+
+    def check_trusted_snapshot(
+        self, platform_name: str, constant: str, safe: dict[str, object]
+    ) -> None:
+        host_telemetry._azure_vm_provenance.cache_clear()
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "compute.json"
+            snapshot.write_text(json.dumps(safe), encoding="utf-8")
+            with (
+                patch.object(host_telemetry.sys, "platform", platform_name),
+                patch.object(host_telemetry, "may_be_azure_vm", return_value=True),
+                patch.object(host_telemetry, constant, snapshot),
+                patch.object(host_telemetry, "read_azure_compute_metadata") as read,
+            ):
+                expected = host_telemetry.azure_compute_provenance(safe)
+                self.assertEqual(host_telemetry.azure_vm_provenance(), expected)
+                read.assert_not_called()
+
+                snapshot.unlink()
+                host_telemetry._azure_vm_provenance.cache_clear()
+                missing = host_telemetry.azure_vm_provenance()
+                assert missing is not None
+                self.assertIn("snapshot is invalid", str(missing["error"]))
+                read.assert_not_called()
+
+                for content in (
+                    '{"vmSize": ""}',
+                    '{"vmSize": "Standard_D16ds_v5", "storageProfile": {}}',
+                    "x" * 65537,
+                ):
+                    with self.subTest(content=content[:20]):
+                        snapshot.write_text(content, encoding="utf-8")
+                        host_telemetry._azure_vm_provenance.cache_clear()
+                        invalid = host_telemetry.azure_vm_provenance()
+                        assert invalid is not None
+                        self.assertIn("snapshot is invalid", str(invalid["error"]))
+                        read.assert_not_called()
 
     def test_queries_instance_metadata_once_and_only_on_a_possible_azure_vm(self):
         with (
@@ -410,6 +504,9 @@ class HostProvenanceTests(unittest.TestCase):
         self.assertEqual(provenance["logical_processors"], os.cpu_count())
         self.assertEqual(provenance["azure"], {"vm_size": "Standard_D16ds_v5"})
         self.assertEqual(
+            provenance["hypervisor"], host_telemetry.hypervisor_provenance()
+        )
+        self.assertEqual(
             set(cast(dict[str, object], provenance["cpu"])),
             {"vendor", "family", "model", "stepping", "microcode"},
         )
@@ -546,6 +643,123 @@ class HostProvenanceTests(unittest.TestCase):
                 host_telemetry.os_version(),
                 {"system": "Linux", "release": "6.6.157.1-1.azl3", "revision": None},
             )
+
+    def test_identifies_the_hypervisor_from_cpuid(self):
+        def host(
+            leaves: CpuidLeaves, hypervisor: bool = True
+        ) -> tuple[host_telemetry.Cpuid, list[int]]:
+            # CPUID.1:ECX[31] reports a hypervisor.
+            table = {1: (0x000C06F2, 0, (1 << 31) if hypervisor else 0, 0), **leaves}
+            calls: list[int] = []
+
+            def cpuid(leaf: int, subleaf: int) -> tuple[int, int, int, int]:
+                self.assertEqual(subleaf, 0)
+                calls.append(leaf)
+                return table.get(leaf, (0, 0, 0, 0))
+
+            return cpuid, calls
+
+        microsoft = (0x4000000C, word(b"Micr"), word(b"osof"), word(b"t Hv"))
+        hv1 = (word(b"Hv#1"), 0, 0, 0)
+        cases: tuple[tuple[str, CpuidLeaves, dict[str, object]], ...] = (
+            # Leaf 0x40000002 as azure-mshv-4 and azure-mshv-scus-1 report it
+            # (#980): build 26100, version 10.0, service pack 9, service 9444.
+            (
+                "MSHV root partition",
+                {
+                    0x40000000: microsoft,
+                    0x40000001: hv1,
+                    0x40000002: (0x65F4, 0x000A0000, 9, 0x24E4),
+                },
+                {"vendor": "Microsoft Hv", "build": "10.0.26100.9444"},
+            ),
+            # prometheus30's older hypervisor, of the same build number.
+            (
+                "older service",
+                {
+                    0x40000000: microsoft,
+                    0x40000001: hv1,
+                    0x40000002: (0x65F4, 0x000A0000, 30, 0x7530),
+                },
+                {"vendor": "Microsoft Hv", "build": "10.0.26100.30000"},
+            ),
+            # The service branch, EDX[31:24], is not part of the version.
+            (
+                "service branch",
+                {
+                    0x40000000: microsoft,
+                    0x40000001: hv1,
+                    0x40000002: (26100, 0x000A0000, 0, 0x01001234),
+                },
+                {"vendor": "Microsoft Hv", "build": "10.0.26100.4660"},
+            ),
+            # Only the Microsoft hypervisor interface defines leaf 0x40000002.
+            (
+                "another interface",
+                {
+                    0x40000000: (0x40000001, word(b"KVMK"), word(b"VMKV"), word(b"M")),
+                    0x40000001: (0x01007AFB, 0, 0, 0),
+                    0x40000002: (1, 2, 3, 4),
+                },
+                {"vendor": "KVMKVMKVM", "build": None},
+            ),
+            (
+                "no version leaf",
+                {0x40000000: (0x40000001, *microsoft[1:]), 0x40000001: hv1},
+                {"vendor": "Microsoft Hv", "build": None},
+            ),
+        )
+        for name, leaves, expected in cases:
+            with self.subTest(name):
+                cpuid, _ = host(leaves)
+                self.assertEqual(host_telemetry.identify_hypervisor(cpuid), expected)
+        cpuid, calls = host({0x40000000: microsoft}, hypervisor=False)
+        self.assertEqual(
+            host_telemetry.identify_hypervisor(cpuid), {"vendor": None, "build": None}
+        )
+        # Without a hypervisor, the hypervisor leaves hold no hypervisor data.
+        self.assertEqual(calls, [1])
+
+    def test_reads_the_hypervisor_only_on_x86_64_linux(self):
+        cpuid_error = OSError(13, "mprotect failed: Permission denied")
+        for system, machine, error, expected in (
+            ("win32", "AMD64", None, None),
+            ("linux", "aarch64", None, None),
+            (
+                "linux",
+                "x86_64",
+                cpuid_error,
+                {"error": f"CPUID is unavailable: {cpuid_error}"},
+            ),
+        ):
+            with (
+                self.subTest(system=system, machine=machine),
+                patch.object(host_telemetry.sys, "platform", system),
+                patch.object(host_telemetry.platform, "machine", return_value=machine),
+                patch.object(
+                    host_telemetry, "_linux_cpuid", side_effect=error
+                ) as linux_cpuid,
+            ):
+                self.assertEqual(host_telemetry.hypervisor_provenance(), expected)
+                self.assertEqual(linux_cpuid.called, error is not None)
+
+    @unittest.skipUnless(
+        sys.platform == "linux" and platform.machine() == "x86_64",
+        "Python runs CPUID only on x86-64 Linux",
+    )
+    def test_runs_cpuid_on_this_host(self):
+        with host_telemetry._linux_cpuid() as cpuid:
+            _, ebx, ecx, edx = cpuid(0, 0)
+            hypervisor = host_telemetry.identify_hypervisor(cpuid)
+
+        # The vendor of leaf 0 is in EBX, EDX, and ECX.
+        self.assertEqual(
+            host_telemetry._register_text(ebx, edx, ecx),
+            host_telemetry.cpu_signature()["vendor"],
+        )
+        self.assertEqual(host_telemetry.hypervisor_provenance(), hypervisor)
+        if hypervisor["vendor"] == "Microsoft Hv":
+            self.assertRegex(str(hypervisor["build"]), r"^\d+\.\d+\.\d+\.\d+$")
 
     def test_volume_errors_are_recorded_instead_of_raised(self):
         reader = (
@@ -699,6 +913,34 @@ class HostProvenanceTests(unittest.TestCase):
         self.assertEqual(rows["CPU"], "unknown CPU")
         self.assertEqual(
             rows["Azure metadata"], "Azure instance metadata is unavailable: x"
+        )
+        self.assertNotIn("Hypervisor", rows)
+
+    def test_provenance_rows_describe_the_hypervisor(self):
+        for hypervisor, description in (
+            (
+                {"vendor": "Microsoft Hv", "build": "10.0.26100.9444"},
+                "Microsoft Hv 10.0.26100.9444",
+            ),
+            ({"vendor": "KVMKVMKVM", "build": None}, "KVMKVMKVM"),
+            ({"vendor": None, "build": None}, "none"),
+            (
+                {"error": "CPUID is unavailable: [Errno 13] mprotect failed"},
+                "CPUID is unavailable: [Errno 13] mprotect failed",
+            ),
+        ):
+            with self.subTest(hypervisor=hypervisor):
+                rows = host_telemetry.host_provenance_rows(
+                    {"os": "Linux-6.18.34.mshv3-1.azl3", "hypervisor": hypervisor}
+                )
+                self.assertEqual(
+                    [label for label, _ in rows][2:4],
+                    ["Operating system", "Hypervisor"],
+                )
+                self.assertEqual(dict(rows)["Hypervisor"], description)
+        self.assertNotIn(
+            "Hypervisor",
+            dict(host_telemetry.host_provenance_rows({"hypervisor": None})),
         )
 
 
@@ -1136,6 +1378,47 @@ class StorageTelemetrySamplerTests(unittest.TestCase):
         self.assertTrue(reader.reads[-1])
         self.assertFalse(any(reader.reads[1:-1]))
 
+    def test_describe_summarizes_a_window_in_one_line(self):
+        series = iter(counter_series(0, 100, 200, 300, 400))
+
+        class SeriesReader(FakeReader):
+            def read(self, *, processes: bool) -> tuple[dict[str, object], list[str]]:
+                self.reads.append(processes)
+                sample = next(series)
+                del sample["elapsed_ns"]
+                return sample, []
+
+        times = iter(range(0, 500_000_000, 100_000_000))
+        reader = SeriesReader()
+        telemetry = host_telemetry.StorageTelemetry(
+            reader, 0, interval_seconds=3600, clock=lambda: next(times)
+        )
+        telemetry.start()
+        for _ in range(3):
+            telemetry._sample(final=False)
+
+        self.assertEqual(
+            telemetry.describe(0, 400_000_000),
+            "scratch F: write 120.0 MiB/s at 30.0 ms, queue 15.0, 90% busy; "
+            "volume C: write 2.0 MiB/s at 0.1 ms, queue 0.0, 1% busy; "
+            "CPU 25% busy; cache dirty 200.0 MiB, lazy writes 10.0 MiB/s; "
+            "Defender 25.0% CPU",
+        )
+        # Describing stops the sampling.
+        self.assertEqual(reader.closed, 1)
+
+    def test_describe_appends_the_counter_errors(self):
+        times = iter(range(0, 500_000_000, 100_000_000))
+        telemetry = host_telemetry.StorageTelemetry(
+            FakeReader(), 0, interval_seconds=3600, clock=lambda: next(times)
+        )
+        telemetry.start()
+
+        self.assertEqual(
+            telemetry.describe(0, 100_000_000),
+            "CPU n/a busy (errors: F: volume counters failed: busy)",
+        )
+
 
 class PlatformTelemetryTests(unittest.TestCase):
     def test_windows_reader_keeps_disk_counters_enabled_until_closed(self):
@@ -1207,6 +1490,516 @@ class PlatformTelemetryTests(unittest.TestCase):
                 {"scratch": Path(tempfile.gettempdir())}, 0
             )
         )
+        self.assertIsNone(
+            host_telemetry.describe_volume_activity(
+                {"scratch": Path(tempfile.gettempdir())}, 0.1
+            )
+        )
+
+    @unittest.skipUnless(sys.platform == "win32", "requires Windows")
+    def test_windows_describes_a_volume_s_activity_without_privileges(self):
+        activity = host_telemetry.describe_volume_activity(
+            {"scratch": Path(tempfile.gettempdir())}, 0.2
+        )
+
+        assert activity is not None
+        self.assertRegex(activity, r"^scratch \S+ write \S+ MiB/s at ")
+        self.assertRegex(activity, r"; CPU \d+% busy")
+        self.assertNotIn("errors", activity)
+
+
+def rendered_event(
+    provider: str,
+    event_id: int,
+    level: str,
+    time: str,
+    message: str,
+    data: dict[str, str],
+) -> str:
+    """Return an event as wevtutil renders it."""
+    fields = "".join(
+        f"<Data Name='{name}'>{value}</Data>" for name, value in data.items()
+    )
+    return (
+        "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>"
+        f"<System><Provider Name='{provider}'/><EventID Qualifiers='0'>{event_id}"
+        f"</EventID><Level>3</Level><TimeCreated SystemTime='{time}'/>"
+        "<Computer>runner</Computer></System>"
+        f"<EventData>{fields}</EventData><RenderingInfo Culture='en-US'>"
+        f"<Message>{message}</Message><Level>{level}</Level></RenderingInfo>"
+        "</Event>"
+    )
+
+
+DEVICE = {"PortNumber": "1", "PathID": "0", "TargetID": "0", "LUN": "0"}
+SLOW_IO = rendered_event(
+    "Microsoft-Windows-StorPort",
+    557,
+    "Warning",
+    "2026-10-25T00:49:12.3456789Z",
+    "An IO took more than 30000 ms to complete for Storport Device (Port = 1, "
+    "Path = 0, Target = 0, Lun = 0).&#13;&#10;Second line.",
+    {
+        **DEVICE,
+        "Threshold_ms": "30000",
+        "RequestDuration_ms": "35123",
+        "WaitDuration_ms": "12",
+    },
+)
+LATENCY = rendered_event(
+    "Microsoft-Windows-StorPort",
+    505,
+    "Information",
+    "2026-10-25T00:40:00.0000000Z",
+    "Performance summary for Storport Device",
+    {
+        **DEVICE,
+        "IoLatencyBuckets": "128us, 256us, 512us, 1ms, 4ms, 16ms, 64ms, 128ms, "
+        "256ms, 512ms, 1000ms, 2000ms, 10000ms, 10000+ms,",
+        **{f"BucketIoSuccess{index}": "9" for index in range(1, 12)},
+        "BucketIoSuccess12": "2",
+        "BucketIoSuccess13": "3",
+        "BucketIoFailed13": "1",
+        "BucketIoSuccess14": "1",
+    },
+)
+TIMEOUT = rendered_event(
+    "Microsoft-Windows-StorPort",
+    500,
+    "Warning",
+    "2026-10-25T00:48:40.0000000Z",
+    "A request timed out for Storport Device",
+    {**DEVICE, "SrbTimeout": "60"},
+)
+MINIPORT_RESET = rendered_event(
+    "storvsc",
+    129,
+    "Warning",
+    "2026-10-25T00:48:37.0000000Z",
+    "Reset to device, \\Device\\RaidPort1, was issued.",
+    {},
+)
+
+
+def rendered_events(*events: str) -> bytes:
+    """Return a document of rendered events, as wevtutil writes it in UTF-16."""
+    return f"<Events>\r\n{''.join(events)}\r\n</Events>\r\n".encode("utf-16")
+
+
+class StorageEventTests(unittest.TestCase):
+    def test_parses_round_trip_and_offset_times(self):
+        self.assertEqual(
+            storage_events.parse_utc("2026-10-28T23:51:46.1234567Z"),
+            datetime.datetime(2026, 10, 28, 23, 51, 46, 123456, datetime.timezone.utc),
+        )
+        self.assertEqual(
+            storage_events.parse_utc("2026-10-28T16:51:46-07:00"),
+            datetime.datetime(2026, 10, 28, 23, 51, 46, tzinfo=datetime.timezone.utc),
+        )
+        for invalid in ("", "2026-10-28T23:51:46", "yesterday"):
+            with self.assertRaises(ValueError, msg=invalid):
+                storage_events.parse_utc(invalid)
+
+    def test_queries_a_window_of_a_channel_or_of_its_providers(self):
+        since = datetime.datetime(
+            2026, 10, 28, 23, 51, 46, 123999, datetime.timezone.utc
+        )
+        until = datetime.datetime(2026, 10, 29, 0, 20, tzinfo=datetime.timezone.utc)
+        window = (
+            "TimeCreated[@SystemTime>='2026-10-28T23:51:46.123Z' and "
+            "@SystemTime<='2026-10-29T00:20:00.000Z']"
+        )
+        self.assertEqual(
+            storage_events.event_query(since, until), f"*[System[{window}]]"
+        )
+        self.assertEqual(
+            storage_events.event_query(since, until, ("storvsc", "disk")),
+            f"*[System[Provider[@Name='storvsc' or @Name='disk'] and {window}]]",
+        )
+
+    @unittest.skipUnless(sys.platform == "win32", "only Windows has event logs")
+    def test_reads_a_window_of_a_windows_log(self):
+        until = datetime.datetime.now(datetime.timezone.utc)
+        query = storage_events.event_query(
+            until - datetime.timedelta(minutes=1),
+            until,
+            storage_events.SYSTEM_STORAGE_PROVIDERS,
+        )
+        document = storage_events.read_events(storage_events.SYSTEM_CHANNEL, query)
+
+        for event in storage_events.parse_events("System", document):
+            self.assertIn(event.provider, storage_events.SYSTEM_STORAGE_PROVIDERS)
+        with self.assertRaisesRegex(OSError, "^wevtutil failed with status 15007"):
+            storage_events.read_events("NVX-Missing-Channel/Operational", "*")
+
+    def test_a_query_is_killed_and_left_behind_once_it_overruns(self):
+        # Like any process, wevtutil may wait for a stalled disk even after
+        # its kill.
+        released = threading.Event()
+
+        def communicate() -> tuple[bytes, bytes]:
+            released.wait(30)
+            return b"", b""
+
+        process = MagicMock()
+        process.communicate.side_effect = communicate
+        with patch.object(
+            storage_events.subprocess, "Popen", return_value=process
+        ) as popen:
+            started = time.monotonic()
+            try:
+                with self.assertRaisesRegex(
+                    TimeoutError, r"^wevtutil did not finish within 0\.1s$"
+                ):
+                    storage_events.read_events(
+                        storage_events.STORPORT_CHANNEL, "*", timeout=0.1
+                    )
+                elapsed = time.monotonic() - started
+            finally:
+                released.set()
+
+        process.kill.assert_called_once_with()
+        self.assertLess(elapsed, 10)
+        self.assertEqual(
+            popen.call_args.args[0][:3],
+            ["wevtutil", "query-events", storage_events.STORPORT_CHANNEL],
+        )
+
+    def test_parses_rendered_events(self):
+        [event] = storage_events.parse_events("Storport", rendered_events(SLOW_IO))
+
+        self.assertEqual(event.provider, "Microsoft-Windows-StorPort")
+        self.assertEqual((event.event_id, event.level), (557, "Warning"))
+        self.assertEqual(event.time, "2026-10-25T00:49:12.3456789Z")
+        self.assertEqual(event.device, "1:0:0:0")
+        self.assertEqual(event.data["RequestDuration_ms"], "35123")
+        self.assertEqual(
+            event.summary(),
+            "2026-10-25T00:49:12.3456789Z Storport 557 Warning: An IO took more "
+            "than 30000 ms to complete for Storport Device (Port = 1, Path = 0, "
+            "Target = 0, Lun = 0).",
+        )
+        [reset] = storage_events.parse_events("System", rendered_events(MINIPORT_RESET))
+        self.assertIsNone(reset.device)
+        self.assertTrue(reset.summary().startswith("2026-10-25T00:48:37.0000000Z "))
+        self.assertIn(" System storvsc 129 Warning: Reset to device", reset.summary())
+
+    def test_counts_the_io_of_latency_buckets_above_a_second(self):
+        [event] = storage_events.parse_events("Storport", rendered_events(LATENCY))
+
+        self.assertEqual(
+            storage_events.slow_latency_counts(event),
+            [("1000ms-2000ms", 2), ("2000ms-10000ms", 4), ("10000+ms", 1)],
+        )
+
+    def test_saves_and_summarizes_a_window_and_warns_of_slow_io(self):
+        documents = {
+            storage_events.STORPORT_CHANNEL: rendered_events(LATENCY, TIMEOUT, SLOW_IO),
+            storage_events.SYSTEM_CHANNEL: rendered_events(MINIPORT_RESET),
+        }
+        queries: list[tuple[str, str]] = []
+        calls: list[str] = []
+
+        def read(channel: str, query: str) -> bytes:
+            queries.append((channel, query))
+            calls.append(channel)
+            return documents[channel]
+
+        def named(volumes: dict[str, Path]) -> dict[str, str]:
+            del volumes
+            calls.append("volumes")
+            return {"1:0:0:0": "workspace/scratch F:"}
+
+        since = datetime.datetime(2026, 10, 25, 0, 30, tzinfo=datetime.timezone.utc)
+        until = datetime.datetime(2026, 10, 25, 1, 0, tzinfo=datetime.timezone.utc)
+        volumes = {"scratch": Path("F:/scratch")}
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(storage_events, "read_events", side_effect=read),
+            patch.object(
+                storage_events, "volume_devices", side_effect=named
+            ) as devices,
+        ):
+            output = Path(temporary) / "storage-events"
+            report = storage_events.save_storage_events(
+                since, output, lambda: volumes, now=until
+            )
+            saved = {path.name: path.read_bytes() for path in output.iterdir()}
+
+        devices.assert_called_once_with(volumes)
+        # The volumes, which may have stalled, are probed once the events are
+        # saved.
+        self.assertEqual(
+            calls,
+            [storage_events.STORPORT_CHANNEL, storage_events.SYSTEM_CHANNEL, "volumes"],
+        )
+        self.assertIn("@Name='storvsc'", queries[1][1])
+        for _, query in queries:
+            self.assertIn(
+                "@SystemTime>='2026-10-25T00:30:00.000Z' and "
+                "@SystemTime<='2026-10-25T01:00:00.000Z'",
+                query,
+            )
+        self.assertEqual(
+            saved["storport-operational.xml"],
+            documents[storage_events.STORPORT_CHANNEL],
+        )
+        self.assertEqual(
+            saved["system-storage.xml"], documents[storage_events.SYSTEM_CHANNEL]
+        )
+        device = "device 1:0:0:0 (workspace/scratch F:)"
+        lines = [
+            "Storage events from 2026-10-25T00:30:00.000Z to 2026-10-25T01:00:00.000Z",
+            "Storport: 3 events: 1 of 500, 1 of 505, 1 of 557",
+            "System: 1 event: 1 of storvsc 129",
+            f"2026-10-25T00:40:00.0000000Z latency summary of {device}: 2 in "
+            "1000ms-2000ms, 4 in 2000ms-10000ms, 1 in 10000+ms",
+            "2026-10-25T00:48:37.0000000Z storvsc reset: Reset to device, "
+            "\\Device\\RaidPort1, was issued.",
+            f"2026-10-25T00:48:40.0000000Z request timeout on {device} after 60 s",
+            f"2026-10-25T00:49:12.3456789Z slow I/O on {device}: took 35123 ms, "
+            "waited 12 ms, threshold 30000 ms",
+        ]
+        self.assertEqual(report.lines(), lines)
+        summary = saved[storage_events.SUMMARY_FILENAME].decode("utf-8")
+        self.assertTrue(summary.startswith("\n".join(lines) + "\n\nAll events:\n"))
+        self.assertEqual(summary.count("\n  2026-10-25T"), 4)
+        self.assertEqual(
+            report.warnings(),
+            [
+                (
+                    "Slow storage I/O",
+                    "Storport recorded 1 I/O slower than its threshold of 30000 "
+                    f"ms in this job: the slowest took 35123 ms on {device} at "
+                    "2026-10-25T00:49:12.3456789Z. The diagnostics artifact keeps "
+                    "the job's storage events.",
+                )
+            ],
+        )
+
+    def test_reports_a_log_that_cannot_be_read(self):
+        def read(channel: str, _query: str) -> bytes:
+            if channel == storage_events.STORPORT_CHANNEL:
+                raise OSError("wevtutil failed with status 5: Access is denied.")
+            return rendered_events()
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(storage_events, "read_events", side_effect=read),
+        ):
+            output = Path(temporary) / "storage-events"
+            report = storage_events.save_storage_events(
+                datetime.datetime(2026, 10, 25, tzinfo=datetime.timezone.utc), output
+            )
+            saved = sorted(path.name for path in output.iterdir())
+
+        self.assertEqual(saved, ["storage-events.txt", "system-storage.xml"])
+        self.assertEqual(
+            report.lines()[1:],
+            [
+                "Storport: unavailable: wevtutil failed with status 5: Access is "
+                "denied.",
+                "System: 0 events",
+            ],
+        )
+        self.assertEqual(
+            report.warnings(),
+            [
+                (
+                    "Storage events",
+                    "Could not read the Storport events: wevtutil failed with "
+                    "status 5: Access is denied.",
+                )
+            ],
+        )
+
+    def test_keeps_the_events_when_probing_the_volumes_stalls_or_fails(self):
+        released = threading.Event()
+
+        def stalled() -> dict[str, Path]:
+            released.wait(30)
+            return {}
+
+        def failed() -> dict[str, Path]:
+            raise OSError("[WinError 21] The device is not ready")
+
+        def read(channel: str, _query: str) -> bytes:
+            if channel == storage_events.STORPORT_CHANNEL:
+                return rendered_events(SLOW_IO)
+            return rendered_events()
+
+        cases = (
+            (stalled, "probing them did not finish within 0.1s"),
+            (failed, "[WinError 21] The device is not ready"),
+        )
+        for volumes, failure in cases:
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as temporary,
+                patch.object(storage_events, "read_events", side_effect=read),
+                patch.object(storage_events, "VOLUME_NAMING_TIMEOUT_SECONDS", 0.1),
+            ):
+                output = Path(temporary) / "storage-events"
+                try:
+                    report = storage_events.save_storage_events(
+                        datetime.datetime(2026, 10, 25, tzinfo=datetime.timezone.utc),
+                        output,
+                        volumes,
+                    )
+                finally:
+                    released.set()
+                summary = (output / storage_events.SUMMARY_FILENAME).read_text(
+                    encoding="utf-8"
+                )
+
+            lines = report.lines()
+            self.assertEqual(
+                lines[1:4],
+                [
+                    "Storport: 1 event: 1 of 557",
+                    "System: 0 events",
+                    f"Volumes: unavailable: {failure}",
+                ],
+            )
+            self.assertTrue(
+                lines[4].startswith(
+                    "2026-10-25T00:49:12.3456789Z slow I/O on device 1:0:0:0: "
+                ),
+                lines[4],
+            )
+            self.assertTrue(summary.startswith("\n".join(lines) + "\n"))
+
+    def test_keeps_reading_and_reports_the_files_that_it_cannot_save(self):
+        # The workspace can share the stalled volume, which can hold a write.
+        released = threading.Event()
+
+        def write(path: Path, contents: bytes) -> None:
+            if path.name == "storport-operational.xml":
+                released.wait(30)
+                return
+            path.write_bytes(contents)
+
+        def read(channel: str, _query: str) -> bytes:
+            if channel == storage_events.STORPORT_CHANNEL:
+                return rendered_events(SLOW_IO)
+            return rendered_events()
+
+        since = datetime.datetime(2026, 10, 25, tzinfo=datetime.timezone.utc)
+        stalled = "the write did not finish within 0.1s"
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(storage_events, "read_events", side_effect=read),
+            patch.object(storage_events, "_write", side_effect=write),
+            patch.object(storage_events, "WRITE_TIMEOUT_SECONDS", 0.1),
+        ):
+            output = Path(temporary) / "storage-events"
+            try:
+                report = storage_events.save_storage_events(since, output)
+            finally:
+                released.set()
+            saved = sorted(path.name for path in output.iterdir())
+            summary = (output / storage_events.SUMMARY_FILENAME).read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(saved, ["storage-events.txt", "system-storage.xml"])
+        lines = report.lines()
+        self.assertEqual(
+            lines[1:4],
+            [
+                "Storport: 1 event: 1 of 557",
+                "System: 0 events",
+                f"Not saved: storport-operational.xml: {stalled}",
+            ],
+        )
+        self.assertTrue(summary.startswith("\n".join(lines) + "\n"))
+        self.assertIn(
+            ("Storage events", f"Could not save storport-operational.xml: {stalled}"),
+            report.warnings(),
+        )
+
+        # Without its directory, no file is saved, but the events are read.
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(storage_events, "read_events", side_effect=read),
+        ):
+            output = Path(temporary) / "storage-events"
+            output.write_bytes(b"")
+            report = storage_events.save_storage_events(since, output)
+        self.assertEqual(
+            sorted(report.unsaved),
+            ["storage-events.txt", "storport-operational.xml", "system-storage.xml"],
+        )
+        self.assertEqual(report.lines()[1], "Storport: 1 event: 1 of 557")
+
+    def test_the_command_prints_the_summary_and_annotates_slow_io(self):
+        report = storage_events.StorageEventReport(
+            since="2026-10-25T00:30:00.000Z",
+            until="2026-10-25T01:00:00.000Z",
+            events=storage_events.parse_events("Storport", rendered_events(SLOW_IO)),
+            failures={},
+        )
+        args = performance_arguments(
+            "storage-events",
+            "--since",
+            "2026-10-25T00:30:00.0000000Z",
+            "--output-dir",
+            "events",
+            "--scratch-dir",
+            "F:/nvx-benchmark-scratch",
+        )
+        stdout = io.StringIO()
+        with (
+            patch.object(performance.sys, "platform", "win32"),
+            patch.object(
+                storage_events, "save_storage_events", return_value=report
+            ) as save,
+            patch.object(
+                performance.benchmark_host,
+                "benchmark_volumes",
+                return_value={"scratch": Path("F:/nvx-benchmark-scratch")},
+            ) as volumes,
+            contextlib.redirect_stdout(stdout),
+        ):
+            status = performance.command_performance(args)
+            # The command leaves the probing of the volumes to the save,
+            # which bounds it after the export.
+            volumes.assert_not_called()
+            since, output, volume_source = save.call_args.args
+            probed = volume_source()
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            since, datetime.datetime(2026, 10, 25, 0, 30, tzinfo=datetime.timezone.utc)
+        )
+        self.assertEqual(output, Path("events"))
+        self.assertEqual(probed["scratch"], Path("F:/nvx-benchmark-scratch"))
+        volumes.assert_called_once_with(Path("F:/nvx-benchmark-scratch"))
+        printed = stdout.getvalue().splitlines()
+        self.assertEqual(printed[:2], report.lines()[:2])
+        self.assertIn("Saved the storage events in events", printed)
+        self.assertTrue(
+            printed[-1].startswith(
+                "::warning title=Slow storage I/O::Storport recorded 1 I/O"
+            ),
+            printed[-1],
+        )
+
+    @unittest.skipIf(sys.platform == "win32", "Windows records storage events")
+    def test_other_hosts_have_no_storage_events(self):
+        args = performance_arguments(
+            "storage-events", "--since", "2026-10-25T00:30:00Z", "--output-dir", "x"
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(performance.command_performance(args), 2)
+        self.assertIn("only on Windows", stderr.getvalue())
+
+
+def performance_arguments(*arguments: str) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    performance.configure_parser(parser)
+    return parser.parse_args(list(arguments))
 
 
 class AzureMetadataRequestTests(unittest.TestCase):

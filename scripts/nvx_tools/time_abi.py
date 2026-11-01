@@ -1,4 +1,4 @@
-"""Harness checks of the NVX time ABI v1 guest obligations.
+"""Harness checks of the NVX time ABI v2 guest obligations.
 
 A conforming guest reports each conformance check with an ``NVX-TIME-ABI``
 marker and each runtime violation with an ``NVX-TIME-ABI-VIOLATION`` event, and
@@ -14,7 +14,7 @@ import json
 import re
 import urllib.parse
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
@@ -108,11 +108,19 @@ class CpuGeneration:
     name: str
     vendor: str
     cpus: tuple[CpuModel, ...]
+    # The latest revision of the generation's profile, which `--cpu-profile
+    # auto` selects; OpenVMM keeps every earlier revision pinned, so that
+    # their snapshots still restore. Only NVX's copy of the catalog records
+    # it: benchmark reads the generations of an OpenVMM checkout only for the
+    # CPUs that they cover. A generation is those CPUs, so the revision takes
+    # no part in comparisons.
+    revision: int = field(default=1, compare=False)
 
     @property
     def profile_id(self) -> str:
-        """The catalog's v1 profile, which every backend shares."""
-        return f"{PROFILE_VENDORS[self.vendor]}.{self.name}.v1"
+        """The generation's latest profile, which ``--cpu-profile auto``
+        selects and every backend shares."""
+        return f"{PROFILE_VENDORS[self.vendor]}.{self.name}.v{self.revision}"
 
     def contains(self, vendor: str, family: int, model: int, stepping: int) -> bool:
         """Whether a CPU belongs to the generation."""
@@ -128,22 +136,26 @@ class CpuGeneration:
 
 # A copy of the generations of OpenVMM's pinned CPU profiles
 # (openvmm/vmm_core/cpu_profile/profiles), which test_time_abi compares with
-# the submodule. Doctor uses it only without OpenVMM (--no-openvmm), and run to
-# explain a failed cold boot on a CPU that it lacks; benchmark reads the
-# profiles of the OpenVMM checkout that it builds instead
+# the submodule. Doctor uses it only without OpenVMM (--no-openvmm); benchmark
+# reads the profiles of the OpenVMM checkout that it builds instead
 # (openvmm_cpu_generations), and otherwise OpenVMM reports the generation and
-# the profile itself.
+# the profile itself. nvx-rs run, which guides a failed cold boot on a CPU that
+# no built-in profile serves, reads a copy of its own,
+# nvx-rs/src/host/cli/cpu_generations.json.
 # Model 85 also covers Cascade Lake (steppings 5-7) and Cooper Lake (10-11),
 # which have no profile. AMD's family 25 model 1 is Milan's in every stepping,
 # Milan-X's 2 included, family 25 model 17 Genoa's, Genoa-X's included, and
-# family 26 model 2 Turin's.
+# family 26 model 2 Turin's. Genoa's latest profile, amd.genoa.v2, leaves out
+# what amd.genoa.v1 presents in CPUID 0x80000021 and the basic leaves above
+# 0xD, which the Microsoft hypervisor of the Azure Genoa VMs fingerprinted so
+# far does not present.
 CPU_GENERATIONS: tuple[CpuGeneration, ...] = (
     CpuGeneration("skylake-sp", "GenuineIntel", (CpuModel(6, 85, range(5)),)),
     CpuGeneration("icelake-sp", "GenuineIntel", (CpuModel(6, 106),)),
     CpuGeneration("emeraldrapids", "GenuineIntel", (CpuModel(6, 207),)),
     CpuGeneration("alderlake", "GenuineIntel", (CpuModel(6, 151), CpuModel(6, 154))),
     CpuGeneration("milan", "AuthenticAMD", (CpuModel(25, 1),)),
-    CpuGeneration("genoa", "AuthenticAMD", (CpuModel(25, 17),)),
+    CpuGeneration("genoa", "AuthenticAMD", (CpuModel(25, 17),), revision=2),
     CpuGeneration("turin", "AuthenticAMD", (CpuModel(26, 2),)),
 )
 
@@ -249,16 +261,10 @@ _CPU_PROFILE_FALLBACK = re.compile(
     rf"{re.escape(CPU_PROFILE_FALLBACK_MARKER)} .*?, so --cpu-profile auto fell back"
     r" to ([a-z0-9-]+\.host\.v[1-9][0-9]*) \(sha256:[0-9a-f]{64}\), "
 )
-# The issues that track built-in CPU profiles for more Intel and more AMD CPUs.
-# No issue tracks the CPUs of other vendors, which the time ABI does not serve
-# (doc/design/2.2-cpu-and-topology.md, "CPU Profile Selection").
-CPU_SUPPORT_ISSUES: Mapping[str, tuple[str, str]] = {
-    "GenuineIntel": ("Intel", "https://github.com/microsoft/nvx/issues/408"),
-    "AuthenticAMD": ("AMD", "https://github.com/microsoft/nvx/issues/409"),
-}
 # The issue form that requests a built-in CPU profile for a CPU
 # (.github/ISSUE_TEMPLATE/cpu-profile.yml), which OpenVMM's fallback warning,
-# run, and benchmark link to, prefilling the CPU fields that the form defines.
+# nvx-rs run, and benchmark link to, prefilling the CPU fields that the form
+# defines.
 CPU_PROFILE_REQUEST_URL = (
     "https://github.com/microsoft/nvx/issues/new?template=cpu-profile.yml"
 )
@@ -334,60 +340,6 @@ def parse_cpu_profile_fallback(output: str) -> str | None:
             f"malformed {CPU_PROFILE_FALLBACK_MARKER} warning: {lines[0].strip()!r}"
         )
     return match.group(1)
-
-
-def host_cpu_profile_guidance(
-    cpu_profile: str | None, host: HostCpu | None, openvmm: str, hypervisor: str
-) -> str | None:
-    """Return the next steps after OpenVMM failed a cold boot with
-    ``--cpu-profile cpu_profile``, or with its default, ``auto``, if
-    ``cpu_profile`` is None, on the CPU ``host`` with the ``hypervisor``
-    backend, or None unless no built-in profile serves the CPU.
-
-    On such an Intel or AMD CPU, ``auto`` falls back to a host profile, so the
-    failure may not be the profile's: the guidance says what ``auto`` does on
-    the CPU, and asks for the CPU's fingerprint, which ``openvmm`` writes, to
-    add a built-in profile for it. OpenVMM's own error names this run's cause,
-    and says so where the host profile cannot boot. On another vendor's CPU,
-    ``auto`` and ``host`` fail with ``E_PROFILE_HOST_UNKNOWN``. An explicit
-    profile ID fails with its own code, and ``host`` on an Intel or AMD CPU
-    with OpenVMM's own explanation, which need no guidance. OpenVMM keeps its
-    standard error on the terminal, so the caller cannot read the code that
-    ended the run."""
-    if host is None or (
-        cpu_generation(host.vendor, host.family, host.model, host.stepping) is not None
-    ):
-        return None
-    host_profiles = host.vendor in HOST_PROFILE_VENDORS
-    auto = cpu_profile in (None, "auto")
-    if not (auto or (cpu_profile == HOST_PROFILE_GENERATION and not host_profiles)):
-        return None
-    unserved = f"nvx: no built-in CPU profile serves this host's CPU, {host.describe()}"
-    generations = f"the built-in profiles cover {describe_cpu_generations()}."
-    if not host_profiles:
-        return "\n".join(
-            (
-                f"{unserved}, so a cold boot with --cpu-profile auto, the default, "
-                f"fails on it with {PROFILE_HOST_UNKNOWN}; {generations}",
-                f"nvx: --cpu-profile {HOST_PROFILE_GENERATION} cannot boot on it "
-                "either: host CPU profiles serve only Intel and AMD CPUs.",
-            )
-        )
-    vendor, issue = CPU_SUPPORT_ISSUES[host.vendor]
-    lines = [
-        f"{unserved}, so --cpu-profile auto, the default, falls back on it to a "
-        "CPU profile derived from this host, which OpenVMM warns about with "
-        f"{CPU_PROFILE_FALLBACK_MARKER}; {generations}",
-        "nvx: OpenVMM's error above names the cause of this failure, and says "
-        'so where the host profile cannot boot; doc/usage.md ("CPU profiles") '
-        "explains a host profile's limits.",
-    ]
-    lines.extend(
-        f"nvx: {line}"
-        for line in cpu_profile_request_lines(host, openvmm, hypervisor).splitlines()
-    )
-    lines.append(f"nvx: {issue} tracks CPU profiles for more {vendor} CPUs.")
-    return "\n".join(lines)
 
 
 def benchmark_cpu_profile_refusal(
@@ -842,7 +794,7 @@ class TimeAbiMonitor:
     def _missing_reason(self) -> str:
         if self.report_only:
             return "the guest ran nvx-time in report-only mode"
-        return "the guest image or OpenVMM does not implement time ABI v1"
+        return "the guest image or OpenVMM does not implement time ABI v2"
 
     def require_boot(
         self,

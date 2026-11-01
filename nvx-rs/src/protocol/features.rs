@@ -7,10 +7,10 @@ use super::{ProtocolError, array, violation};
 /// Control features of a guest image, advertised in the response to
 /// [`APP_FEATURES`](super::APP_FEATURES).
 ///
-/// The bits are defined by the guest agent in `guest/common/nvx-managed-agent.c`, which also
-/// speaks for the features of its image's init script. A host drives a sandbox only when its
-/// guest provides every feature in [`GuestFeatures::REQUIRED`]; an older image would silently
-/// ignore the policy or the request that depends on the missing feature.
+/// The Rust guest agent uses these shared definitions and also speaks for the features of its
+/// image's init script. A host drives a sandbox only when its guest provides every feature in
+/// [`GuestFeatures::REQUIRED`]; an older image would silently ignore the policy or the request
+/// that depends on the missing feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestFeatures(u32);
 
@@ -21,7 +21,8 @@ impl GuestFeatures {
     pub const CANCEL: Self = Self(1 << 0);
     // Bit 1 announced the bind mounts that `nvx_map=` kernel command-line tokens listed. Guests
     // no longer set it, so a host that still sends those tokens refuses them.
-    /// Creates the account that `nvx_workload_account=create` selects.
+    /// Creates the account that `nvx_workload_account=create` selects. Only the blockless root
+    /// creates accounts; the layered root's executions require an existing one.
     pub const WORKLOAD_ACCOUNT: Self = Self(1 << 2);
     /// Runs each workload in a cgroup of its own and kills whatever it leaves behind.
     pub const EXEC_CGROUP: Self = Self(1 << 3);
@@ -36,24 +37,8 @@ impl GuestFeatures {
     /// `nvx_maps=` kernel command-line token announces, keeps the shared export root-only, and
     /// refuses workloads until every entry is mounted.
     pub const HOST_MAPPING_TABLE: Self = Self(1 << 6);
-    /// Accepts `APP_MAPS` entries that continue the host mapping table at run time, after the
-    /// table that `nvx_maps=` announced is mounted. Not in [`GuestFeatures::REQUIRED`]: only the
-    /// live-share experiment needs it.
-    pub const RUNTIME_MAPPINGS: Self = Self(1 << 7);
-    /// Serves several executions at once: each `EXEC` request keeps its own process, cgroup,
-    /// output stream and deadline, so cancelling or timing out one leaves the others running.
-    /// Not in [`GuestFeatures::REQUIRED`]: a host that starts only one execution at a time works
-    /// with an image that lacks it.
-    pub const EXEC_SLOTS: Self = Self(1 << 8);
-    /// Enforces the `memMb`, `cpuPercent` and `pidsMax` limits of an `EXEC` request on the
-    /// execution's own cgroup, and refuses an execution whose limit it cannot enforce. Not in
-    /// [`GuestFeatures::REQUIRED`]: a host that asks for no limits works without it.
-    pub const EXEC_LIMITS: Self = Self(1 << 9);
-    /// Versioned guest-session lifecycle, scoped execution, and namespace isolation.
-    /// Not required for legacy trusted-shared guests; hosts must explicitly negotiate it.
-    pub const SESSION_ISOLATION: Self = Self(1 << 10);
-    /// The features that the host depends on.
-    pub const REQUIRED: Self = Self(
+    /// Features announced by the direct-mode managed agent.
+    pub const DIRECT_AGENT: Self = Self(
         Self::CANCEL.0
             | Self::WORKLOAD_ACCOUNT.0
             | Self::EXEC_CGROUP.0
@@ -61,18 +46,33 @@ impl GuestFeatures {
             | Self::EXEC_CWD.0
             | Self::HOST_MAPPING_TABLE.0,
     );
+    /// Features announced by the managed agent that launches a sandbox container.
+    pub const SANDBOX_AGENT: Self =
+        Self(Self::CANCEL.0 | Self::EXEC_ENVIRONMENT.0 | Self::HOST_MAPPING_TABLE.0);
+    /// The features that the host depends on.
+    pub const REQUIRED: Self = Self::DIRECT_AGENT;
+    /// The features that `nvx-rs sandbox` depends on in the layered sandbox root, whose agent
+    /// announces [`SANDBOX_AGENT`](Self::SANDBOX_AGENT):
+    /// [`EXEC_ENVIRONMENT`](Self::EXEC_ENVIRONMENT), because `exec` sends a working directory and
+    /// an environment in an extended `EXEC`, and
+    /// [`HOST_MAPPING_TABLE`](Self::HOST_MAPPING_TABLE), because `start` sends the mappings of
+    /// the sandbox's shares as `MAPS` requests.
+    ///
+    /// It holds no [`CANCEL`](Self::CANCEL), because the CLI sends no `APP_CANCEL`: as `nvx.py`
+    /// did, Ctrl-C ends an `exec` by closing the session, and the guest agent ends the workload
+    /// when OpenVMM resets the session that it ran for. It holds no
+    /// [`WORKLOAD_ACCOUNT`](Self::WORKLOAD_ACCOUNT), because no sandbox launch requests account
+    /// creation, which the layered root neither performs nor announces (microsoft/nvx#566).
+    pub const LAYERED_SANDBOX: Self = Self(Self::EXEC_ENVIRONMENT.0 | Self::HOST_MAPPING_TABLE.0);
 
-    /// Human-readable names of every feature, used in compatibility errors.
-    pub(crate) const NAMES: [(Self, &'static str); 9] = [
+    /// Human-readable names of every required feature, used in compatibility errors.
+    pub(crate) const NAMES: [(Self, &'static str); 6] = [
         (Self::CANCEL, "cancellation"),
         (Self::WORKLOAD_ACCOUNT, "workload accounts"),
         (Self::EXEC_CGROUP, "workload containment"),
         (Self::EXEC_ENVIRONMENT, "per-execution environments"),
         (Self::EXEC_CWD, "working directories"),
         (Self::HOST_MAPPING_TABLE, "host path mapping tables"),
-        (Self::EXEC_SLOTS, "concurrent executions"),
-        (Self::EXEC_LIMITS, "per-execution resource limits"),
-        (Self::SESSION_ISOLATION, "isolated guest sessions"),
     ];
 
     /// Returns the features whose bits are set in `bits`.

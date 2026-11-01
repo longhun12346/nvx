@@ -33,7 +33,11 @@ param(
     [string]$BenchmarkScratchDirectory,
 
     [Parameter()]
-    [switch]$RunnerTokenStdin
+    [switch]$RunnerTokenStdin,
+
+    [Parameter()]
+    [ValidatePattern('^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$')]
+    [string]$ExtraRunnerLabels
 )
 
 Set-StrictMode -Version 2.0
@@ -128,6 +132,34 @@ function Get-ToolArtifact {
     }
 }
 
+function Get-ExpectedRunnerLabels {
+    param(
+        [string]$AdditionalLabels,
+        [switch]$BenchmarkRunner
+    )
+
+    $labels = @("windows", "whp", "virtual-machine")
+    if ($BenchmarkRunner) {
+        $labels += "benchmark"
+    }
+    else {
+        $labels += "general"
+    }
+    if (-not [string]::IsNullOrEmpty($AdditionalLabels)) {
+        foreach ($label in $AdditionalLabels.Split(',')) {
+            if ($label -in @("general", "benchmark")) {
+                throw "runner role label must be selected with -BenchmarkRunner: $label"
+            }
+            if ($label -cnotmatch '^[A-Za-z0-9_.-]+$' -or
+                $labels -contains $label) {
+                throw "invalid or duplicate runner label: $label"
+            }
+            $labels += $label
+        }
+    }
+    return $labels -join ','
+}
+
 # The versions, artifacts, and checksums of the tools that this script
 # installs; stage the manifest next to the script.
 $ToolPlatform = "windows-x86_64"
@@ -147,6 +179,9 @@ $RunnerVersion = $runnerRelease.Version
 $RunnerArtifact = $runnerRelease.Name
 $RunnerSha256 = $runnerRelease.Sha256
 
+$ExpectedRunnerLabels = Get-ExpectedRunnerLabels `
+    -AdditionalLabels $ExtraRunnerLabels -BenchmarkRunner:$BenchmarkRunner
+
 if (-not $RunnerOnly) {
     if ([string]::IsNullOrWhiteSpace($Workspace)) {
         $Workspace = Join-Path $PSScriptRoot "..\.."
@@ -163,12 +198,15 @@ $RustupHome = Join-Path $ToolRoot "rustup"
 $RequiredGuestArtifacts = @(
     "vmlinux",
     "vmlinux.config",
+    "vmlinux.provenance.json",
     "initramfs.cpio.gz",
     "initramfs.cpio.gz.packages.json",
+    "initramfs.provenance.json",
     "initramfs-ubuntu.cpio.gz",
     "initramfs-ubuntu.cpio.gz.packages.json",
     "ubuntu-distro.erofs",
     "ubuntu-distro.erofs.manifest.json",
+    "ubuntu-smoke-scratch.ext4",
     "initramfs-azurelinux.cpio.gz",
     "initramfs-azurelinux.cpio.gz.packages.json"
 )
@@ -418,6 +456,23 @@ function Assert-ActionsRunnerWritablePaths {
         if (-not $item.PSIsContainer) {
             throw "runner writable path is not a directory: $path"
         }
+    }
+}
+
+function Assert-FreshRunnerDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $root = Get-Item -LiteralPath $Path -Force
+    $unexpected = @(Get-ChildItem -LiteralPath $Path -Force |
+        Where-Object {
+            $_.Name -ne "_work" -or
+            -not $_.PSIsContainer -or
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
+        })
+    if (-not $root.PSIsContainer -or
+        $root.Attributes -band [IO.FileAttributes]::ReparsePoint -or
+        $unexpected.Count -ne 0) {
+        throw "refusing to install into partial runner directory: $Path"
     }
 }
 
@@ -820,8 +875,11 @@ function Install-Toolchain {
         }
     }
     Update-ProcessPath
+    # Keep the pinned rustup. Its self-update replaces rustup.exe from a
+    # detached process after rustup exits, racing the next rustup command.
     Invoke-Native $rustupPath @(
-        "toolchain", "install", $RustToolchain, "--profile", "minimal"
+        "toolchain", "install", $RustToolchain, "--profile", "minimal",
+        "--no-self-update"
     )
     Invoke-Native $rustupPath @(
         "target", "add",
@@ -1101,15 +1159,6 @@ function Assert-RunnerPackage {
     }
 }
 
-# CI's platform jobs require the benchmark label, which exactly one runner of
-# each backend's pool carries.
-function Get-ActionsRunnerLabels {
-    if ($BenchmarkRunner) {
-        return "windows,whp,virtual-machine,benchmark"
-    }
-    return "windows,whp,virtual-machine"
-}
-
 function Install-ActionsRunner {
     param([Parameter()][string]$Token)
     $archiveName = $RunnerArtifact
@@ -1131,9 +1180,7 @@ function Install-ActionsRunner {
 
         $listener = Join-Path $RunnerDirectory "bin\Runner.Listener.exe"
         if (-not (Test-Path -LiteralPath $listener -PathType Leaf)) {
-            if (@(Get-ChildItem -LiteralPath $RunnerDirectory -Force).Count -ne 0) {
-                throw "refusing to install into partial runner directory: $RunnerDirectory"
-            }
+            Assert-FreshRunnerDirectory -Path $RunnerDirectory
             Copy-Item `
                 -Path (Join-Path $packageRoot "*") `
                 -Destination $RunnerDirectory `
@@ -1157,7 +1204,7 @@ function Install-ActionsRunner {
     $runnerConfiguration = Join-Path $RunnerDirectory ".runner"
     $serviceFile = Join-Path $RunnerDirectory ".service"
     $labelsFile = Join-Path $RunnerDirectory ".nvx-labels"
-    $labels = Get-ActionsRunnerLabels
+    $labels = $ExpectedRunnerLabels
     $runnerNameValidated = $false
     if (Test-Path -LiteralPath $runnerConfiguration -PathType Leaf) {
         $configuration = Get-Content -LiteralPath $runnerConfiguration -Raw |
@@ -1342,7 +1389,7 @@ function Assert-ActionsRunner {
     }
     if (-not [string]::IsNullOrWhiteSpace($RunnerName)) {
         $labelsFile = Join-Path $RunnerDirectory ".nvx-labels"
-        $expectedLabels = Get-ActionsRunnerLabels
+        $expectedLabels = $ExpectedRunnerLabels
         if (-not (Test-Path -LiteralPath $labelsFile -PathType Leaf) -or
             (Get-Content -LiteralPath $labelsFile -Raw).Trim() -ne
             $expectedLabels) {
@@ -1627,8 +1674,29 @@ function Assert-Environment {
                         -PathType Leaf)) {
                 throw "missing OpenVMM release binary"
             }
-            Invoke-Native $python @(
-                "scripts\nvx.py", "run",
+            # nvx-rs runs NVX's microVMs; a current build changes nothing.
+            Invoke-Native (Get-RequiredCommand "cargo.exe") @(
+                "+$RustToolchain", "build", "--release", "--locked",
+                "--features", "cli",
+                "--manifest-path", "nvx-rs\Cargo.toml",
+                "--target-dir", "nvx-rs\target"
+            )
+            $nvxRs = "$Workspace\nvx-rs\target\release\nvx-rs.exe"
+            # Packaging and the adversarial executor take only an nvx-rs whose
+            # provenance binds it to the checkout's sources.
+            $previousNvxRs = $env:NVX_RS
+            $previousToolchain = $env:RUSTUP_TOOLCHAIN
+            $env:NVX_RS = $nvxRs
+            $env:RUSTUP_TOOLCHAIN = $RustToolchain
+            try {
+                Invoke-Native $python @("scripts\nvx.py", "record-nvx-rs-provenance")
+            }
+            finally {
+                $env:NVX_RS = $previousNvxRs
+                $env:RUSTUP_TOOLCHAIN = $previousToolchain
+            }
+            Invoke-Native $nvxRs @(
+                "run",
                 "--hypervisor", "whp",
                 "--dry-run"
             )

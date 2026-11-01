@@ -1,0 +1,494 @@
+//! The kernel's text formats that both time tools parse: the records of `/dev/kmsg` and of
+//! `syslog(2)`, CPU lists, and `/proc/timer_list`.
+//!
+//! The kernel writes its procfs and sysfs files in ASCII, so their parsers read text. A log
+//! message may quote any bytes, which the tools print or escape byte for byte, so the log's
+//! parsers keep messages as bytes, and [`find`] searches them.
+
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
+
+use super::parse::parse_decimal;
+
+/// Returns the position of the first occurrence of `needle` in `haystack`, which may hold any
+/// bytes. An empty needle occurs at the start.
+pub(crate) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Returns whether `needle` occurs in `haystack`, which may hold any bytes.
+pub(crate) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    find(haystack, needle).is_some()
+}
+
+/// One record of the kernel's structured log, as a read of `/dev/kmsg` returns it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KmsgRecord<'a> {
+    /// Microseconds since boot at which the kernel logged the record, when its header has them.
+    pub(crate) timestamp_us: Option<u64>,
+    /// The message's first line.
+    pub(crate) message: &'a [u8],
+}
+
+impl<'a> KmsgRecord<'a> {
+    /// Parses one record: a header of comma-separated fields, the priority, the sequence number,
+    /// and the timestamp first, then `;`, the message, and the message's continuation lines.
+    /// Returns `None` for a record without a header.
+    pub(crate) fn parse(record: &'a [u8]) -> Option<Self> {
+        let mut parts = record.splitn(2, |&byte| byte == b';');
+        let header = parts.next()?;
+        let body = parts.next()?;
+        Some(Self {
+            timestamp_us: header
+                .split(|&byte| byte == b',')
+                .nth(2)
+                .and_then(parse_decimal),
+            message: body.split(|&byte| byte == b'\n').next().unwrap_or_default(),
+        })
+    }
+}
+
+/// One line of the kernel's log as `syslog(2)` returns it: `<priority>`, then `[seconds]` when the
+/// kernel stamps its messages, then the message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SyslogLine<'a> {
+    /// Microseconds since boot of the line's timestamp, when it has a well-formed one.
+    pub(crate) timestamp_us: Option<u64>,
+    /// The message, after the priority, a well-formed timestamp, and one space after it.
+    pub(crate) message: &'a [u8],
+}
+
+impl<'a> SyslogLine<'a> {
+    /// Parses one line. A timestamp is spaces, then decimal seconds with a decimal fraction,
+    /// between brackets. A line whose brackets hold anything else keeps them in its message.
+    pub(crate) fn parse(line: &'a [u8]) -> Self {
+        let line = line
+            .strip_prefix(b"<")
+            .and_then(|rest| {
+                let end = rest.iter().position(|&byte| byte == b'>')?;
+                Some(&rest[end + 1..])
+            })
+            .unwrap_or(line);
+        let stamped = line.strip_prefix(b"[").and_then(|rest| {
+            let end = rest.iter().position(|&byte| byte == b']')?;
+            let timestamp_us = microseconds(&rest[..end])?;
+            let message = &rest[end + 1..];
+            Some(Self {
+                timestamp_us: Some(timestamp_us),
+                message: message.strip_prefix(b" ").unwrap_or(message),
+            })
+        });
+        stamped.unwrap_or(Self {
+            timestamp_us: None,
+            message: line,
+        })
+    }
+}
+
+/// Parses a log timestamp, spaces then `seconds.fraction` in decimal, into microseconds.
+fn microseconds(stamp: &[u8]) -> Option<u64> {
+    /// Microseconds in a second.
+    const PER_SECOND: u64 = 1_000_000;
+    /// Decimal digits of a microsecond fraction of a second.
+    const DIGITS: usize = 6;
+    let stamp = std::str::from_utf8(stamp).ok()?.trim_start_matches(' ');
+    let (seconds, fraction) = stamp.split_once('.')?;
+    if !(seconds.bytes().chain(fraction.bytes())).all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let whole = if seconds.is_empty() {
+        0
+    } else {
+        seconds.parse::<u64>().ok()?
+    };
+    let micros = fraction
+        .bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(DIGITS)
+        .fold(0, |micros, digit| micros * 10 + u64::from(digit - b'0'));
+    whole.checked_mul(PER_SECOND)?.checked_add(micros)
+}
+
+/// Parses a CPU list in the kernel's syntax, such as `0-3,6`: comma-separated CPU numbers and
+/// inclusive ranges of them, in plain decimal. An empty list has no ranges.
+///
+/// Returns `None` for any other form, including a range that ends before it starts.
+pub(crate) fn parse_cpu_list(text: &[u8]) -> Option<Vec<RangeInclusive<usize>>> {
+    /// Parses one CPU number.
+    fn cpu(text: &[u8]) -> Option<usize> {
+        parse_decimal(text).and_then(|cpu| usize::try_from(cpu).ok())
+    }
+    if text.is_empty() {
+        return Some(Vec::new());
+    }
+    text.split(|&byte| byte == b',')
+        .map(|item| {
+            let mut bounds = item.splitn(2, |&byte| byte == b'-');
+            let first = cpu(bounds.next()?)?;
+            let last = bounds.next().map_or(Some(first), cpu)?;
+            (first <= last).then_some(first..=last)
+        })
+        .collect()
+}
+
+/// The modes of a tick device, `enum tick_device_mode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TickMode {
+    /// The device ticks periodically.
+    Periodic,
+    /// The device is programmed for each next event.
+    Oneshot,
+}
+
+impl TickMode {
+    /// Returns the mode that the kernel numbers `number`.
+    pub(crate) const fn from_number(number: i32) -> Option<Self> {
+        match number {
+            0 => Some(Self::Periodic),
+            1 => Some(Self::Oneshot),
+            _ => None,
+        }
+    }
+
+    /// Returns the mode's name, as the time probe prints it.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Periodic => "periodic",
+            Self::Oneshot => "oneshot",
+        }
+    }
+}
+
+/// The states of a clock-event device, `enum clock_event_state`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClockEventState {
+    /// The device is not in use.
+    Detached,
+    /// The device is powered down.
+    Shutdown,
+    /// The device fires periodically.
+    Periodic,
+    /// The device fires once for each programmed event.
+    Oneshot,
+    /// The device is in one-shot mode with no event programmed.
+    OneshotStopped,
+}
+
+impl ClockEventState {
+    /// Returns the state that the kernel numbers `number`.
+    pub(crate) const fn from_number(number: i32) -> Option<Self> {
+        match number {
+            0 => Some(Self::Detached),
+            1 => Some(Self::Shutdown),
+            2 => Some(Self::Periodic),
+            3 => Some(Self::Oneshot),
+            4 => Some(Self::OneshotStopped),
+            _ => None,
+        }
+    }
+
+    /// Returns the state's name, as the time probe prints it.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Detached => "detached",
+            Self::Shutdown => "shutdown",
+            Self::Periodic => "periodic",
+            Self::Oneshot => "oneshot",
+            Self::OneshotStopped => "oneshot_stopped",
+        }
+    }
+}
+
+/// One tick device's section of `/proc/timer_list`. The numbers are the kernel's, so that the
+/// diagnostics can print values that no variant of [`TickMode`] or [`ClockEventState`] names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TickDevice {
+    /// The tick device's mode, from the `Tick Device: mode:` line that starts the section.
+    pub(crate) mode: Option<i32>,
+    /// The clock-event device's name, `<NULL>` for none.
+    pub(crate) device: Option<String>,
+    /// The clock-event device's state.
+    pub(crate) state: Option<i32>,
+    /// The clock-event device's event handler.
+    pub(crate) handler: Option<String>,
+}
+
+impl TickDevice {
+    /// Returns the tick device's mode, when the kernel reported a known one.
+    pub(crate) fn tick_mode(&self) -> Option<TickMode> {
+        self.mode.and_then(TickMode::from_number)
+    }
+
+    /// Returns the clock-event device's state, when the kernel reported a known one.
+    pub(crate) fn clock_event_state(&self) -> Option<ClockEventState> {
+        self.state.and_then(ClockEventState::from_number)
+    }
+}
+
+/// One CPU's high-resolution timer base in `/proc/timer_list`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TimerBase {
+    /// Whether high-resolution timers are active, as the kernel numbers it.
+    pub(crate) hres_active: Option<i32>,
+    /// The tickless mode, `.nohz_mode` in older kernels and `.nohz` in newer ones.
+    pub(crate) nohz: Option<i32>,
+}
+
+/// The tick devices and timer bases that `/proc/timer_list` describes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TimerList {
+    /// The broadcast tick device's section, when the list has one.
+    pub(crate) broadcast: Option<TickDevice>,
+    /// Each CPU's tick device, by CPU number.
+    pub(crate) tick_devices: BTreeMap<usize, TickDevice>,
+    /// Each CPU's timer base, by CPU number.
+    pub(crate) timer_bases: BTreeMap<usize, TimerBase>,
+}
+
+/// The section of `/proc/timer_list` that its lines describe.
+#[derive(Clone, Copy)]
+enum Section {
+    /// No section, or one whose lines the tools ignore.
+    None,
+    /// The broadcast tick device.
+    Broadcast,
+    /// One CPU's tick device.
+    TickDevice(usize),
+    /// One CPU's timer base.
+    TimerBase(usize),
+}
+
+impl TimerList {
+    /// Parses the list's `key: value` lines, whose keys the kernel pads with whitespace.
+    pub(crate) fn parse(text: &[u8]) -> Self {
+        /// Returns the number that starts `value`.
+        fn number(value: &str) -> Option<i32> {
+            value.split_whitespace().next()?.parse().ok()
+        }
+        /// Returns the CPU number that starts `value`.
+        fn cpu(value: &str) -> Option<usize> {
+            number(value).and_then(|cpu| usize::try_from(cpu).ok())
+        }
+        /// Returns the word that starts `value`.
+        fn word(value: &str) -> Option<String> {
+            value.split_whitespace().next().map(str::to_owned)
+        }
+        let text: Cow<'_, str> = String::from_utf8_lossy(text);
+        let mut list = Self::default();
+        let mut section = Section::None;
+        let mut mode = None;
+        for line in text.lines() {
+            if line.starts_with("Broadcast device") {
+                list.broadcast = Some(TickDevice {
+                    mode,
+                    ..TickDevice::default()
+                });
+                section = Section::Broadcast;
+                continue;
+            }
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            match key.trim() {
+                "cpu" => section = cpu(value).map_or(Section::None, Section::TimerBase),
+                "Tick Device" => {
+                    mode = value.trim().strip_prefix("mode:").and_then(number);
+                    section = Section::None;
+                }
+                "Per CPU device" => {
+                    section = cpu(value).map_or(Section::None, |cpu| {
+                        let device = TickDevice {
+                            mode,
+                            ..TickDevice::default()
+                        };
+                        list.tick_devices.insert(cpu, device);
+                        Section::TickDevice(cpu)
+                    });
+                }
+                "Clock Event Device" => {
+                    if let Some(device) = list.tick_device(section) {
+                        device.device = word(value);
+                    }
+                }
+                "mode" => {
+                    if let Some(device) = list.tick_device(section) {
+                        device.state = number(value);
+                    }
+                }
+                "event_handler" => {
+                    if let Some(device) = list.tick_device(section) {
+                        device.handler = word(value);
+                    }
+                }
+                ".hres_active" => {
+                    if let Some(base) = list.timer_base(section) {
+                        base.hres_active = number(value);
+                    }
+                }
+                ".nohz_mode" | ".nohz" => {
+                    if let Some(base) = list.timer_base(section) {
+                        base.nohz = number(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        list
+    }
+
+    /// Returns the tick device that `section` describes, if it describes one.
+    fn tick_device(&mut self, section: Section) -> Option<&mut TickDevice> {
+        match section {
+            Section::Broadcast => self.broadcast.as_mut(),
+            Section::TickDevice(cpu) => self.tick_devices.get_mut(&cpu),
+            Section::None | Section::TimerBase(_) => None,
+        }
+    }
+
+    /// Returns the timer base that `section` describes, if it describes one.
+    fn timer_base(&mut self, section: Section) -> Option<&mut TimerBase> {
+        match section {
+            Section::TimerBase(cpu) => Some(self.timer_bases.entry(cpu).or_default()),
+            Section::None | Section::Broadcast | Section::TickDevice(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Checks of the parsers against the kernel's formats.
+
+    use super::*;
+
+    /// An excerpt of a Linux 6 `/proc/timer_list` with one CPU.
+    const TIMER_LIST: &str = "\
+Timer List Version: v0.10
+HRTIMER_MAX_CLOCK_BASES: 8
+now at 1234567890 nsecs
+
+cpu: 0
+ clock 0:
+  .base:       00000000a1b2c3d4
+  .index:      0
+active timers:
+ #0: <00000000deadbeef>, tick_nohz_highres_handler, S:01
+  .expires_next   : 1235000000 nsecs
+  .hres_active    : 1
+  .nr_events      : 12345
+  .nohz           : 1
+  .highres        : 1
+
+jiffies: 4294967296
+
+Tick Device: mode:     1
+Broadcast device
+Clock Event Device: <NULL>
+tick_broadcast_mask: 00
+tick_broadcast_oneshot_mask: 00
+
+Tick Device: mode:     1
+Per CPU device: 0
+Clock Event Device: lapic
+ max_delta_ns:   1374389534634
+ mode:           3
+ next_event:     1235000000 nsecs
+ oneshot stopped: lapic_timer_shutdown
+ event_handler:  hrtimer_interrupt
+ retries:        0
+";
+
+    #[test]
+    fn byte_search_finds_any_bytes() {
+        assert_eq!(find(b"ab\xffcd", b"\xffc"), Some(2));
+        assert_eq!(find(b"abc", b""), Some(0));
+        assert_eq!(find(b"ab", b"abc"), None);
+        assert!(contains(b"x TSC unstable", b"TSC"));
+        assert!(!contains(b"tsc", b"TSC"));
+    }
+
+    #[test]
+    fn kmsg_records_give_their_timestamp_and_first_line() {
+        let record = KmsgRecord::parse(b"6,339,5140900,-;NET: Registered\n SUBSYSTEM=net\n");
+        assert_eq!(
+            record,
+            Some(KmsgRecord {
+                timestamp_us: Some(5_140_900),
+                message: b"NET: Registered",
+            })
+        );
+        let record = KmsgRecord::parse(b"6,1;\xff").unwrap();
+        assert_eq!((record.timestamp_us, record.message), (None, &b"\xff"[..]));
+        assert_eq!(KmsgRecord::parse(b"no header"), None);
+    }
+
+    #[test]
+    fn syslog_lines_strip_only_well_formed_timestamps() {
+        let line = SyslogLine::parse(b"<6>[    3.000001] tsc: Refined");
+        assert_eq!(line.timestamp_us, Some(3_000_001));
+        assert_eq!(line.message, b"tsc: Refined");
+        let line = SyslogLine::parse(b"<4>[12.5]x");
+        assert_eq!(
+            (line.timestamp_us, line.message),
+            (Some(12_500_000), &b"x"[..])
+        );
+        let line = SyslogLine::parse(b"<6>[abc] message");
+        assert_eq!(
+            (line.timestamp_us, line.message),
+            (None, &b"[abc] message"[..])
+        );
+        let line = SyslogLine::parse(b"plain");
+        assert_eq!((line.timestamp_us, line.message), (None, &b"plain"[..]));
+    }
+
+    #[test]
+    fn cpu_lists_are_plain_ranges() {
+        assert_eq!(parse_cpu_list(b"0-3,6"), Some(vec![0..=3, 6..=6]));
+        assert_eq!(parse_cpu_list(b""), Some(Vec::new()));
+        for list in [
+            &b"3-1"[..],
+            b"0,",
+            b",0",
+            b"-1",
+            b"+1",
+            b" 1",
+            b"1-",
+            b"0x1",
+            b"1\n",
+        ] {
+            assert_eq!(parse_cpu_list(list), None, "{}", list.escape_ascii());
+        }
+    }
+
+    #[test]
+    fn timer_lists_give_tick_devices_and_timer_bases() {
+        let list = TimerList::parse(TIMER_LIST.as_bytes());
+        let broadcast = list.broadcast.unwrap();
+        assert_eq!(broadcast.device.as_deref(), Some("<NULL>"));
+        assert_eq!(broadcast.tick_mode(), Some(TickMode::Oneshot));
+        let cpu = &list.tick_devices[&0];
+        assert_eq!(cpu.device.as_deref(), Some("lapic"));
+        assert_eq!(cpu.handler.as_deref(), Some("hrtimer_interrupt"));
+        assert_eq!(cpu.clock_event_state(), Some(ClockEventState::Oneshot));
+        assert_eq!(cpu.state, Some(3));
+        assert_eq!(
+            list.timer_bases[&0],
+            TimerBase {
+                hres_active: Some(1),
+                nohz: Some(1),
+            }
+        );
+        let older = TimerList::parse(b"cpu: 2\n  .nohz_mode      : 2\n");
+        assert_eq!(older.timer_bases[&2].nohz, Some(2));
+        assert_eq!(TickMode::from_number(7), None);
+        assert_eq!(
+            ClockEventState::from_number(4).map(ClockEventState::name),
+            Some("oneshot_stopped")
+        );
+    }
+}

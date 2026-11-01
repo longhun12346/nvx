@@ -1,6 +1,6 @@
 [package]
-name = "nvx-rs"
-version = "0.1.0"
+name = "nvx"
+version = "0.1.0-alpha.3"
 edition = "2024"
 rust-version = "1.89"
 description = "NVX mechanics: the OpenVMM control protocol and the launch, policy lowering, and supervision of NVX microVMs"
@@ -9,9 +9,15 @@ repository = "https://github.com/microsoft/nvx"
 readme = "README.md"
 keywords = ["sandbox", "microvm", "openvmm", "virtualization"]
 categories = ["virtualization"]
-publish = false
+publish = ["crates-io"]
 # Lets the build scripts of dependents read the staged bundle as `DEP_NVX_ARTIFACTS_DIR`.
 links = "nvx"
+
+# docs.rs builds without network access, so its documentation leaves out `bundled`, whose build
+# script downloads a release.
+[package.metadata.docs.rs]
+features = ["cli", "testing", "guest"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 
 [lib]
 name = "nvx"
@@ -19,14 +25,25 @@ name = "nvx"
 [features]
 default = ["host"]
 # The host side: artifact discovery, launch, network and filesystem lowering, control sessions,
-# process and platform primitives, and the supervision of VM instances.
-host = ["serde", "dep:getrandom", "dep:serde_json", "dep:libc", "dep:windows-sys"]
+# process and platform primitives, the supervision of VM instances, and the sandbox launch
+# profile, whose aggregate child names are SHA-256 digests.
+host = [
+    "serde",
+    "dep:getrandom",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:nix",
+    "dep:windows-sys",
+]
 # Stages the OpenVMM executable, guest kernel, and control initramfs at build time; see
 # `Artifacts::bundled`. The build script downloads the release pinned in `artifacts.json`, or
 # copies the release directory named by `NVX_BUNDLE_DIR`.
 bundled = ["host", "dep:sha2"]
 # Test doubles: the fake OpenVMM of `testing::fake_openvmm` and its `nvx-fake-openvmm` binary.
-testing = ["dep:getrandom", "dep:serde", "dep:serde_json", "dep:libc", "dep:windows-sys"]
+testing = ["dep:getrandom", "dep:serde", "dep:serde_json", "dep:nix", "dep:windows-sys"]
+# The `nvx-rs` command-line interface of `host::cli` and its `nvx-rs` binary, which runs NVX's
+# microVMs and sandboxes, compiles egress policies, looks up artifacts, and downloads releases.
+cli = ["host"]
 # The serde form of `Hypervisor`. The `host` feature enables it.
 serde = ["dep:serde"]
 # The programs that run in Linux guests: the `guest` module and the `nvx-*` guest binaries. Build
@@ -37,22 +54,28 @@ guest = ["dep:nix", "dep:getrandom"]
 getrandom = { version = "0.4", optional = true }
 serde = { version = "1.0.200", features = ["derive"], optional = true }
 serde_json = { version = "1.0.120", optional = true }
-
-[target.'cfg(unix)'.dependencies]
-libc = { version = "0.2.160", optional = true }
+# The same release as the build script's: `host` enables both.
+sha2 = { version = "0.10", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", optional = true, features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
+    "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
 ] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# The host and the fake OpenVMM also build on Unix hosts other than Linux, such as macOS.
+[target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", default-features = false, optional = true, features = [
     "fs",
     "ioctl",
@@ -71,18 +94,42 @@ nix = { version = "0.31.3", default-features = false, optional = true, features 
 ] }
 
 [build-dependencies]
-# Only the `bundled` build script reads JSON; `host`, which `bundled` enables, enables it here too.
+# Only the `bundled` build script reads JSON and computes digests; `host`, which `bundled`
+# enables, enables both here too.
 serde_json = { version = "1.0.120", optional = true }
 sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
+# The property tests of the protocol's codecs, which need none of the forking and timeouts of its
+# default features.
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 serde_json = "1.0.120"
 tempfile = "3.10"
+
+# The job objects, process security descriptors, handles, and process lists of the process
+# supervision and CLI tests, and the command-line splitting and file deletions of the CLI tests.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
 
 [[bin]]
 name = "nvx-fake-openvmm"
 path = "src/bin/nvx-fake-openvmm.rs"
 required-features = ["testing"]
+doc = false
+
+[[bin]]
+name = "nvx-rs"
+path = "src/bin/nvx-rs.rs"
+required-features = ["cli"]
 doc = false
 
 # The guest binaries. Their unit tests live in the library, so the binaries have no test harness.
@@ -117,6 +164,34 @@ test = false
 [[bin]]
 name = "nvx-device-io"
 path = "src/bin/nvx-device-io.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+[[bin]]
+name = "nvx-managed-agent"
+path = "src/bin/nvx-managed-agent.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+[[bin]]
+name = "nvx-ingress"
+path = "src/bin/nvx-ingress.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+[[bin]]
+name = "nvx-time"
+path = "src/bin/nvx-time.rs"
+required-features = ["guest"]
+doc = false
+test = false
+
+[[bin]]
+name = "nvx-time-probe"
+path = "src/bin/nvx-time-probe.rs"
 required-features = ["guest"]
 doc = false
 test = false

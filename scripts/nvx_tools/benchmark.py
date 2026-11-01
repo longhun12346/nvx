@@ -12,6 +12,7 @@ import contextlib
 import ctypes
 import datetime as dt
 import errno
+import functools
 import ipaddress
 import json
 import math
@@ -31,17 +32,19 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from pathlib import Path
 from string import Template
-from typing import IO, Literal, Protocol, TextIO, TypedDict, cast
+from typing import IO, Literal, NoReturn, Protocol, TextIO, TypedDict, cast
 
 from . import benchmark_host, common, host_telemetry
-from .adversarial_oracles import ProcessTreeContainment
+from .adversarial_oracles import ProcessTreeContainment, killed_with_parent
 from .build_constants import (
     AlpineBuildConstants,
     BuildConstants,
+    GuestRustBuildConstants,
     KernelBuildConstants,
     OpenVMMBuildConstants,
 )
 from .common import bytes_to_mib, sha256_file
+from .guest_binaries import guest_binary_source_sha256, pinned_guest_rust_toolchain
 from .time_abi import TimeAbiFailure, TimeAbiMonitor, status_script
 
 BOOT_MARKER = b"ALPINE-MICROVM-BOOT-OK"
@@ -49,6 +52,12 @@ RESTORE_MARKER = b"OPENVMM-SNAPSHOT-RESTORE-OK"
 TEARDOWN_TIMEOUT_SECONDS = 15.0
 OUTPUT_DRAIN_TIMEOUT_SECONDS = 1.0
 OUTPUT_READER_STOP_TIMEOUT_SECONDS = 5.0
+# How long terminate() waits for a killed process to exit. A killed process
+# exits only once the I/O that its threads wait for completes, so a stalled
+# disk can hold it; a hung microVM otherwise exits within tens of
+# milliseconds. A slower exit than SLOW_TERMINATION_SECONDS gets a warning.
+TERMINATION_TIMEOUT_SECONDS = 30.0
+SLOW_TERMINATION_SECONDS = 1.0
 OUTPUT_BUFFER_LIMIT_BYTES = 1024 * 1024
 PEAK_RSS_SAMPLE_ATTEMPTS = 3
 BASE_TUNING = (
@@ -79,6 +88,7 @@ WORKLOAD_SUITES = frozenset(
         "shell-snapshot-restore",
         "snapshot-restore-memory",
         "snapshot-restore-vcpu",
+        "platform-snapshot-restore-vcpu",
         "network-snapshot",
         "device-restore-profile",
         "performance",
@@ -107,6 +117,12 @@ DEVICE_IO_DURATION_SECONDS = 10.0
 DEVICE_IO_WARMUPS = 5
 DEVICE_IO_RUNS = 30
 DEVICE_IO_PORT = 5201
+# When a device-io attempt times out, it describes the host before the kill:
+# its scratch files, the OpenVMM processes, and the scratch volume's activity
+# over DEVICE_IO_HOST_STATE_SAMPLE_SECONDS. A stalled volume can block each of
+# them, so each gets at most DEVICE_IO_HOST_STATE_TIMEOUT_SECONDS.
+DEVICE_IO_HOST_STATE_SAMPLE_SECONDS = 3.0
+DEVICE_IO_HOST_STATE_TIMEOUT_SECONDS = 10.0
 DD_RATE_PATTERN = re.compile(r"([0-9.]+)\s*([KMG]?)B/s")
 VIRTFS_COMPLETION_MARKER = b"NVX-VIRTFS-WORKLOAD-COMPLETE"
 VIRTFS_ROUNDTRIP_MARKER = b"VIRTFS-LIVE-ROUNDTRIP-OK"
@@ -123,6 +139,8 @@ SNAPSHOT_FILENAMES = ("manifest.bin", "state.bin", "memory.bin")
 SHELL_SNAPSHOT_MEMORY_MIB = (128, 256, 512)
 SNAPSHOT_PROFILE_MEMORY_MIB = (*SHELL_SNAPSHOT_MEMORY_MIB, 1024)
 RESTORE_VCPU_TARGETS = (1, 2, 4, 8)
+# The size of the distro layer and scratch disk of a platform snapshot.
+PLATFORM_SNAPSHOT_BLOCK_BYTES = 1024 * 1024
 RESTORE_MEMORY_BASE_MIB = 512
 RESTORE_MEMORY_TARGETS_MIB = (512, 1024, 2048)
 RESTORE_MEMORY_MARKER_PATTERN = re.compile(
@@ -850,6 +868,30 @@ def _linux_status_bytes(status: str, name: str) -> int | None:
     return None
 
 
+def _linux_process_resource_counters(pid: int) -> dict[str, int]:
+    # Profiles sample these counters while OpenVMM runs the intervals that a
+    # benchmark measures, so read only files that the kernel fills from the
+    # counters it maintains. smaps_rollup instead walks every mapping and
+    # page table of the process under its mmap lock, and reading it there
+    # slowed MSHV snapshot generation and spread its samples (#383).
+    status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
+    values: dict[str, int] = {}
+    for field, name in (
+        ("rss_bytes", "VmRSS"),
+        ("peak_rss_bytes", "VmHWM"),
+    ):
+        value = _linux_status_bytes(status, name)
+        if value is not None:
+            values[field] = value
+
+    stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    fields = stat.rsplit(")", 1)[1].split()
+    values["minor_faults"] = int(fields[7])
+    values["major_faults"] = int(fields[9])
+    values["page_faults"] = values["minor_faults"] + values["major_faults"]
+    return values
+
+
 def process_resource_counters(pid: int) -> dict[str, int]:
     """Return cheap process counters available on the current host."""
     try:
@@ -862,31 +904,7 @@ def process_resource_counters(pid: int) -> dict[str, int]:
                 "page_faults": int(counters.page_fault_count),
             }
         if sys.platform.startswith("linux"):
-            status = Path(f"/proc/{pid}/status").read_text(encoding="ascii")
-            values: dict[str, int] = {}
-            for field, name in (
-                ("rss_bytes", "VmRSS"),
-                ("peak_rss_bytes", "VmHWM"),
-            ):
-                value = _linux_status_bytes(status, name)
-                if value is not None:
-                    values[field] = value
-
-            stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-            fields = stat.rsplit(")", 1)[1].split()
-            values["minor_faults"] = int(fields[7])
-            values["major_faults"] = int(fields[9])
-            values["page_faults"] = values["minor_faults"] + values["major_faults"]
-
-            try:
-                rollup = Path(f"/proc/{pid}/smaps_rollup").read_text(encoding="ascii")
-                private_clean = _linux_status_bytes(rollup, "Private_Clean") or 0
-                private_dirty = _linux_status_bytes(rollup, "Private_Dirty") or 0
-                values["private_dirty_bytes"] = private_dirty
-                values["private_rss_bytes"] = private_clean + private_dirty
-            except (OSError, RuntimeError, ValueError):
-                pass
-            return values
+            return _linux_process_resource_counters(pid)
     except (OSError, RuntimeError, ValueError):
         return {}
     return {}
@@ -1296,14 +1314,215 @@ def describe_capture_telemetry(sample: dict[str, object]) -> str | None:
     )
 
 
+class ProcessExitTimeout(RuntimeError):
+    """A killed process was still running when ``terminate()`` stopped waiting."""
+
+
 def terminate(process: subprocess.Popen[bytes]) -> None:
+    """Kill ``process`` and wait until it has exited.
+
+    Raises ``ProcessExitTimeout`` if the process still runs
+    ``TERMINATION_TIMEOUT_SECONDS`` after the kill, and warns when its exit
+    took longer than ``SLOW_TERMINATION_SECONDS``.
+    """
+    killed = time.perf_counter()
     if process.poll() is None:
         process.kill()
+    if not _wait_for_exit(process, TERMINATION_TIMEOUT_SECONDS):
+        raise ProcessExitTimeout(
+            f"process {process.pid} did not exit within "
+            f"{TERMINATION_TIMEOUT_SECONDS:g}s of being killed"
+        )
+    elapsed = time.perf_counter() - killed
+    if elapsed > SLOW_TERMINATION_SECONDS:
+        print(
+            f"warning: process {process.pid} took {elapsed:.3f}s to exit "
+            "after it was killed",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _wait_for_exit(process: subprocess.Popen[bytes], timeout: float) -> bool:
+    """Return whether ``process`` exits within ``timeout`` seconds.
+
+    On Windows, ``Popen.kill()`` of a process that is already terminating
+    stores its exit code as ``returncode``, after which ``Popen.wait()``
+    returns while the process still runs, so the wait uses the process object.
+    """
+    if os.name == "nt":
+        if not _wait_for_windows_process(process.pid, timeout):
+            return False
+        # The process object is signaled, so this records the exit code.
+        process.poll()
+        return True
     try:
-        process.wait(timeout=3)
+        process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
+        return False
+    return True
+
+
+def _wait_for_windows_process(pid: int, timeout: float) -> bool:
+    """Return whether the Windows process ``pid`` exits within ``timeout``
+    seconds.
+
+    The caller's ``Popen`` keeps a handle to the process, so ``pid`` names
+    the same process even after it exits.
+    """
+    if os.name != "nt":
+        raise RuntimeError("Windows process waits are unavailable on this host")
+    synchronize = 0x00100000
+    wait_object_0 = 0
+    wait_timeout = 0x102
+    error_invalid_parameter = 87
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+
+    handle = kernel32.OpenProcess(synchronize, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        # No process has the ID any more.
+        if error == error_invalid_parameter:
+            return True
+        raise ctypes.WinError(error)
+    try:
+        result = kernel32.WaitForSingleObject(handle, max(0, round(timeout * 1000)))
+        error = ctypes.get_last_error()
+    finally:
+        kernel32.CloseHandle(handle)
+    if result == wait_object_0:
+        return True
+    if result == wait_timeout:
+        return False
+    raise ctypes.WinError(error)
+
+
+def terminate_after_failure(
+    process: subprocess.Popen[bytes], error: BaseException | None = None
+) -> list[BaseException]:
+    """Kill ``process`` after ``error``, and return the failure of the kill
+    rather than raise it over ``error``. A process that ``terminate()`` gave
+    up on, as ``error`` reports, isn't killed again."""
+    if isinstance(error, ProcessExitTimeout):
+        return []
+    try:
+        terminate(process)
+    except ProcessExitTimeout as cleanup_error:
+        return [cleanup_error]
+    return []
+
+
+def append_cleanup_failures(
+    error: BaseException, cleanup_errors: Sequence[BaseException]
+) -> BaseException:
+    """Return ``error`` with ``cleanup_errors`` appended to its message, after
+    those that an earlier call appended, under one heading.
+
+    An error whose message doesn't come from its arguments, such as an
+    ``OSError`` with an errno, would hide what is appended, so the result is
+    then a new error of its type, or a ``RuntimeError``, with the combined
+    message, which the caller raises in its place and which ``error``
+    caused.
+    """
+    previous: tuple[BaseException, ...] = getattr(error, "cleanup_errors", ())
+    summary = "\n".join(
+        f"- {type(cleanup_error).__name__}: {cleanup_error}"
+        for cleanup_error in cleanup_errors
+    )
+    heading = "" if previous else "\n--- cleanup failures ---"
+    message = f"{error}{heading}\n{summary}"
+    arguments = error.args
+    error.args = (message, *arguments[1:])
+    combined = error
+    if str(error) != message:
+        error.args = arguments
+        combined = RuntimeError(message)
+        if isinstance(error, OSError):
+            with contextlib.suppress(Exception):
+                combined = type(error)(message)
+        combined.__cause__ = error
+    combined.cleanup_errors = (*previous, *cleanup_errors)  # type: ignore[attr-defined]
+    return combined
+
+
+def combined_failure(cleanup_errors: Sequence[BaseException]) -> BaseException:
+    """Return the first of ``cleanup_errors``, with the others appended."""
+    first, *others = cleanup_errors
+    return append_cleanup_failures(first, others) if others else first
+
+
+def with_output(
+    error: Exception, tail: str, cleanup_errors: Sequence[BaseException] = ()
+) -> BaseException:
+    """Return ``error`` with OpenVMM's output ``tail`` and then
+    ``cleanup_errors`` appended to its message: when there is output, or
+    when the message of ``error`` can't show them, as a new error, which the
+    caller raises from ``error``."""
+    primary: BaseException = (
+        RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}") if tail else error
+    )
+    if cleanup_errors:
+        primary = append_cleanup_failures(primary, cleanup_errors)
+    return primary
+
+
+def raise_with_output(
+    error: Exception, tail: str, cleanup_errors: Sequence[BaseException] = ()
+) -> NoReturn:
+    """Raise ``error`` with OpenVMM's output ``tail`` and then
+    ``cleanup_errors`` appended to its message."""
+    primary = with_output(error, tail, cleanup_errors)
+    if primary is error:
+        raise error
+    raise primary from error
+
+
+def run_cleanup(*steps: Callable[[], object] | None) -> list[BaseException]:
+    """Run each of ``steps`` that there is, even after one fails, and return
+    their failures."""
+    cleanup_errors: list[BaseException] = []
+    for step in steps:
+        if step is None:
+            continue
+        try:
+            step()
+        except Exception as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+    return cleanup_errors
+
+
+def finish_cleanup(
+    failure: BaseException | None, *steps: Callable[[], object] | None
+) -> None:
+    """Run ``steps`` as ``run_cleanup()`` does, and append their failures to
+    ``failure``, the error that the cleanup follows, or raise the first, with
+    the others appended, when there is none.
+
+    An OpenVMM that outlives its kill can keep its output reader from
+    stopping, so closing the interaction fails just when the error that the
+    failure path raises must surface with its output and the kill's failure.
+    """
+    cleanup_errors = run_cleanup(*steps)
+    if not cleanup_errors:
+        return
+    if failure is None:
+        raise combined_failure(cleanup_errors)
+    combined = append_cleanup_failures(failure, cleanup_errors)
+    if combined is not failure:
+        # The message of ``failure`` can't show the failures, so the error
+        # that it caused, which does, replaces it.
+        raise combined
+
+
+def save_log(log_path: Path, contents: bytes | bytearray) -> None:
+    """Write OpenVMM's output ``contents`` to ``log_path``."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_bytes(contents)
 
 
 def wait_for_process_exit(process: subprocess.Popen[bytes], timeout: float) -> int:
@@ -1533,6 +1752,11 @@ class InteractiveProcess:
     Linux attaches the console to a pseudo-terminal, and other platforms use
     pipes. stderr shares the console stream unless ``separate_stderr`` gives it
     a pipe of its own, which the caller must drain with ``read_stderr``.
+
+    On Linux, a command started from the main thread ends with this process,
+    even when this process is killed outright: OpenVMM by its parent-death
+    signal (``killed_with_parent``), and with ``contain_process_tree``, the
+    whole tree by its supervisor.
     """
 
     def __init__(
@@ -1551,7 +1775,12 @@ class InteractiveProcess:
         process_command = (
             self.containment.command(command)
             if self.containment is not None
-            else list(command)
+            else killed_with_parent(command)
+        )
+        process_environment = (
+            self.containment.environment(environment)
+            if self.containment is not None
+            else environment
         )
         if sys.platform.startswith("linux"):
             openpty = cast(
@@ -1567,7 +1796,7 @@ class InteractiveProcess:
                     stdin=child_fd,
                     stdout=child_fd,
                     stderr=subprocess.PIPE if separate_stderr else child_fd,
-                    env=environment,
+                    env=process_environment,
                     creationflags=creationflags,
                 )
             except Exception:
@@ -1585,7 +1814,7 @@ class InteractiveProcess:
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE if separate_stderr else subprocess.STDOUT,
-                    env=environment,
+                    env=process_environment,
                     creationflags=creationflags,
                 )
             except Exception:
@@ -1925,6 +2154,14 @@ def measure_once(
                 profile.finish_restore(marker_reached, readiness_counters)
             )
 
+    def write_log() -> None:
+        if log_path is not None:
+            output.drain(
+                OUTPUT_DRAIN_TIMEOUT_SECONDS, on_console=scan_console_unchecked
+            )
+            save_log(log_path, output.contents())
+
+    raised: BaseException | None = None
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -1952,13 +2189,18 @@ def measure_once(
             if failure_marker is not None:
                 failure = completed_output_line_with_prefix(console, failure_marker)
                 if failure is not None:
-                    terminate(process)
+                    cleanup_errors = terminate_after_failure(process)
                     output.drain(
                         OUTPUT_DRAIN_TIMEOUT_SECONDS, on_console=scan_console_unchecked
                     )
-                    raise GuestFailureReported(
+                    reported = GuestFailureReported(
                         failure.decode("utf-8", "replace"),
                         output.tail(),
+                    )
+                    raise (
+                        append_cleanup_failures(reported, cleanup_errors)
+                        if cleanup_errors
+                        else reported
                     )
             marker_seen = (
                 contains_output_line(console, marker)
@@ -2013,25 +2255,25 @@ def measure_once(
                     raise monitor.exit_error(returncode, when="during teardown")
                 finish_output(returncode, marker_reached, readiness_counters)
                 return elapsed_ms, peak_bytes, teardown_ms, wall_ms
-    except GuestFailureReported:
+    except GuestFailureReported as error:
+        raised = error
         raise
     except Exception as error:
-        terminate(process)
+        cleanup_errors = terminate_after_failure(process, error)
         output.drain(OUTPUT_DRAIN_TIMEOUT_SECONDS, on_console=scan_console_unchecked)
-        tail = output.tail()
-        if tail:
-            raise RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}") from error
-        raise
+        raised = with_output(error, output.tail(), cleanup_errors)
+        if raised is error:
+            raise
+        raise raised from error
     finally:
-        if log_path is not None:
-            output.drain(
-                OUTPUT_DRAIN_TIMEOUT_SECONDS, on_console=scan_console_unchecked
-            )
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_bytes(output.contents())
-        interaction.close()
-        if cleanup_managed_network:
-            cleanup_managed_tap(process.pid)
+        finish_cleanup(
+            raised,
+            write_log,
+            interaction.close,
+            (lambda: cleanup_managed_tap(process.pid))
+            if cleanup_managed_network
+            else None,
+        )
 
 
 def benchmark(
@@ -2513,14 +2755,7 @@ def _raise_guest_script_failure(
 ) -> None:
     if primary_error is not None:
         if cleanup_errors:
-            cleanup_summary = "\n".join(
-                f"- {type(error).__name__}: {error}" for error in cleanup_errors
-            )
-            primary_error.args = (
-                f"{primary_error}\n--- cleanup failures ---\n{cleanup_summary}",
-                *primary_error.args[1:],
-            )
-            primary_error.cleanup_errors = tuple(cleanup_errors)  # type: ignore[attr-defined]
+            primary_error = append_cleanup_failures(primary_error, cleanup_errors)
         raise primary_error.with_traceback(primary_error.__traceback__)
 
     if len(cleanup_errors) == 1:
@@ -2547,6 +2782,7 @@ def run_guest_script(
     boot_marker: bytes = BOOT_MARKER,
     contain_process_tree: bool = False,
     time_abi_status: bool = False,
+    host_state_on_timeout: Callable[[subprocess.Popen[bytes]], str] | None = None,
 ) -> GuestCommandResult:
     """Run ``script`` once the guest boots and wait for ``completion_marker``.
 
@@ -2554,6 +2790,9 @@ def run_guest_script(
     ABI status and sends ``script`` only after the query exits, so the
     guest's tty cannot echo script bytes into the status lines. The run
     fails unless the guest reported a valid boot line.
+
+    When the workload times out, ``host_state_on_timeout`` describes the host
+    while OpenVMM still runs, and the failure includes its description.
     """
     environment = os.environ.copy()
     environment["OPENVMM_LOG"] = "off"
@@ -2639,6 +2878,16 @@ def run_guest_script(
             "peak_rss_bytes": peak_bytes,
         }
     except BaseException as error:
+        host_state = None
+        interruption: BaseException | None = None
+        if isinstance(error, TimeoutError) and host_state_on_timeout is not None:
+            try:
+                host_state = host_state_on_timeout(process)
+            except Exception as state_error:
+                host_state = f"could not be described: {state_error}"
+            except BaseException as state_interruption:
+                # A Ctrl-C while describing the host still ends OpenVMM first.
+                interruption = state_interruption
         try:
             if interaction.containment is not None:
                 interaction.containment.close(process)
@@ -2646,10 +2895,17 @@ def run_guest_script(
                 terminate(process)
         except BaseException as cleanup_error:
             cleanup_errors.append(cleanup_error)
-        if isinstance(error, Exception):
+        if interruption is not None:
+            primary_error = interruption
+        elif isinstance(error, Exception):
             tail = output[-4096:].decode("utf-8", "replace")
+            sections = [str(error)]
+            if host_state is not None:
+                sections.append(f"--- host state at the timeout ---\n{host_state}")
             if tail:
-                wrapped = RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}")
+                sections.append(f"--- OpenVMM output ---\n{tail}")
+            if len(sections) > 1:
+                wrapped = RuntimeError("\n".join(sections))
                 wrapped.__cause__ = error
                 primary_error = wrapped
             else:
@@ -2697,6 +2953,7 @@ def capture_automatic_snapshot(
     ).start()
     deadline = time.monotonic() + timeout
     output = bytearray()
+    raised: BaseException | None = None
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -2723,13 +2980,14 @@ def capture_automatic_snapshot(
                 )
         _require_snapshot_artifacts(snapshot_path, "snapshot")
     except Exception as error:
-        terminate(process)
+        cleanup_errors = terminate_after_failure(process, error)
         tail = output[-4096:].decode("utf-8", "replace")
-        if tail:
-            raise RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}") from error
-        raise
+        raised = with_output(error, tail, cleanup_errors)
+        if raised is error:
+            raise
+        raise raised from error
     finally:
-        interaction.close()
+        finish_cleanup(raised, interaction.close)
 
 
 def _device_restore_markers(
@@ -2784,6 +3042,7 @@ def capture_device_restore_snapshot(
     ).start()
     deadline = time.monotonic() + timeout
     output = bytearray()
+    raised: BaseException | None = None
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -2818,15 +3077,14 @@ def capture_device_restore_snapshot(
         _require_snapshot_artifacts(snapshot_path, f"{device}/{mode} snapshot")
         return markers
     except Exception as error:
-        terminate(process)
+        cleanup_errors = terminate_after_failure(process, error)
         tail = output[-4096:].decode("utf-8", "replace")
-        if tail:
-            raise RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}") from error
-        raise
+        raised = with_output(error, tail, cleanup_errors)
+        if raised is error:
+            raise
+        raise raised from error
     finally:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_bytes(output)
-        interaction.close()
+        finish_cleanup(raised, lambda: save_log(log_path, output), interaction.close)
 
 
 def run_device_restore_sample(
@@ -2858,6 +3116,7 @@ def run_device_restore_sample(
     phase_times: dict[str, int] = {}
     sequence = 0
     peak_bytes = 0
+    raised: BaseException | None = None
 
     def observe_line(raw_line: bytes, observed_ns: int) -> None:
         nonlocal sequence
@@ -2950,15 +3209,14 @@ def run_device_restore_sample(
         validate_device_restore_sample(sample, device, mode)
         return sample
     except Exception as error:
-        terminate(process)
+        cleanup_errors = terminate_after_failure(process, error)
         tail = output[-4096:].decode("utf-8", "replace")
-        if tail:
-            raise RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}") from error
-        raise
+        raised = with_output(error, tail, cleanup_errors)
+        if raised is error:
+            raise
+        raise raised from error
     finally:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_bytes(output)
-        interaction.close()
+        finish_cleanup(raised, lambda: save_log(log_path, output), interaction.close)
 
 
 def benchmark_device_restore_profile(
@@ -3175,6 +3433,12 @@ def _format_rate_summary(samples: Sequence[float]) -> str:
         f"{statistics.median(samples):8.1f} MB/s  "
         f"(min {min(samples):.1f}, max {max(samples):.1f}, n={len(samples)})"
     )
+
+
+def _format_samples(samples: Sequence[float], unit: str, *, digits: int) -> str:
+    """List a series' retained samples in measurement order, so that a split
+    of the series can be recognized from its log."""
+    return f"{', '.join(f'{value:.{digits}f}' for value in samples)} {unit}"
 
 
 def _guest_exit_script(teardown_mode: str) -> str:
@@ -3493,6 +3757,113 @@ def _print_device_io_summary(records: Sequence[dict[str, object]]) -> int:
     return sum(failures.values())
 
 
+def _raise_os_error(error: OSError) -> NoReturn:
+    raise error
+
+
+def _describe_files(root: Path) -> str:
+    """List the files under ``root`` with their sizes and modification times.
+
+    A directory that cannot be listed fails the description, rather than
+    leaving its files out, since a storage error is what it should show.
+    """
+    entries: list[str] = []
+    for directory, _, names in os.walk(root, onerror=_raise_os_error):
+        for name in sorted(names):
+            path = Path(directory) / name
+            status = path.stat()
+            modified = dt.datetime.fromtimestamp(status.st_mtime, dt.timezone.utc)
+            entries.append(
+                f"{path.relative_to(root).as_posix()} {status.st_size} bytes, "
+                f"modified {modified.isoformat(timespec='milliseconds')}"
+            )
+    return "; ".join(entries) or "none"
+
+
+def _openvmm_pids(proc: Path = Path("/proc")) -> list[int]:
+    """Return the IDs of the host's running OpenVMM processes, which Linux
+    lists in ``proc``."""
+    pids: list[int] = []
+    if os.name == "nt":
+        listing = subprocess.run(
+            ["tasklist.exe", "/FI", "IMAGENAME eq openvmm.exe", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=DEVICE_IO_HOST_STATE_TIMEOUT_SECONDS,
+            check=True,
+        ).stdout
+        for line in listing.splitlines():
+            fields = [field.strip('"') for field in line.split('","')]
+            if len(fields) > 1 and fields[0].lower() == "openvmm.exe":
+                pids.append(int(fields[1]))
+        return sorted(pids)
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            command = (entry / "comm").read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if command == "openvmm":
+            pids.append(int(entry.name))
+    return sorted(pids)
+
+
+def _describe_openvmm_processes(process: subprocess.Popen[bytes]) -> str:
+    """List the running OpenVMM processes and mark ``process`` among them."""
+    pids = _openvmm_pids()
+    return (
+        ", ".join(
+            f"{pid} (this attempt)" if pid == process.pid else str(pid) for pid in pids
+        )
+        or "none"
+    )
+
+
+def _describe_volume_activity(root: Path) -> str:
+    activity = host_telemetry.describe_volume_activity(
+        {"scratch": root}, DEVICE_IO_HOST_STATE_SAMPLE_SECONDS
+    )
+    return activity if activity is not None else "no counters on this host"
+
+
+def _device_io_host_state(root: Path, process: subprocess.Popen[bytes]) -> str:
+    """Describe the host while a hung device-io attempt's OpenVMM still runs.
+
+    ``root`` holds the attempt's block device and share. A stalled volume can
+    block each description, so each runs in its own thread, and one that does
+    not finish within ``DEVICE_IO_HOST_STATE_TIMEOUT_SECONDS`` says so.
+    """
+    parts: tuple[tuple[str, Callable[[], str]], ...] = (
+        ("files", lambda: _describe_files(root)),
+        ("OpenVMM processes", lambda: _describe_openvmm_processes(process)),
+        ("scratch volume", lambda: _describe_volume_activity(root)),
+    )
+    descriptions: dict[str, str] = {}
+
+    def describe(name: str, description: Callable[[], str]) -> None:
+        try:
+            descriptions[name] = description()
+        except Exception as error:
+            descriptions[name] = f"failed: {error}"
+
+    threads = [
+        threading.Thread(
+            target=describe, args=part, name="nvx-device-io-host-state", daemon=True
+        )
+        for part in parts
+    ]
+    deadline = time.perf_counter() + DEVICE_IO_HOST_STATE_TIMEOUT_SECONDS
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(max(0.0, deadline - time.perf_counter()))
+    unfinished = f"did not finish within {DEVICE_IO_HOST_STATE_TIMEOUT_SECONDS:g}s"
+    return "\n".join(
+        f"{name}: {descriptions.get(name, unfinished)}" for name, _ in parts
+    )
+
+
 def benchmark_device_io_workload(
     args: argparse.Namespace,
     executable: Path,
@@ -3601,6 +3972,9 @@ def benchmark_device_io_workload(
                             ),
                             windows_cpus=windows_cpus,
                             teardown_mode=args.teardown_mode,
+                            host_state_on_timeout=functools.partial(
+                                _device_io_host_state, root
+                            ),
                         )
                         if isinstance(echo_server, UdpEchoServer):
                             echo_server.check()
@@ -3830,6 +4204,12 @@ def benchmark_virtfs_workload(
             f"  {'rw live host directory':<27} write {_format_rate_summary(write_rates)}"
         )
         print(f"  {'':<27} read  {_format_rate_summary(read_rates)}")
+        print(
+            f"  {'write samples':<34}: {_format_samples(write_rates, 'MB/s', digits=1)}"
+        )
+        print(
+            f"  {'read samples':<34}: {_format_samples(read_rates, 'MB/s', digits=1)}"
+        )
         print(f"  OpenVMM peak RSS                  : {format_rss_summary(io_rss)}")
         print()
 
@@ -3855,6 +4235,10 @@ def benchmark_virtfs_workload(
         print(
             "  live exchange (cold each)         : "
             + format_sample_summary(roundtrip_samples)
+        )
+        print(
+            f"  {'exchange samples':<34}: "
+            f"{_format_samples(roundtrip_samples, 'ms', digits=3)}"
         )
         print(
             f"  OpenVMM peak RSS                  : {format_rss_summary(roundtrip_rss)}"
@@ -4008,6 +4392,12 @@ def _format_shell_snapshot_line(name: str, values: Sequence[float]) -> str:
     )
 
 
+def _format_restore_samples_line(values: Sequence[float]) -> str:
+    # The retained samples show whether a transient host stall split the
+    # series, which its median alone hides.
+    return f"  {'restore samples':<20}: {_format_samples(values, 'ms', digits=3)}"
+
+
 def _print_shell_snapshot_summary(
     memory_mib: int,
     cold: Sequence[float],
@@ -4027,6 +4417,7 @@ def _print_shell_snapshot_summary(
             "TSC PIT-calib)"
         )
     print(_format_shell_snapshot_line("snapshot restore", restored))
+    print(_format_restore_samples_line(restored))
     restore_p50 = statistics.median(restored)
     if restore_p50 > 0:
         base = statistics.median(fast) if fast else statistics.median(cold)
@@ -4179,6 +4570,7 @@ def benchmark_shell_snapshot_restore_workload(
             print(
                 _format_shell_snapshot_line("snapshot restore", restored["samples_ms"])
             )
+            print(_format_restore_samples_line(restored["samples_ms"]))
             restore_profile = restored.get("profile")
             if restore_profile is not None:
                 print_lifecycle_profile_summary(
@@ -4266,6 +4658,121 @@ def benchmark_snapshot_restore_vcpu_workload(
                 print_lifecycle_profile_summary(
                     f"snapshot-restore-vcpu/{backend}/capacity-{args.processors}/"
                     f"online-{target}",
+                    restore_profile,
+                )
+            print()
+
+
+def benchmark_platform_snapshot_restore_vcpu_workload(
+    args: argparse.Namespace,
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    command_prefix: Sequence[str] = (),
+    windows_cpus: set[int] | None = None,
+) -> None:
+    """Restore one platform snapshot at each online vCPU target.
+
+    The capture boots the capacity with ``maxcpus=1``, the only caller token
+    that a platform command line may carry, and sandbox blocks. Each restore
+    reattaches the blocks and runs until the guest finishes the platform
+    repair, which brings the target's vCPU prefix online.
+    """
+    if args.processors != 8:
+        raise ValueError("platform-snapshot-restore-vcpu requires --processors 8")
+    snapshot_profile = bool(getattr(args, "snapshot_profile", False))
+
+    print(
+        "platform snapshot restore vCPU activation, "
+        f"median of {args.runs} runs, capacity 8, boot-online 1"
+    )
+    print(f'marker : "{RESTORE_MARKER.decode()}"')
+    print(f"kernel : {kernel}")
+    print(f"initrd : {initrd}")
+    print()
+    with tempfile.TemporaryDirectory(
+        prefix="openvmm-platform-vcpu-restore-"
+    ) as temporary:
+        root = Path(temporary)
+        snapshot_path = root / "snapshot"
+        layer = root / "distro.erofs"
+        scratch = root / "scratch.raw"
+        layer.write_bytes(b"\x3c" * PLATFORM_SNAPSHOT_BLOCK_BYTES)
+        scratch.write_bytes(b"\xa5" * PLATFORM_SNAPSHOT_BLOCK_BYTES)
+        # The guest never mounts the scratch of a platform capture, so every
+        # restore can reattach the same one.
+        sandbox_blocks = (
+            "--microvm-sandbox-block",
+            f"distro:file:{layer},ro",
+            "--microvm-sandbox-block",
+            f"scratch:file:{scratch}",
+        )
+        capture_command = workload_boot_command(
+            executable,
+            backend,
+            kernel,
+            initrd,
+            args.memory_mib,
+            "maxcpus=1",
+            processors=args.processors,
+            command_prefix=command_prefix,
+        )
+        # A sandbox guest's console is a virtio console, which can deliver the
+        # restore marker after a prequeued exit has started OpenVMM's teardown,
+        # too late for its peak RSS. The restored guest therefore waits at its
+        # shell, and each sample ends it after the marker with --teardown-mode.
+        capture_snapshot(
+            [
+                *capture_command,
+                "--snapshot-destination",
+                str(snapshot_path),
+                "--snapshot-tier",
+                "platform",
+                *sandbox_blocks,
+            ],
+            snapshot_path,
+            timeout=args.timeout,
+            windows_cpus=windows_cpus,
+            processors=1,
+            teardown_mode="host-terminate",
+        )
+
+        for target in RESTORE_VCPU_TARGETS:
+            restored = benchmark(
+                [
+                    *command_prefix,
+                    *snapshot_restore_command(
+                        executable,
+                        backend,
+                        snapshot_path,
+                        processors=args.processors,
+                        restore_processors=target,
+                    ),
+                    *sandbox_blocks,
+                ],
+                warmups=args.warmups,
+                runs=args.runs,
+                timeout=args.timeout,
+                marker=RESTORE_MARKER,
+                marker_must_be_line=True,
+                windows_cpus=windows_cpus,
+                teardown_mode=args.teardown_mode,
+                snapshot_profile=snapshot_profile,
+            )
+            print(f"== restore-online {target} vCPU ==")
+            print(
+                _format_shell_snapshot_line("snapshot restore", restored["samples_ms"])
+            )
+            print(
+                f"  OpenVMM peak RSS    : {format_rss_summary(restored['peak_rss_samples_bytes'])}"
+            )
+            restore_profile = restored.get("profile")
+            if restore_profile is not None:
+                print_lifecycle_profile_summary(
+                    f"platform-snapshot-restore-vcpu/{backend}/"
+                    f"capacity-{args.processors}/online-{target}",
                     restore_profile,
                 )
             print()
@@ -4440,10 +4947,8 @@ def _git_status(repository: Path) -> list[str] | None:
 def _device_io_helper_provenance(
     args: argparse.Namespace, initrd: Path
 ) -> dict[str, str]:
-    source = require_file(
-        args.nvx_dir.resolve() / "guest" / "common" / "nvx-device-io.c",
-        "device I/O helper source",
-    )
+    checkout = args.nvx_dir.resolve()
+    source = checkout / "nvx-rs"
     manifest_path = require_file(
         initrd.with_name(f"{initrd.name}{BuildConstants.PACKAGE_MANIFEST_SUFFIX}"),
         "initramfs package manifest",
@@ -4457,10 +4962,11 @@ def _device_io_helper_provenance(
         raise ValueError(
             f"invalid nvx-device-io provenance in {manifest_path}"
         ) from error
-    actual_source_sha256 = sha256_file(source)
+    toolchain = pinned_guest_rust_toolchain(checkout)
+    actual_source_sha256 = guest_binary_source_sha256(checkout)
     if source_sha256 != actual_source_sha256:
         raise ValueError(
-            "initramfs device I/O helper source does not match the current checkout"
+            "initramfs Rust guest binary sources do not match the current checkout"
         )
     if not isinstance(binary_sha256, str) or not re.fullmatch(
         r"[0-9a-f]{64}", binary_sha256
@@ -4470,6 +4976,8 @@ def _device_io_helper_provenance(
         "source": str(source),
         "source_sha256": actual_source_sha256,
         "binary_sha256": binary_sha256,
+        "toolchain": toolchain,
+        "target": GuestRustBuildConstants.TARGET,
     }
 
 
@@ -4503,7 +5011,7 @@ def write_benchmark_metadata(
         "processors": processors,
         "restore_processor_targets": (
             list(RESTORE_VCPU_TARGETS)
-            if args.suite == "snapshot-restore-vcpu"
+            if args.suite in {"snapshot-restore-vcpu", "platform-snapshot-restore-vcpu"}
             else None
         ),
         "restore_memory_base_mib": (
@@ -4651,6 +5159,8 @@ def run_workload_benchmarks(
             (output_dir / "acceptance.json").unlink(missing_ok=True)
         if args.suite == "snapshot-restore-vcpu":
             (output_dir / "snapshot-restore-vcpu.log").unlink(missing_ok=True)
+        if args.suite == "platform-snapshot-restore-vcpu":
+            (output_dir / "platform-snapshot-restore-vcpu.log").unlink(missing_ok=True)
         if args.suite == "snapshot-restore-memory":
             (output_dir / "snapshot-restore-memory.log").unlink(missing_ok=True)
         metadata_path = write_benchmark_metadata(
@@ -4752,6 +5262,18 @@ def run_workload_benchmarks(
         "snapshot-restore-vcpu": (
             "snapshot-restore-vcpu.log",
             lambda: benchmark_snapshot_restore_vcpu_workload(
+                args,
+                executable,
+                kernel,
+                initrd,
+                backend,
+                command_prefix=command_prefix,
+                windows_cpus=windows_cpus,
+            ),
+        ),
+        "platform-snapshot-restore-vcpu": (
+            "platform-snapshot-restore-vcpu.log",
+            lambda: benchmark_platform_snapshot_restore_vcpu_workload(
                 args,
                 executable,
                 kernel,
@@ -4891,6 +5413,15 @@ def capture_snapshot(
         snapshot_requested = True
         deadline = time.monotonic() + timeout
 
+    def stop_storage() -> None:
+        if storage is not None:
+            storage.stop()
+
+    def write_log() -> None:
+        if log_path is not None:
+            save_log(log_path, output.contents())
+
+    raised: BaseException | None = None
     try:
         while True:
             peak_bytes = _try_peak_rss(process, peak_bytes)
@@ -5009,19 +5540,14 @@ def capture_snapshot(
             peak_bytes,
         )
     except Exception as error:
-        terminate(process)
+        cleanup_errors = terminate_after_failure(process, error)
         output.drain(OUTPUT_DRAIN_TIMEOUT_SECONDS)
-        tail = output.tail()
-        if tail:
-            raise RuntimeError(f"{error}\n--- OpenVMM output ---\n{tail}") from error
-        raise
+        raised = with_output(error, output.tail(), cleanup_errors)
+        if raised is error:
+            raise
+        raise raised from error
     finally:
-        if storage is not None:
-            storage.stop()
-        if log_path is not None:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log_path.write_bytes(output.contents())
-        interaction.close()
+        finish_cleanup(raised, stop_storage, write_log, interaction.close)
 
 
 def capture_telemetry_volumes(snapshot_path: Path) -> dict[str, Path]:

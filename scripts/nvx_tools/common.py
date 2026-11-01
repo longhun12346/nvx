@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -28,6 +29,22 @@ from .build_constants import (
 
 class ScriptError(RuntimeError):
     """Raised for an actionable command-line workflow failure."""
+
+
+def is_link_or_junction(path: Path) -> bool:
+    """Return whether ``path`` is a symbolic link or, on Windows, a junction.
+
+    ``Path.is_symlink()`` misses junctions, which redirect a path the same way.
+    """
+    try:
+        metadata = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    if sys.platform == "win32":
+        return metadata.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    return False
 
 
 def strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -174,6 +191,44 @@ def repository_metadata() -> dict[str, object]:
         "machine": platform.machine(),
         "python": platform.python_version(),
     }
+
+
+# The GitHub Actions variables that identify the job that wrote a duration
+# report, under the names that the report gives them.
+GITHUB_VARIABLES = (
+    ("repository", "GITHUB_REPOSITORY"),
+    ("workflow", "GITHUB_WORKFLOW"),
+    ("run_id", "GITHUB_RUN_ID"),
+    ("run_attempt", "GITHUB_RUN_ATTEMPT"),
+    ("job", "GITHUB_JOB"),
+    ("event_name", "GITHUB_EVENT_NAME"),
+    ("ref", "GITHUB_REF"),
+    ("sha", "GITHUB_SHA"),
+    ("runner_name", "RUNNER_NAME"),
+    ("runner_os", "RUNNER_OS"),
+)
+
+
+def github_job(environment: Mapping[str, str]) -> dict[str, str | None] | None:
+    """Return the GitHub Actions job that an environment describes, or None
+    outside GitHub Actions."""
+    if environment.get("GITHUB_ACTIONS") != "true":
+        return None
+    return {name: environment.get(variable) for name, variable in GITHUB_VARIABLES}
+
+
+def workflow_path(workflow_ref: str, repository: str) -> str:
+    """Return the path of the workflow that `workflow_ref`, the
+    GITHUB_WORKFLOW_REF of a run of `repository`, names."""
+    reference, separator, _ = workflow_ref.partition("@")
+    path = reference.removeprefix(f"{repository}/")
+    if (
+        not separator
+        or path == reference
+        or PurePosixPath(path).parent != PurePosixPath(".github/workflows")
+    ):
+        raise ScriptError(f"{workflow_ref!r} names no workflow of {repository}")
+    return path
 
 
 def openvmm_git_state(directory: Path) -> tuple[str, bool]:

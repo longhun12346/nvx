@@ -1,0 +1,47 @@
+set -eu
+on_exit() {
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        nvx-exit "$status"
+    fi
+}
+trap on_exit EXIT
+fail() {
+    echo "NVX-ZERO-FILL-FAIL $1"
+    exit "$2"
+}
+# Prints the SHA-256 digest of COUNT blocks of SIZE bytes of DEVICE at block
+# SKIP, read from the clone's device rather than from what the template cached.
+digest() {
+    blockdev --flushbufs "$1"
+    dd if="$1" bs="$2" skip="$3" count="$4" 2>/dev/null | sha256sum | cut -d ' ' -f 1
+}
+# Keep the kernel's reports of the refused scratch write off the console that
+# carries the markers.
+dmesg -n 1
+# The distro device presents the template's capacity over the shorter image.
+size="$(blockdev --getsize64 /dev/vda)"
+[ "$size" = @CAPACITY@ ] || fail "distro size $size" 80
+[ "$(digest /dev/vda 512 0 @IMAGE_SECTORS@)" = @IMAGE_SHA256@ ] ||
+    fail "distro reads inside the image" 81
+[ "$(digest /dev/vda 4096 @ACROSS_PAGE@ 1)" = @ACROSS_SHA256@ ] ||
+    fail "distro reads across the image's end" 82
+[ "$(digest /dev/vda 512 @IMAGE_SECTORS@ @TAIL_SECTORS@)" = @TAIL_SHA256@ ] ||
+    fail "distro reads past the image's end" 83
+echo NVX-ZERO-FILL-IMAGE-OK
+# The absent scratch keeps the captured geometry and access, reads zeros, and
+# fails writes.
+[ "$(cat /sys/block/vdb/ro)" = 0 ] || fail "scratch is read-only" 84
+size="$(blockdev --getsize64 /dev/vdb)"
+[ "$size" = @SCRATCH_LENGTH@ ] || fail "scratch size $size" 85
+[ "$(digest /dev/vdb 4096 0 @SCRATCH_PAGES@)" = @SCRATCH_SHA256@ ] ||
+    fail "scratch reads" 86
+if printf NVX-ABSENT-SCRATCH |
+    dd of=/dev/vdb bs=512 count=1 conv=sync,notrunc,fsync 2>/tmp/nvx-zero-fill-write; then
+    fail "scratch write succeeded" 87
+fi
+grep -q 'I/O error' /tmp/nvx-zero-fill-write ||
+    fail "scratch write: $(cat /tmp/nvx-zero-fill-write)" 88
+[ "$(digest /dev/vdb 4096 0 @SCRATCH_PAGES@)" = @SCRATCH_SHA256@ ] ||
+    fail "scratch reads after a write" 89
+echo NVX-ZERO-FILL-SCRATCH-OK

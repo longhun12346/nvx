@@ -1,0 +1,249 @@
+name: Module diagrams
+
+# Draws the module diagrams of the nvx crate, which doc/modules publishes, with
+# scripts/module_diagrams.py (doc/ci.md, "Module diagrams"). A nightly run of
+# dev commits them to dev when they changed, at the time of the nightly full
+# run of CI, so that dev takes at most one push of them a night outside the
+# merge queue, each of which rebuilds every queued merge group (doc/ci.md,
+# "Pushes outside the queue"). A pull request that changes their inputs draws
+# them without committing them, so that a change that breaks the drawing fails
+# before it merges, and uploads them for review.
+on:
+  pull_request:
+    branches:
+      - dev
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+    paths:
+      - nvx-rs/**
+      - rust-toolchain.toml
+      - scripts/module_diagrams.py
+      - scripts/nvx_tools/build_constants.py
+      - .github/workflows/module-diagrams.yml
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Runs of dev, nightly or dispatched, wait for one another, and a newer one
+# replaces the run that waits. Each run draws the newest dev, so the run that
+# commits last commits the diagrams of the newest dev. A newer push to a pull
+# request cancels its older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_MODULES_VERSION: 0.27.0
+
+jobs:
+  # The diagrams depend on the Graphviz release and the fonts that lay them
+  # out, so this job runs on a fixed Ubuntu release, and builds and runs the
+  # commit's code without credentials.
+  draw:
+    name: Draw module diagrams
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      sha: ${{ steps.draw.outputs.sha }}
+    steps:
+      # A nightly or dispatched run draws the newest commit of its branch,
+      # rather than the commit that started it, so that whichever run commits
+      # last commits the diagrams of the newest dev.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name != 'pull_request' && github.ref || '' }}
+          persist-credentials: false
+
+      # Graphviz measures the labels with Liberation Sans, which the diagrams
+      # name first, so that their layouts do not depend on the image's other
+      # fonts.
+      - name: Install Graphviz
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            graphviz fonts-liberation
+          dot -V
+
+      - name: Install the pinned Rust release
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          test -n "${toolchain}"
+          rustup toolchain install "${toolchain}" --profile minimal --no-self-update
+          echo "RUST_TOOLCHAIN=${toolchain}" >> "${GITHUB_ENV}"
+          echo "${RUNNER_TEMP}/cargo-modules/bin" >> "${GITHUB_PATH}"
+
+      - name: Restore cargo-modules
+        id: restore-cargo-modules
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/cargo-modules
+          key: cargo-modules-${{ env.CARGO_MODULES_VERSION }}-rust-${{ env.RUST_TOOLCHAIN }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-modules
+        if: steps.restore-cargo-modules.outputs.cache-hit != 'true'
+        shell: bash
+        run: >-
+          cargo "+${RUST_TOOLCHAIN}" install --locked cargo-modules
+          --version "${CARGO_MODULES_VERSION}" --root "${RUNNER_TEMP}/cargo-modules"
+
+      # Only the runs of dev save the build, as dev pushes save the other
+      # caches.
+      - name: Save cargo-modules
+        if: >-
+          github.event_name != 'pull_request' &&
+          github.ref == 'refs/heads/dev' &&
+          steps.restore-cargo-modules.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/cargo-modules
+          key: cargo-modules-${{ env.CARGO_MODULES_VERSION }}-rust-${{ env.RUST_TOOLCHAIN }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Draw the diagrams
+        id: draw
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cargo modules --version)
+          if [[ "${version}" != "cargo-modules ${CARGO_MODULES_VERSION}" ]]; then
+            echo "::error::${version} is not cargo-modules ${CARGO_MODULES_VERSION}"
+            exit 1
+          fi
+          python3 scripts/module_diagrams.py --output doc/modules
+          echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Summarize the changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          changes=$(git status --porcelain --untracked-files=all -- doc/modules)
+          {
+            echo "## Module diagrams"
+            echo
+            if [[ -z "${changes}" ]]; then
+              echo "The diagrams of \`${sha}\` match doc/modules."
+            else
+              echo "The diagrams of \`${sha}\` change doc/modules:"
+              echo
+              echo '```text'
+              echo "${changes}"
+              echo '```'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload the diagrams
+        uses: actions/upload-artifact@v7
+        with:
+          name: module-diagrams-${{ github.run_id }}
+          path: doc/modules
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  # Commits the diagrams that the draw job drew to dev, with the deploy key that
+  # may push to dev past its rules, the one of the performance history. It
+  # builds and runs no code of the commit, and commits nothing but doc/modules.
+  publish:
+    name: Publish module diagrams
+    needs: draw
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v5
+        with:
+          ref: dev
+          fetch-depth: 0
+          ssh-key: ${{ secrets.PERFORMANCE_PERSIST_DEPLOY_KEY }}
+
+      - name: Download the diagrams
+        uses: actions/download-artifact@v8
+        with:
+          name: module-diagrams-${{ github.run_id }}
+          path: ${{ runner.temp }}/module-diagrams
+
+      - name: Commit the diagrams to dev
+        shell: bash
+        env:
+          DIAGRAMS: ${{ runner.temp }}/module-diagrams
+          DRAWN: ${{ needs.draw.outputs.sha }}
+          # The inputs of the diagrams: the paths that start the workflow for
+          # a pull request.
+          INPUTS: >-
+            nvx-rs rust-toolchain.toml scripts/module_diagrams.py
+            scripts/nvx_tools/build_constants.py
+            .github/workflows/module-diagrams.yml
+        run: |
+          set -euo pipefail
+          if [[ ! "${DRAWN}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The draw job named no commit: '${DRAWN}'"
+            exit 1
+          fi
+          unexpected=$(find "${DIAGRAMS}" -mindepth 1 \
+            ! \( -type f \( -name README.md -o -name '*.svg' \) \) -print)
+          if [[ -n "${unexpected}" || ! -f "${DIAGRAMS}/README.md" ]]; then
+            echo "::error::The diagrams hold more than a page and SVG files, or no page:"
+            echo "${unexpected}"
+            exit 1
+          fi
+          read -r -a inputs <<< "${INPUTS}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          for attempt in 1 2 3; do
+            git fetch origin dev
+            git checkout -B module-diagrams origin/dev
+            # A rerun of this job alone reuses the drawing of its run, which a
+            # newer run may have replaced. Publish it only while dev holds the
+            # inputs that it was drawn from: the next run of dev draws and
+            # publishes the diagrams of newer inputs.
+            status=0
+            git diff --quiet "${DRAWN}" HEAD -- "${inputs[@]}" || status=$?
+            if [[ "${status}" -eq 1 ]]; then
+              echo "::notice::dev changed the inputs of the diagrams since ${DRAWN}; the next run of dev publishes their diagrams"
+              exit 0
+            elif [[ "${status}" -ne 0 ]]; then
+              echo "::error::Cannot compare the inputs of the diagrams at ${DRAWN} with dev"
+              exit 1
+            fi
+            rm -rf doc/modules
+            mkdir -p doc/modules
+            cp "${DIAGRAMS}"/* doc/modules/
+            git add --all -- doc/modules
+
+            unexpected=$(git diff --cached --no-renames --name-only |
+              grep -v '^doc/modules/' || true)
+            if [[ -n "${unexpected}" ]]; then
+              echo "::error::Refusing to commit changes outside doc/modules:"
+              echo "${unexpected}"
+              exit 1
+            fi
+
+            if git diff --cached --quiet; then
+              echo "The module diagrams on dev are up to date"
+              exit 0
+            fi
+
+            git commit --no-verify \
+              -m "doc: update module diagrams (${DRAWN}) [skip ci]"
+            if git push origin HEAD:dev; then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "::error::Failed to publish the module diagrams after ${attempt} attempts"
+              exit 1
+            fi
+          done

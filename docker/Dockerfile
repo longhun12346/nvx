@@ -1,9 +1,25 @@
 # syntax=docker/dockerfile:1.7
 
 ARG DEBIAN_IMAGE=debian:12-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+ARG RUST_BUILDER_IMAGE=rust:1.95.0-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082
 ARG EROFS_UTILS_VERSION=1.5-1
 ARG AZURELINUX_VERSION=3.0
 ARG AZURELINUX_IMAGE=mcr.microsoft.com/azurelinux/base/core@sha256:c877612270d1ee2d6ab2bc1f64bfe38ab697ac50be325154ee5129fce89c17e4
+
+FROM ${RUST_BUILDER_IMAGE} AS guest-binaries
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /repo
+COPY rust-toolchain.toml /repo/
+COPY nvx-rs/ /repo/nvx-rs/
+COPY scripts/ /repo/scripts/
+RUN set -eux; \
+    toolchain="$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)"; \
+    test -n "$toolchain"; \
+    rustup target add --toolchain "$toolchain" x86_64-unknown-linux-musl; \
+    python3 scripts/nvx.py build-guest-binaries --output /out/guest-binaries
 
 FROM ${DEBIAN_IMAGE} AS base
 ARG EROFS_UTILS_VERSION
@@ -20,7 +36,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gzip \
         libelf-dev \
         libssl-dev \
-        musl-tools \
         patch \
         python3 \
         rsync \
@@ -43,10 +58,18 @@ RUN python3 scripts/nvx.py build-kernel
 FROM base AS kernel-debug
 RUN python3 scripts/nvx.py build-kernel --debug
 
-FROM base AS initramfs
+# Only the guest images install the Rust guest binaries and record their sources,
+# so the kernel and Linux source targets never build them.
+FROM base AS guest-base
+COPY nvx-rs/ /repo/nvx-rs/
+COPY rust-toolchain.toml /repo/
+COPY --from=guest-binaries /out/guest-binaries/ /repo/build/guest-binaries/
+ENV NVX_GUEST_BINARIES=/repo/build/guest-binaries
+
+FROM guest-base AS initramfs
 RUN python3 scripts/nvx.py build-initramfs --guest alpine
 
-FROM base AS ubuntu-initramfs
+FROM guest-base AS ubuntu-initramfs
 RUN python3 scripts/nvx.py build-initramfs --guest ubuntu
 
 FROM ubuntu-initramfs AS ubuntu-distro-layer
@@ -54,25 +77,20 @@ RUN python3 scripts/nvx.py build-distro-layer \
         --guest ubuntu \
         --output build/ubuntu-distro.erofs
 
-FROM base AS ubuntu-determinism
-RUN python3 scripts/nvx.py verify-guest-determinism \
+# The sandbox scratch template needs only the base image's mkfs.ext4, so it
+# builds no guest binary.
+FROM base AS ubuntu-scratch-template
+RUN python3 scripts/nvx.py build-scratch-template
+
+FROM guest-base AS ubuntu-determinism
+COPY --from=guest-binaries /usr/local/cargo/ /usr/local/cargo/
+COPY --from=guest-binaries /usr/local/rustup/ /usr/local/rustup/
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:${PATH}
+RUN NVX_GUEST_BINARIES= python3 scripts/nvx.py verify-guest-determinism \
         --guest ubuntu \
         --work-dir build/guest-determinism
-
-FROM base AS azurelinux-helpers
-RUN set -eux; \
-    mkdir -p /out/helpers; \
-    for helper in nvx-reseed nvx-mmio-write nvx-console-pending nvx-managed-agent; do \
-        cc -static -Os -s -Wall -Wextra -Werror -o "/out/helpers/$helper" "/repo/guest/common/$helper.c"; \
-    done; \
-    for helper in nvx-time nvx-exit nvx-ingress; do \
-        musl-gcc -static -Os -s -Wall -Wextra -Werror -o "/out/helpers/$helper" "/repo/guest/common/$helper.c"; \
-    done; \
-    musl-gcc -std=gnu11 -static -O2 -pthread -s -Wall -Wextra -Werror -o /out/helpers/nvx-time-probe \
-        /repo/guest/common/nvx-time-probe.c; \
-    cc -nostdlib -static -Os -fno-builtin -fno-pie -fno-stack-protector -no-pie \
-        -Wl,--build-id=none -Wl,-z,noexecstack -s -o /out/helpers/nvx-device-io \
-        /repo/guest/common/nvx-device-io.c
 
 FROM base AS azurelinux-packages
 RUN python3 - <<'PY'
@@ -97,12 +115,11 @@ RUN rpm --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY \
     && rpm -qa --queryformat '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{LICENSE}\t%{SOURCERPM}\n' \
         | sort > /tmp/azurelinux-rpm-packages.tsv
 
-FROM base AS azurelinux-initramfs
+FROM guest-base AS azurelinux-initramfs
 ARG AZURELINUX_IMAGE
 ARG AZURELINUX_VERSION
 COPY --from=azurelinux-rootfs / /rootfs/
 COPY --from=azurelinux-rootfs /tmp/azurelinux-rpm-packages.tsv /tmp/azurelinux-rpm-packages.tsv
-COPY --from=azurelinux-helpers /out/helpers/ /rootfs/sbin/
 RUN <<'EOF'
 set -eux
 install -m 0755 /repo/guest/common/init /rootfs/init
@@ -113,6 +130,22 @@ install -m 0755 /repo/guest/common/nvx-hostmount \
     /repo/guest/common/nvx-container-enter-azurelinux /rootfs/sbin/
 install -m 0755 /repo/guest/common/nvx-container-launch-azurelinux \
     /rootfs/sbin/nvx-container-launch
+python3 <<'PY'
+import shutil
+import sys
+from pathlib import Path
+
+sys.path.insert(0, '/repo/scripts')
+from nvx_tools.build_constants import GuestRustBuildConstants
+from nvx_tools.guest_binaries import inspect_guest_binaries
+
+source = Path('/repo/build/guest-binaries')
+inspect_guest_binaries(source)
+for name in GuestRustBuildConstants.BINARIES:
+    destination = Path('/rootfs/sbin') / name
+    shutil.copyfile(source / name, destination)
+    destination.chmod(0o755)
+PY
 # Link the BusyBox applets that the shared guest scripts expect; every other
 # command resolves through PATH to the Azure Linux packages.
 ln -sf ../sbin/busybox /rootfs/usr/bin/busybox
@@ -171,9 +204,22 @@ from pathlib import Path
 
 sys.path.insert(0, '/repo/scripts')
 from nvx_tools.azurelinux import input_sha256
+from nvx_tools.build_constants import GuestRustBuildConstants
+from nvx_tools.guest_binaries import inspect_guest_binaries
 
 def sha256(path: str) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+guest_build = inspect_guest_binaries(Path('/repo/build/guest-binaries'))
+helpers = {}
+for name in GuestRustBuildConstants.BINARIES:
+    binary_sha256 = sha256(f'/rootfs/sbin/{name}')
+    if binary_sha256 != guest_build.binaries[name]:
+        raise ValueError(f'installed Rust guest binary changed: {name}')
+    helpers[name] = {
+        'source_sha256': guest_build.source_sha256,
+        'binary_sha256': binary_sha256,
+    }
 
 manifest = {
     'format': 1,
@@ -190,12 +236,7 @@ manifest = {
     ),
     'package_manifest_format': 'azurelinux-v1',
     'packages': json.loads(Path('/tmp/azurelinux-packages.json').read_text(encoding='utf-8')),
-    'helpers': {
-        'nvx-device-io': {
-            'source_sha256': sha256('/repo/guest/common/nvx-device-io.c'),
-            'binary_sha256': sha256('/rootfs/sbin/nvx-device-io'),
-        },
-    },
+    'helpers': helpers,
 }
 Path('/tmp/initramfs-azurelinux.cpio.gz.packages.json').write_text(
     json.dumps(manifest, indent=2, sort_keys=True) + '\n',
@@ -222,8 +263,6 @@ COPY --from=initramfs /repo/build/initramfs.provenance.json /initramfs.provenanc
 FROM scratch AS ubuntu-initramfs-artifacts
 COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu.cpio.gz /initramfs-ubuntu.cpio.gz
 COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu.cpio.gz.packages.json /initramfs-ubuntu.cpio.gz.packages.json
-COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu-stage.cpio.gz /initramfs-ubuntu-stage.cpio.gz
-COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu-stage.cpio.gz.manifest.json /initramfs-ubuntu-stage.cpio.gz.manifest.json
 
 FROM scratch AS azurelinux-initramfs-artifacts
 COPY --from=azurelinux-initramfs /tmp/initramfs-azurelinux.cpio.gz /initramfs-azurelinux.cpio.gz
@@ -232,6 +271,7 @@ COPY --from=azurelinux-initramfs /tmp/initramfs-azurelinux.cpio.gz.packages.json
 FROM scratch AS ubuntu-distro-layer-artifacts
 COPY --from=ubuntu-distro-layer /repo/build/ubuntu-distro.erofs /ubuntu-distro.erofs
 COPY --from=ubuntu-distro-layer /repo/build/ubuntu-distro.erofs.manifest.json /ubuntu-distro.erofs.manifest.json
+COPY --from=ubuntu-scratch-template /repo/build/ubuntu-smoke-scratch.ext4 /ubuntu-smoke-scratch.ext4
 
 FROM scratch AS azurelinux-guest-artifacts
 COPY --from=kernel /repo/build/vmlinux /vmlinux
@@ -260,8 +300,6 @@ COPY --from=kernel /repo/build/vmlinux.config /vmlinux.config
 COPY --from=kernel /repo/build/vmlinux.provenance.json /vmlinux.provenance.json
 COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu.cpio.gz /initramfs-ubuntu.cpio.gz
 COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu.cpio.gz.packages.json /initramfs-ubuntu.cpio.gz.packages.json
-COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu-stage.cpio.gz /initramfs-ubuntu-stage.cpio.gz
-COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu-stage.cpio.gz.manifest.json /initramfs-ubuntu-stage.cpio.gz.manifest.json
 
 FROM scratch AS all-guest-artifacts
 COPY --from=kernel /repo/build/vmlinux /vmlinux
@@ -272,10 +310,9 @@ COPY --from=initramfs /repo/build/initramfs.cpio.gz.packages.json /initramfs.cpi
 COPY --from=initramfs /repo/build/initramfs.provenance.json /initramfs.provenance.json
 COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu.cpio.gz /initramfs-ubuntu.cpio.gz
 COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu.cpio.gz.packages.json /initramfs-ubuntu.cpio.gz.packages.json
-COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu-stage.cpio.gz /initramfs-ubuntu-stage.cpio.gz
-COPY --from=ubuntu-initramfs /repo/build/initramfs-ubuntu-stage.cpio.gz.manifest.json /initramfs-ubuntu-stage.cpio.gz.manifest.json
 COPY --from=ubuntu-distro-layer /repo/build/ubuntu-distro.erofs /ubuntu-distro.erofs
 COPY --from=ubuntu-distro-layer /repo/build/ubuntu-distro.erofs.manifest.json /ubuntu-distro.erofs.manifest.json
+COPY --from=ubuntu-scratch-template /repo/build/ubuntu-smoke-scratch.ext4 /ubuntu-smoke-scratch.ext4
 COPY --from=azurelinux-initramfs /tmp/initramfs-azurelinux.cpio.gz /initramfs-azurelinux.cpio.gz
 COPY --from=azurelinux-initramfs /tmp/initramfs-azurelinux.cpio.gz.packages.json /initramfs-azurelinux.cpio.gz.packages.json
 

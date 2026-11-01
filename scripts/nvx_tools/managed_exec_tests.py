@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from . import nvx_rs
 from .build_constants import BuildConstants, UbuntuBuildConstants
 from .common import ScriptError, artifact_path, require_file
 
@@ -23,7 +23,6 @@ FORBIDDEN_DEFAULT_ENVIRONMENT_NAMES = {
     "SECOND",
     "ORDER",
     "LAYERED",
-    "NVX_EXEC_CONFIG_FD",
 }
 
 
@@ -36,16 +35,28 @@ class WorkloadArtifacts:
     scratch_template: Path
 
 
+def workload_artifact_paths() -> tuple[tuple[Path, str], ...]:
+    """Return the paths of the Ubuntu workload layer, its manifest, and the
+    sandbox scratch template, which the public scenarios read, each with its
+    description."""
+    distro = artifact_path(UbuntuBuildConstants.DISTRO_NAME)
+    return (
+        (distro, "Ubuntu workload layer"),
+        (
+            distro.with_name(UbuntuBuildConstants.DISTRO_MANIFEST_NAME),
+            "Ubuntu layer manifest",
+        ),
+        (
+            artifact_path(UbuntuBuildConstants.SCRATCH_TEMPLATE_NAME),
+            "sandbox scratch template",
+        ),
+    )
+
+
 def load_workload_artifacts() -> WorkloadArtifacts:
-    distro = require_file(
-        artifact_path(UbuntuBuildConstants.DISTRO_NAME), "Ubuntu workload layer"
-    )
-    manifest_path = require_file(
-        distro.with_name(UbuntuBuildConstants.DISTRO_MANIFEST_NAME),
-        "Ubuntu layer manifest",
-    )
-    scratch_template = require_file(
-        artifact_path("ubuntu-smoke-scratch.ext4"), "sandbox scratch template"
+    distro, manifest_path, scratch_template = (
+        require_file(path, description)
+        for path, description in workload_artifact_paths()
     )
     try:
         manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -177,11 +188,7 @@ def run_managed_exec_configuration(
         state = root / "state"
         scratch = root / "scratch.ext4"
         shutil.copyfile(scratch_template, scratch)
-        base = [
-            sys.executable,
-            str(BuildConstants.REPO_ROOT / "scripts" / "nvx.py"),
-            "sandbox",
-        ]
+        base = nvx_rs.command_line(("sandbox",))
 
         def invoke(
             operation: str, *arguments: str, expected: int = 0
@@ -237,11 +244,15 @@ def run_managed_exec_configuration(
                 )
 
         def expect_rejection(
-            result: subprocess.CompletedProcess[bytes], message: bytes
+            result: subprocess.CompletedProcess[bytes], code: str
         ) -> None:
-            if result.stdout or message not in result.stderr:
+            # nvx-rs refuses the request before it runs anything, with the
+            # stable code of its error, whatever the wording of its message.
+            reported = nvx_rs.reported_error(result.stderr)
+            if result.stdout or reported is None or reported.code != code:
                 raise RuntimeError(
-                    "public managed validation returned unexpected diagnostics: "
+                    "public managed validation returned unexpected diagnostics, "
+                    f"expected error {code!r}: "
                     f"stdout={bounded_text(result.stdout)!r}, "
                     f"stderr={bounded_text(result.stderr)!r}"
                 )
@@ -387,7 +398,9 @@ def run_managed_exec_configuration(
                 "relative",
                 expected=1,
             )
-            expect_rejection(relative, b"working directory must be an absolute path")
+            expect_rejection(relative, "unsupported")
+            # The parser refuses a timeout outside the unsigned 32-bit range as a
+            # usage error, before it runs anything.
             for invalid_timeout in (-1, 0x100000000):
                 rejected = workload(
                     "/bin/sh",
@@ -395,9 +408,9 @@ def run_managed_exec_configuration(
                     "--arg=printf workload-must-not-run",
                     "--exec-timeout-ms",
                     str(invalid_timeout),
-                    expected=1,
+                    expected=2,
                 )
-                expect_rejection(rejected, b"timeout must be 0 through 4294967295 ms")
+                expect_rejection(rejected, "argument-invalid")
 
             for cwd in ("/does-not-exist", "/etc/passwd", "/root"):
                 failed = workload(

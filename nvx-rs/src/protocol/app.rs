@@ -28,10 +28,6 @@ pub const APP_FEATURES: u8 = 5;
 /// Request that the guest agent mount entries of the host mapping table; the payload is a `MAPS`
 /// payload.
 pub const APP_MAPS: u8 = 6;
-/// Request that the guest agent unmount a host mapping that an `APP_MAPS` request appended at run
-/// time; the payload is the absolute guest path of the mapping, in UTF-8. Guests that advertise
-/// [`GuestFeatures::RUNTIME_MAPPINGS`](super::GuestFeatures::RUNTIME_MAPPINGS) accept it.
-pub const APP_UNMAP: u8 = 7;
 /// Response that acknowledges a request.
 pub const APP_READY: u8 = 0x81;
 /// Response that carries a chunk of a workload's standard output.
@@ -64,9 +60,6 @@ pub const MAPPINGS_INCOMPLETE: &str = "mappings-incomplete";
 /// Error category with which a guest agent reports a host mapping that it could not apply. The
 /// status is the guest's error number.
 pub const MAPPING_FAILED: &str = "mapping-failed";
-/// Error category of an `APP_MAPS` request that appends a runtime mapping while the guest agent
-/// already lists as many as it can unmount.
-pub const MAPPING_LIMIT: &str = "mapping-limit";
 
 /// Decoded application frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,18 +123,6 @@ pub enum ExitCategory {
     OutputLimit,
     /// A signal ended the workload; the status is 128 plus the signal number.
     Signal,
-    /// The workload's own memory limit killed it: it was the execution that ran out.
-    ///
-    /// Reported separately from [`Signal`](Self::Signal) because a bare SIGKILL cannot be acted
-    /// on: the caller cannot tell "I used too much memory" from "something else killed me".
-    /// The status is 128 plus the signal number, as for `Signal`.
-    Oom,
-    /// The VM ran out of memory and the kernel killed this workload, which need not have been
-    /// the one that caused the pressure.
-    ///
-    /// Distinct from [`Oom`](Self::Oom) because no execution-local limit caused this kill.
-    /// This execution may itself have exhausted the VM; retrying is not guaranteed to help.
-    VmOom,
     /// The guest agent could not supervise the workload.
     Failed,
     /// A cancellation request ended the workload.
@@ -156,8 +137,6 @@ impl ExitCategory {
             b"timeout" => Ok(Self::Timeout),
             b"output-limit" => Ok(Self::OutputLimit),
             b"signal" => Ok(Self::Signal),
-            b"oom" => Ok(Self::Oom),
-            b"vm-oom" => Ok(Self::VmOom),
             b"failed" => Ok(Self::Failed),
             b"cancelled" => Ok(Self::Cancelled),
             _ => Err(violation(
@@ -173,8 +152,6 @@ impl ExitCategory {
             Self::Timeout => "timeout",
             Self::OutputLimit => "output-limit",
             Self::Signal => "signal",
-            Self::Oom => "oom",
-            Self::VmOom => "vm-oom",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
         }

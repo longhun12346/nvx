@@ -14,7 +14,14 @@ from pathlib import Path
 from typing import cast
 
 from .build_constants import BuildConstants, GuestRustBuildConstants
-from .common import ScriptError, require_file, require_tool, run_checked, sha256_file
+from .common import (
+    ScriptError,
+    normalized_sha256_file,
+    require_file,
+    require_tool,
+    run_checked,
+    sha256_file,
+)
 from .elf import check_static_executables
 
 
@@ -26,58 +33,59 @@ class GuestBinaryBuildResult:
     binaries: dict[str, str]
 
 
-def guest_binary_source_files() -> tuple[Path, ...]:
-    """Return the complete ordered input set of the PR 1 guest executables."""
-    files = {
-        GuestRustBuildConstants.MANIFEST,
-        GuestRustBuildConstants.LOCKFILE,
-        GuestRustBuildConstants.BUILD_SCRIPT,
-        GuestRustBuildConstants.TOOLCHAIN_FILE,
-        *GuestRustBuildConstants.BUILD_RECIPE_FILES,
-    }
+def guest_binary_source_files(root: Path | None = None) -> tuple[Path, ...]:
+    """Return the complete ordered input set of the guest executables under ``root``."""
+    root = Path(root or BuildConstants.REPO_ROOT)
+    files = {root / path for path in GuestRustBuildConstants.SOURCE_FILES}
+    source = root / GuestRustBuildConstants.SOURCE_DIRECTORY
+    if not source.is_dir():
+        raise ScriptError(f"nvx-rs source directory not found: {source}")
     for directory in GuestRustBuildConstants.SOURCE_DIRECTORIES:
-        if not directory.is_dir():
-            raise ScriptError(f"nvx-rs source directory not found: {directory}")
+        if not (root / directory).is_dir():
+            continue
         files.update(
             path
-            for path in directory.rglob("*")
-            if path.is_file() and "target" not in path.relative_to(directory).parts
+            for path in (root / directory).rglob("*")
+            if path.is_file()
+            and GuestRustBuildConstants.SOURCE_PATTERN.fullmatch(
+                path.relative_to(root).as_posix()
+            )
         )
     return tuple(
         sorted(
             (require_file(path, "Rust guest binary source input") for path in files),
-            key=lambda path: path.relative_to(BuildConstants.REPO_ROOT).as_posix(),
+            key=lambda path: path.relative_to(root).as_posix(),
         )
     )
 
 
-def guest_binary_source_sha256() -> str:
+def guest_binary_source_sha256(root: Path | None = None) -> str:
     """Hash the paths and contents that determine every Rust guest executable."""
+    root = Path(root or BuildConstants.REPO_ROOT)
     inventory = {
         "domain": GuestRustBuildConstants.SOURCE_DIGEST_DOMAIN,
         "format": GuestRustBuildConstants.SOURCE_DIGEST_FORMAT,
         "files": [
             {
-                "path": path.relative_to(BuildConstants.REPO_ROOT).as_posix(),
-                "sha256": sha256_file(path),
+                "path": path.relative_to(root).as_posix(),
+                "sha256": normalized_sha256_file(path),
             }
-            for path in guest_binary_source_files()
+            for path in guest_binary_source_files(root)
         ],
     }
     encoded = json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 
-def pinned_guest_rust_toolchain() -> str:
+def pinned_guest_rust_toolchain(root: Path | None = None) -> str:
     """Read and validate the repository's exact Rust release pin."""
-    contents = require_file(
-        GuestRustBuildConstants.TOOLCHAIN_FILE, "Rust toolchain pin"
-    ).read_text(encoding="utf-8")
+    toolchain_file = (root or BuildConstants.REPO_ROOT) / "rust-toolchain.toml"
+    contents = require_file(toolchain_file, "Rust toolchain pin").read_text(
+        encoding="utf-8"
+    )
     matches = re.findall(r'^channel = "([^"]+)"$', contents, re.MULTILINE)
     if len(matches) != 1:
-        raise ScriptError(
-            f"{GuestRustBuildConstants.TOOLCHAIN_FILE} must define one toolchain channel"
-        )
+        raise ScriptError(f"{toolchain_file} must define one toolchain channel")
     [toolchain] = matches
     if toolchain != GuestRustBuildConstants.TOOLCHAIN:
         raise ScriptError(
@@ -115,6 +123,83 @@ def _cargo_environment(target_directory: Path) -> dict[str, str]:
     environment["CARGO_TARGET_DIR"] = str(target_directory)
     environment["SOURCE_DATE_EPOCH"] = "0"
     return environment
+
+
+def _dep_info_paths(dep_info: Path) -> tuple[str, ...]:
+    """Return the prerequisites that a Cargo dep-info file lists.
+
+    Cargo writes one Makefile rule per artifact and escapes each space in a path
+    with a backslash.
+    """
+    contents = dep_info.read_text(encoding="utf-8").replace("\\\n", " ")
+    paths: list[str] = []
+    for line in contents.splitlines():
+        tokens = [
+            token.replace("\\ ", " ") for token in re.findall(r"(?:\\ |\S)+", line)
+        ]
+        if not tokens or tokens[0].startswith("#"):
+            continue
+        if not tokens[0].endswith(":"):
+            raise ScriptError(f"Cargo dep-info is malformed: {dep_info}")
+        paths.extend(tokens[1:])
+    return tuple(paths)
+
+
+def _check_guest_build_inputs(target_directory: Path) -> None:
+    """Fail unless the source identity covers every file that the build read.
+
+    Cargo's dep-info for each executable lists every source file of the crate
+    that rustc read, the targets of ``include_str!`` and ``include_bytes!``
+    included, and every path that the build script watches. A file under the
+    build's own target directory, such as one in ``OUT_DIR``, derives from those.
+    Every file of a watched directory must be covered, and an empty one fails,
+    because a file added to it later could change the build without changing
+    the identity.
+    """
+    root = BuildConstants.REPO_ROOT.resolve()
+    target_directory = target_directory.resolve()
+    identity = {path.resolve() for path in guest_binary_source_files()}
+    outputs = (
+        target_directory
+        / GuestRustBuildConstants.TARGET
+        / GuestRustBuildConstants.PROFILE
+    )
+    omitted: set[str] = set()
+    for binary in GuestRustBuildConstants.BINARIES:
+        dep_info = require_file(
+            outputs / f"{binary}.d", f"Cargo dep-info of Rust guest binary {binary}"
+        )
+        for dependency in _dep_info_paths(dep_info):
+            path = Path(dependency)
+            if not path.is_absolute():
+                raise ScriptError(
+                    f"Cargo dep-info of Rust guest binary {binary} lists a relative "
+                    f"path: {dependency}"
+                )
+            path = path.resolve()
+            if path.is_relative_to(target_directory):
+                continue
+            files = (
+                [entry for entry in path.rglob("*") if entry.is_file()]
+                if path.is_dir()
+                else []
+            )
+            # The identity holds files only, so it never covers an empty
+            # directory or a missing path.
+            omitted.update(
+                file.relative_to(root).as_posix()
+                if file.is_relative_to(root)
+                else file.as_posix()
+                for file in files or [path]
+                if file not in identity
+            )
+    if omitted:
+        raise ScriptError(
+            "Rust guest binary build depends on files that its source identity "
+            "omits, so the guest image cache keys would miss changes to them; "
+            "GuestRustBuildConstants in scripts/nvx_tools/build_constants.py must "
+            "cover: " + ", ".join(sorted(omitted))
+        )
 
 
 def _guest_cargo_arguments() -> list[str]:
@@ -164,7 +249,8 @@ def _validate_owned_output(output: Path) -> tuple[str, ...]:
     """Require an existing output to be a complete build owned by this tool.
 
     Return the retired executables that the output holds, which its build manifest
-    must record.
+    must record. The output may lack added executables, which its build manifest
+    must not record.
     """
     if not output.is_dir():
         raise ScriptError(
@@ -176,9 +262,17 @@ def _validate_owned_output(output: Path) -> tuple[str, ...]:
         for binary in GuestRustBuildConstants.RETIRED_BINARIES
         if binary in actual
     )
+    missing = tuple(
+        binary
+        for binary in GuestRustBuildConstants.ADDED_BINARIES
+        if binary not in actual
+    )
+    present = tuple(
+        binary for binary in GuestRustBuildConstants.BINARIES if binary not in missing
+    )
     expected = {
         GuestRustBuildConstants.BUILD_MANIFEST_NAME,
-        *GuestRustBuildConstants.BINARIES,
+        *present,
         *retired,
     }
     if actual != expected:
@@ -202,15 +296,19 @@ def _validate_owned_output(output: Path) -> tuple[str, ...]:
         raise ScriptError(
             f"guest binary output has an unrecognized build manifest: {manifest_path}"
         )
-    if retired:
+    if retired or missing:
         recorded = manifest.get("binaries")
-        if not isinstance(recorded, dict) or not all(
-            binary in cast(dict[str, object], recorded) for binary in retired
+        if (
+            not isinstance(recorded, dict)
+            or not all(
+                binary in cast(dict[str, object], recorded) for binary in retired
+            )
+            or any(binary in cast(dict[str, object], recorded) for binary in missing)
         ):
             raise ScriptError(
                 f"guest binary output is not owned by this builder: {output}"
             )
-    for binary in (*GuestRustBuildConstants.BINARIES, *retired):
+    for binary in (*present, *retired):
         path = output / binary
         if not path.is_file() or path.is_symlink():
             raise ScriptError(f"guest binary output has an invalid executable: {path}")
@@ -276,6 +374,44 @@ def check_guest_binaries(toolchain: str | None = None) -> None:
         )
 
 
+def inspect_guest_binaries(directory: Path) -> GuestBinaryBuildResult:
+    """Validate and identify a current, previously staged guest build."""
+    directory = directory.resolve()
+    retired = _validate_owned_output(directory)
+    missing = [
+        binary
+        for binary in GuestRustBuildConstants.BINARIES
+        if not (directory / binary).is_file()
+    ]
+    if retired or missing:
+        raise ScriptError(
+            f"guest binary output is not a current build of every executable: "
+            f"{directory}"
+        )
+    paths = [directory / binary for binary in GuestRustBuildConstants.BINARIES]
+    check_static_executables(paths)
+    result = GuestBinaryBuildResult(
+        source_sha256=guest_binary_source_sha256(),
+        binaries={
+            binary: sha256_file(path)
+            for binary, path in zip(
+                GuestRustBuildConstants.BINARIES, paths, strict=True
+            )
+        },
+    )
+    manifest_path = directory / GuestRustBuildConstants.BUILD_MANIFEST_NAME
+    manifest = cast(
+        dict[str, object],
+        json.loads(manifest_path.read_text(encoding="utf-8")),
+    )
+    if manifest != _manifest(result):
+        raise ScriptError(
+            "Rust guest binary build manifest does not match the current "
+            "sources, build pins, and executables"
+        )
+    return result
+
+
 def build_guest_binaries(output: Path) -> GuestBinaryBuildResult:
     """Build, statically check, digest, and stage a fresh set of executables."""
     if sys.platform != "linux":
@@ -313,6 +449,7 @@ def build_guest_binaries(output: Path) -> GuestBinaryBuildResult:
             cwd=GuestRustBuildConstants.DIRECTORY,
             env=environment,
         )
+        _check_guest_build_inputs(target)
 
         built_directory = (
             target / GuestRustBuildConstants.TARGET / GuestRustBuildConstants.PROFILE

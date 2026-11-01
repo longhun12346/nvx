@@ -2,24 +2,52 @@ name: Build guest artifacts
 description: Cache or build the pinned Linux kernel and guest images
 
 inputs:
+  components:
+    description: >-
+      Space-separated guest artifacts to cache or build, so that jobs beside
+      one another can each build some of them: kernel, alpine (the Alpine
+      initramfs), ubuntu (the Ubuntu initramfs, its EROFS distro layer, and
+      the sandbox scratch template), azurelinux (the Azure Linux initramfs),
+      and debug-kernel (the CI debug kernel, build/vmlinux-debug)
+    required: false
+    default: kernel alpine ubuntu azurelinux
   restore-only:
     description: >-
       Only restore cached artifacts; skip Docker builds, determinism checks,
       and cache saves for artifacts that miss the cache
     required: false
     default: "false"
-  debug-kernel:
-    description: Also cache or build the CI debug kernel (build/vmlinux-debug)
-    required: false
-    default: "false"
-  guest-images:
+  save-cache:
     description: >-
-      Cache or build the kernel and guest images; "false" with debug-kernel
-      builds only the CI debug kernel, for a job that runs beside this one
+      Save the artifacts that miss the cache once they are built; "false"
+      still builds them but leaves the cache unchanged
     required: false
     default: "true"
+  record-artifact:
+    description: >-
+      Name of the artifact in which to upload build/guest-artifacts.json, the
+      record of the selected components' exact cache keys and of the SHA-256
+      of each of their files, so that the merge group and the dev push that
+      merge this run's pull request can check them before they reuse them;
+      "" records nothing
+    required: false
+    default: ""
+  reuse:
+    description: >-
+      "true", in the run of a pushed or queued merge commit, installs every
+      file of the selected components, when one missed the cache, from the
+      artifacts of the latest pull_request run of this workflow for the merged
+      head, from this repository and never a fork, once they check out against
+      that run's record-artifact record, and builds them otherwise
+    required: false
+    default: "false"
 
 outputs:
+  cache-keys:
+    description: >-
+      The exact cache keys of the guest artifacts, as a JSON object by name,
+      from which a guest artifact record takes those of its components
+    value: ${{ toJSON(steps.guest-cache-keys.outputs) }}
   kernel-cache-key:
     description: Exact cache key for the Linux kernel artifacts
     value: ${{ steps.guest-cache-keys.outputs.kernel }}
@@ -33,7 +61,9 @@ outputs:
     description: Exact cache key for the Ubuntu initramfs artifacts
     value: ${{ steps.guest-cache-keys.outputs.ubuntu }}
   ubuntu-distro-cache-key:
-    description: Exact cache key for the Ubuntu EROFS distro artifacts
+    description: >-
+      Exact cache key for the Ubuntu EROFS distro artifacts and the sandbox
+      scratch template
     value: ${{ steps.guest-cache-keys.outputs.ubuntu-distro }}
   azurelinux-cache-key:
     description: Exact cache key for the Azure Linux initramfs artifacts
@@ -42,6 +72,39 @@ outputs:
 runs:
   using: composite
   steps:
+    # An unknown name fails here rather than silently selecting nothing.
+    - name: Select guest artifact components
+      id: components
+      shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+      run: |
+        set -euo pipefail
+        set -o noglob
+        selected=" "
+        for component in ${COMPONENTS}; do
+          case "${component}" in
+            kernel | alpine | ubuntu | azurelinux | debug-kernel)
+              selected+="${component} "
+              ;;
+            *)
+              echo "::error::Unknown guest artifact component: ${component}" >&2
+              exit 1
+              ;;
+          esac
+        done
+        if [[ "${selected}" == " " ]]; then
+          echo "::error::No guest artifact component is selected" >&2
+          exit 1
+        fi
+        for component in kernel alpine ubuntu azurelinux debug-kernel; do
+          if [[ "${selected}" == *" ${component} "* ]]; then
+            echo "${component}=true"
+          else
+            echo "${component}=false"
+          fi
+        done >> "${GITHUB_OUTPUT}"
+
     - name: Resolve guest artifact versions
       id: guest-versions
       shell: bash
@@ -71,25 +134,32 @@ runs:
         ALPINE_VERSION: ${{ steps.guest-versions.outputs.alpine-version }}
         UBUNTU_VERSION: ${{ steps.guest-versions.outputs.ubuntu-version }}
         AZURELINUX_VERSION: ${{ steps.guest-versions.outputs.azurelinux-version }}
-        KERNEL_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'kernel/config-microvm', 'kernel/patches/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py') }}
-        DEBUG_KERNEL_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'kernel/config-microvm', 'kernel/config-microvm-debug', 'kernel/patches/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py') }}
-        ALPINE_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'guest/alpine/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/guests.py') }}
-        UBUNTU_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'guest/ubuntu/**', 'ubuntu/**', 'docker/Dockerfile', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/guests.py', 'scripts/nvx_tools/ubuntu.py') }}
-        AZURELINUX_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'azurelinux/**', 'docker/Dockerfile', 'scripts/nvx_tools/azurelinux.py', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/guests.py') }}
+        KERNEL_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'kernel/config-microvm', 'kernel/patches/**', 'docker/Dockerfile', '.dockerignore', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py') }}
+        DEBUG_KERNEL_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'kernel/config-microvm', 'kernel/config-microvm-debug', 'kernel/patches/**', 'docker/Dockerfile', '.dockerignore', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py') }}
+        ALPINE_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'guest/alpine/**', 'docker/Dockerfile', '.dockerignore', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/elf.py', 'scripts/nvx_tools/guest_binaries.py', 'scripts/nvx_tools/guests.py') }}
+        UBUNTU_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'guest/ubuntu/**', 'ubuntu/**', 'docker/Dockerfile', '.dockerignore', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/elf.py', 'scripts/nvx_tools/guest_binaries.py', 'scripts/nvx_tools/guests.py', 'scripts/nvx_tools/ubuntu.py') }}
+        AZURELINUX_INPUT_HASH: ${{ hashFiles('SOURCE-MANIFEST.json', 'guest/common/**', 'azurelinux/**', 'docker/Dockerfile', '.dockerignore', 'scripts/nvx_tools/azurelinux.py', 'scripts/nvx_tools/build.py', 'scripts/nvx_tools/build_config.py', 'scripts/nvx_tools/build_constants.py', 'scripts/nvx_tools/common.py', 'scripts/nvx_tools/elf.py', 'scripts/nvx_tools/guest_binaries.py', 'scripts/nvx_tools/guests.py') }}
       run: |
         set -euo pipefail
+        # hashFiles hashes contents only, so the kernel keys also name each patch
+        # path and its order, and the guest image keys the path-aware digest of
+        # the Rust guest sources that their package manifests record. Those are
+        # the files that the guest binaries' build reads, the only nvx-rs files
+        # that the image keys cover.
+        patch_identity=$(python3 scripts/nvx.py kernel-patch-identity)
+        rust_source_identity=$(python3 scripts/nvx.py guest-binary-source-identity)
         {
-          echo "kernel=linux-kernel-v1-${KERNEL_VERSION}-${KERNEL_INPUT_HASH}"
-          echo "kernel-debug=linux-kernel-debug-v1-${KERNEL_VERSION}-${DEBUG_KERNEL_INPUT_HASH}"
-          echo "alpine=alpine-image-v1-${ALPINE_VERSION}-${ALPINE_INPUT_HASH}"
-          echo "ubuntu=ubuntu-initramfs-v1-${UBUNTU_VERSION}-${UBUNTU_INPUT_HASH}"
-          echo "ubuntu-distro=ubuntu-distro-v1-${UBUNTU_VERSION}-${UBUNTU_INPUT_HASH}"
-          echo "azurelinux=azurelinux-initramfs-v1-${AZURELINUX_VERSION}-${AZURELINUX_INPUT_HASH}"
+          echo "kernel=linux-kernel-v1-${KERNEL_VERSION}-${KERNEL_INPUT_HASH}-${patch_identity}"
+          echo "kernel-debug=linux-kernel-debug-v1-${KERNEL_VERSION}-${DEBUG_KERNEL_INPUT_HASH}-${patch_identity}"
+          echo "alpine=alpine-image-v2-${ALPINE_VERSION}-${ALPINE_INPUT_HASH}-${rust_source_identity}"
+          echo "ubuntu=ubuntu-initramfs-v2-${UBUNTU_VERSION}-${UBUNTU_INPUT_HASH}-${rust_source_identity}"
+          echo "ubuntu-distro=ubuntu-distro-v3-${UBUNTU_VERSION}-${UBUNTU_INPUT_HASH}-${rust_source_identity}"
+          echo "azurelinux=azurelinux-initramfs-v2-${AZURELINUX_VERSION}-${AZURELINUX_INPUT_HASH}-${rust_source_identity}"
         } >> "${GITHUB_OUTPUT}"
 
     - name: Restore Linux kernel (zstd)
       id: cache-linux-kernel-zstd
-      if: inputs.guest-images == 'true'
+      if: steps.components.outputs.kernel == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -101,7 +171,7 @@ runs:
 
     - name: Restore Alpine disk image (zstd)
       id: cache-alpine-image-zstd
-      if: inputs.guest-images == 'true'
+      if: steps.components.outputs.alpine == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -113,31 +183,30 @@ runs:
 
     - name: Restore Ubuntu initramfs (zstd)
       id: cache-ubuntu-initramfs-zstd
-      if: inputs.guest-images == 'true'
+      if: steps.components.outputs.ubuntu == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
           build/initramfs-ubuntu.cpio.gz
           build/initramfs-ubuntu.cpio.gz.packages.json
-          build/initramfs-ubuntu-stage.cpio.gz
-          build/initramfs-ubuntu-stage.cpio.gz.manifest.json
         key: ${{ steps.guest-cache-keys.outputs.ubuntu }}
         enableCrossOsArchive: true
 
     - name: Restore Ubuntu distro layer (zstd)
       id: cache-ubuntu-distro-zstd
-      if: inputs.guest-images == 'true'
+      if: steps.components.outputs.ubuntu == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
           build/ubuntu-distro.erofs
           build/ubuntu-distro.erofs.manifest.json
+          build/ubuntu-smoke-scratch.ext4
         key: ${{ steps.guest-cache-keys.outputs.ubuntu-distro }}
         enableCrossOsArchive: true
 
     - name: Restore Azure Linux initramfs (zstd)
       id: cache-azurelinux-initramfs-zstd
-      if: inputs.guest-images == 'true'
+      if: steps.components.outputs.azurelinux == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -146,11 +215,41 @@ runs:
         key: ${{ steps.guest-cache-keys.outputs.azurelinux }}
         enableCrossOsArchive: true
 
+    # Neither a push nor a merge group can restore the caches that its pull
+    # request's runs saved, so each installs the selected components, when one
+    # missed the cache, from the artifacts of the latest run for the merged
+    # head, from this repository and never a fork, when that run recorded
+    # these keys and the files match the record, their provenance, and this
+    # checkout. Any other outcome builds them below, and a push's saves cache
+    # what it installed.
+    - name: Reuse the merged pull request's guest artifacts
+      id: reuse
+      if: >-
+        inputs.restore-only != 'true' &&
+        inputs.reuse == 'true' &&
+        inputs.record-artifact != ''
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        COMPONENTS: ${{ inputs.components }}
+        GUEST_CACHE_KEYS: ${{ toJSON(steps.guest-cache-keys.outputs) }}
+        RECORD_ARTIFACT: ${{ inputs.record-artifact }}
+      run: >-
+        python3 scripts/nvx.py reuse-guest-artifacts
+        --repository "${GITHUB_REPOSITORY}"
+        --workflow-ref "${GITHUB_WORKFLOW_REF}"
+        --commit "${GITHUB_SHA}"
+        --components "${COMPONENTS}"
+        --record-artifact "${RECORD_ARTIFACT}"
+        --keys "${GUEST_CACHE_KEYS}"
+
     - name: Build Linux kernel (Docker)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
-        steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
+        steps.components.outputs.kernel == 'true' &&
+        steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -162,7 +261,8 @@ runs:
     - name: Save Linux kernel (zstd)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
+        inputs.save-cache == 'true' &&
+        steps.components.outputs.kernel == 'true' &&
         steps.cache-linux-kernel-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
@@ -175,7 +275,7 @@ runs:
 
     - name: Restore Linux debug kernel (zstd)
       id: cache-linux-debug-kernel-zstd
-      if: inputs.debug-kernel == 'true'
+      if: steps.components.outputs.debug-kernel == 'true'
       uses: actions/cache/restore@v5
       with:
         path: |
@@ -188,7 +288,7 @@ runs:
     - name: Build Linux debug kernel (Docker)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.debug-kernel == 'true' &&
+        steps.components.outputs.debug-kernel == 'true' &&
         steps.cache-linux-debug-kernel-zstd.outputs.cache-hit != 'true'
       shell: bash
       run: >-
@@ -201,7 +301,8 @@ runs:
     - name: Save Linux debug kernel (zstd)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.debug-kernel == 'true' &&
+        inputs.save-cache == 'true' &&
+        steps.components.outputs.debug-kernel == 'true' &&
         steps.cache-linux-debug-kernel-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
@@ -215,8 +316,9 @@ runs:
     - name: Build Alpine disk image (Docker)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
-        steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
+        steps.components.outputs.alpine == 'true' &&
+        steps.cache-alpine-image-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -228,7 +330,8 @@ runs:
     - name: Save Alpine disk image (zstd)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
+        inputs.save-cache == 'true' &&
+        steps.components.outputs.alpine == 'true' &&
         steps.cache-alpine-image-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
@@ -242,8 +345,9 @@ runs:
     - name: Build Ubuntu initramfs (Docker)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
-        steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
+        steps.components.outputs.ubuntu == 'true' &&
+        steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -252,11 +356,14 @@ runs:
         --output type=local,dest=build
         .
 
+    # A reused image passed this check in the run that built it, as a cached
+    # one did.
     - name: Verify Ubuntu artifact determinism (Docker)
       if: >-
         inputs.restore-only != 'true' &&
         (
-          inputs.guest-images == 'true' &&
+          steps.components.outputs.ubuntu == 'true' &&
+          steps.reuse.outputs.reused != 'true' &&
           (
             steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true' ||
             steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
@@ -272,23 +379,23 @@ runs:
     - name: Save Ubuntu initramfs (zstd)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
+        inputs.save-cache == 'true' &&
+        steps.components.outputs.ubuntu == 'true' &&
         steps.cache-ubuntu-initramfs-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
         path: |
           build/initramfs-ubuntu.cpio.gz
           build/initramfs-ubuntu.cpio.gz.packages.json
-          build/initramfs-ubuntu-stage.cpio.gz
-          build/initramfs-ubuntu-stage.cpio.gz.manifest.json
         key: ${{ steps.guest-cache-keys.outputs.ubuntu }}
         enableCrossOsArchive: true
 
     - name: Build Azure Linux initramfs (Docker)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
-        steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
+        steps.components.outputs.azurelinux == 'true' &&
+        steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       env:
         AZURELINUX_IMAGE: ${{ steps.guest-versions.outputs.azurelinux-image }}
@@ -305,7 +412,8 @@ runs:
     - name: Save Azure Linux initramfs (zstd)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
+        inputs.save-cache == 'true' &&
+        steps.components.outputs.azurelinux == 'true' &&
         steps.cache-azurelinux-initramfs-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
@@ -315,11 +423,14 @@ runs:
         key: ${{ steps.guest-cache-keys.outputs.azurelinux }}
         enableCrossOsArchive: true
 
+    # The distro layer target also formats the sandbox scratch template, in the
+    # pinned image, so the template is cached and recorded with the layer.
     - name: Build Ubuntu distro layer (Docker)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
-        steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
+        steps.components.outputs.ubuntu == 'true' &&
+        steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true' &&
+        steps.reuse.outputs.reused != 'true'
       shell: bash
       run: >-
         docker build
@@ -331,25 +442,37 @@ runs:
     - name: Save Ubuntu distro layer (zstd)
       if: >-
         inputs.restore-only != 'true' &&
-        inputs.guest-images == 'true' &&
+        inputs.save-cache == 'true' &&
+        steps.components.outputs.ubuntu == 'true' &&
         steps.cache-ubuntu-distro-zstd.outputs.cache-hit != 'true'
       uses: actions/cache/save@v5
       with:
         path: |
           build/ubuntu-distro.erofs
           build/ubuntu-distro.erofs.manifest.json
+          build/ubuntu-smoke-scratch.ext4
         key: ${{ steps.guest-cache-keys.outputs.ubuntu-distro }}
         enableCrossOsArchive: true
 
-    - name: Prepare Ubuntu sandbox scratch template
-      if: inputs.guest-images == 'true'
+    # Uploaded beside the components' own artifacts, so that the merge group
+    # and the dev push that merge this run's pull request can check them before
+    # they reuse them.
+    - name: Record guest artifact keys and digests
+      if: inputs.restore-only != 'true' && inputs.record-artifact != ''
       shell: bash
-      run: |
-        set -euo pipefail
-        mkdir -p build
-        rm -f build/ubuntu-smoke-scratch.ext4
-        truncate --size 64M build/ubuntu-smoke-scratch.ext4
-        mkfs.ext4 -q -F -m 0 \
-          -U 4f3c8bf7-1959-47b4-8811-62b17bbddaf4 \
-          -E lazy_itable_init=0,lazy_journal_init=0 \
-          build/ubuntu-smoke-scratch.ext4
+      env:
+        COMPONENTS: ${{ inputs.components }}
+        GUEST_CACHE_KEYS: ${{ toJSON(steps.guest-cache-keys.outputs) }}
+      run: >-
+        python3 scripts/nvx.py record-guest-artifacts
+        --components "${COMPONENTS}"
+        --keys "${GUEST_CACHE_KEYS}"
+
+    - name: Upload guest artifact record
+      if: inputs.restore-only != 'true' && inputs.record-artifact != ''
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.record-artifact }}
+        path: build/guest-artifacts.json
+        if-no-files-found: error
+        retention-days: 1

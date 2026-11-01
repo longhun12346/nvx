@@ -1,6 +1,14 @@
 name: Check quality
 description: Run NVX linting, typing, and formatting checks
 
+inputs:
+  save-cache:
+    description: >-
+      Cache the pip downloads; setup-python saves the cache whenever it
+      misses, so "false" neither restores nor saves it
+    required: false
+    default: "true"
+
 runs:
   using: composite
   steps:
@@ -8,7 +16,7 @@ runs:
       uses: actions/setup-python@v6
       with:
         python-version: "3.10"
-        cache: pip
+        cache: ${{ inputs.save-cache == 'true' && 'pip' || '' }}
         cache-dependency-path: requirements-dev.txt
 
     - name: Install development tools
@@ -40,9 +48,9 @@ runs:
           guest/common/nvx-container-launch-azurelinux \
           guest/common/nvx-sandbox-smoke guest/common/nvx-snapshot \
           guest/common/nvx-virtio-restore-probe \
-          scripts/setup/setup-linux-mshv.sh \
-          scripts/setup/setup-linux-runner.sh
+          scripts/setup/setup-linux.sh
         ${SHELLCHECK} --shell=bash \
+          .github/actions/run-benchmark/forward-signals.sh \
           .github/specula/setup-runner.sh guest/ubuntu/nvx-bashrc
         python -m pyright --pythonplatform Linux
         python -m pyright --pythonplatform Windows
@@ -56,10 +64,14 @@ runs:
           guest/common/nvx-container-launch-azurelinux \
           guest/common/nvx-sandbox-smoke guest/common/nvx-snapshot \
           guest/common/nvx-virtio-restore-probe \
-          scripts/setup/setup-linux-mshv.sh \
-          scripts/setup/setup-linux-runner.sh
+          scripts/setup/setup-linux.sh
         ${SHFMT} -d -ln bash -i 4 -ci \
+          .github/actions/run-benchmark/forward-signals.sh \
           .github/specula/setup-runner.sh guest/ubuntu/nvx-bashrc
+
+    - name: Check Markdown links
+      shell: bash
+      run: python scripts/check_markdown_links.py
 
     - name: Test Specula CI wiring
       shell: bash
@@ -71,14 +83,23 @@ runs:
       run: |
         $tokens = $null
         $errors = $null
-        [void][System.Management.Automation.Language.Parser]::ParseFile(
-          (Resolve-Path "scripts/setup/setup-windows-whp.ps1"),
-          [ref]$tokens,
-          [ref]$errors
-        )
-        foreach ($error in $errors) {
-          Write-Error $error -ErrorAction Continue
-        }
-        if ($errors.Count -ne 0) {
-          exit 1
+        foreach ($path in @(
+          "scripts/setup/setup-windows-whp.ps1",
+          "scripts/setup/azure/windows/firewall.ps1",
+          "scripts/setup/azure/windows/openssh.ps1",
+          "scripts/setup/azure/windows/storage.ps1",
+          "scripts/setup/azure/windows/system.ps1",
+          "scripts/setup/azure/windows/vmss-bootstrap.ps1"
+        )) {
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path $path), [ref]$tokens, [ref]$errors
+          )
+          foreach ($error in $errors) {
+            Write-Error "$path : $error" -ErrorAction Continue
+          }
+          if ($errors.Count -ne 0) {
+            exit 1
+          }
         }

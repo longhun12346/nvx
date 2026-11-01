@@ -1,24 +1,15 @@
-//! Tests of the control protocol, including golden byte fixtures.
+//! Tests of the control protocol, including its conformance vectors.
 //!
-//! The fixtures are literal bytes, produced with Python's struct module using the formats of
-//! `scripts/nvx_tools/control_session.py` and the guest agent: `"<4sHBB16sQQI"` for outer
-//! headers, `"<4sBBHQiI"` for application frames, `"<IHH"` and `"<IHHHHI"` for `EXEC` payloads,
-//! `"<II"` and `"<HHH"` for `MAPS` payloads, and `"<I"` for features. The host's encoders and the
-//! decoders that the fake OpenVMM shares with it must both match them, so a change to the codec
-//! that both sides would agree on still fails here.
+//! `tests/vectors/nvxc-v1.txt` holds the bytes of the records, frames, and payloads that these
+//! tests pin, which come from the protocol's definition rather than from this codec. The host's
+//! encoders, and the decoders that the guest agent and the fake OpenVMM share with it, must all
+//! match them, so a change to the codec that every side would agree on still fails here.
 
+use proptest::prelude::*;
+
+use super::nvxs::{RecordParser, RecordType, encode_record};
 use super::*;
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn bytes(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
-        .collect()
-}
+use crate::tests::{NVXC_V1, Values, of_kind, vector, vectors};
 
 /// A workload that runs `argv` without a timeout in `/` with the default environment.
 fn program<'a>(argv: &[&str]) -> Workload<'a> {
@@ -27,7 +18,6 @@ fn program<'a>(argv: &[&str]) -> Workload<'a> {
         timeout_ms: 0,
         cwd: None,
         environment: WorkloadEnvironment::Default,
-        limits: ExecLimits::default(),
     }
 }
 
@@ -35,360 +25,270 @@ fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
 
-#[test]
-fn host_attach_matches_the_python_client() {
-    let capability: Vec<u8> = (1..=32).collect();
-    let record = encode_outer(OUTER_HOST_ATTACH, &[0; 16], 0, 0, &capability).unwrap();
-    assert_eq!(
-        hex(&record),
-        concat!(
-            "4e56585301000200",
-            "00000000000000000000000000000000",
-            "0000000000000000",
-            "0000000000000000",
-            "20000000",
-            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
-        )
-    );
+/// Returns the NVXS record type that a vector names, as [`RecordType::name`] spells it.
+fn record_type(name: &str) -> RecordType {
+    (u8::MIN..=u8::MAX)
+        .filter_map(RecordType::from_code)
+        .find(|record_type| record_type.name() == name)
+        .unwrap_or_else(|| panic!("no record type is named {name}"))
 }
 
-#[test]
-fn data_record_matches_the_python_client() {
-    let instance: [u8; 16] = array(&(0x10..0x20).collect::<Vec<u8>>());
-    let frame = encode_app(APP_PING, 0x0102_0304_0506_0708, 0, &[]);
-    assert_eq!(
-        hex(&frame),
-        "4e5658430101000008070605040302010000000000000000"
-    );
-    let record = encode_outer(OUTER_DATA, &instance, 3, 7, &frame).unwrap();
-    assert_eq!(
-        hex(&record[..OUTER_HEADER_LEN]),
-        concat!(
-            "4e56585301000500101112131415161718191a1b1c1d1e1f",
-            "0300000000000000",
-            "0700000000000000",
-            "18000000",
-        )
-    );
-    let header = decode_outer_header(&array(&record[..OUTER_HEADER_LEN])).unwrap();
-    assert_eq!(
-        header,
-        OuterHeader {
-            record_type: OUTER_DATA,
-            instance_id: instance,
-            epoch: 3,
-            sequence: 7,
-            length: APP_HEADER_LEN,
-        }
-    );
-}
-
-#[test]
-fn exec_payload_matches_the_python_client() {
-    let workload = Workload {
-        timeout_ms: 5000,
-        ..program(&["/bin/sh", "-c", "echo hi"])
-    };
-    let payload = encode_exec_payload(&workload).unwrap();
-    assert_eq!(
-        hex(&payload),
-        concat!(
-            "8813000003000000",
-            "070000002f62696e2f7368",
-            "020000002d63",
-            "070000006563686f206869",
-        )
-    );
-}
-
-// Golden vector produced with Python's struct module: "<II", then "<HHH" before each entry.
-#[test]
-fn maps_payload_lists_each_entry_after_its_position() {
-    let payloads = encode_maps_payloads(
-        &[map("0", "/w", false), map("1/a b", "/t/x", true)],
-        OUTER_MAX_PAYLOAD - APP_HEADER_LEN,
-    )
-    .unwrap();
-    assert_eq!(payloads.len(), 1);
-    assert_eq!(
-        hex(&payloads[0]),
-        concat!(
-            "0000000002000000",
-            "000001000200",
-            "30",
-            "2f77",
-            "010005000400",
-            "312f612062",
-            "2f742f78",
-        )
-    );
-}
-
-#[test]
-fn golden_outer_headers_decode_as_the_broker_sends_them() {
-    let ready = bytes(concat!(
-        "4e56585301000700",
-        "07070707070707070707070707070707",
-        "0400000000000000",
-        "0900000000000000",
-        "00000000",
-    ));
-    let expected = OuterHeader {
-        record_type: OUTER_READY,
-        instance_id: [7; 16],
-        epoch: 4,
-        sequence: 9,
-        length: 0,
-    };
-    assert_eq!(decode_outer_header(&array(&ready)).unwrap(), expected);
-    assert_eq!(
-        encode_outer(OUTER_READY, &[7; 16], 4, 9, &[]).unwrap(),
-        ready
-    );
-    // The broker's other records differ only in their type byte.
-    for (record_type, byte) in [
-        (OUTER_HOST_ATTACH, "02"),
-        (OUTER_RESET, "03"),
-        (OUTER_DATA, "05"),
-        (OUTER_WAIT, "06"),
-        (OUTER_READY, "07"),
-        (OUTER_ERROR, "08"),
-    ] {
-        let mut header = ready.clone();
-        header[6] = bytes(byte)[0];
-        assert_eq!(
-            decode_outer_header(&array(&header)).unwrap().record_type,
-            record_type
-        );
+/// Returns the frame kind that a vector names.
+fn frame_kind(name: &str) -> u8 {
+    match name {
+        "PING" => APP_PING,
+        "EXEC" => APP_EXEC,
+        "STOP" => APP_STOP,
+        "CANCEL" => APP_CANCEL,
+        "FEATURES" => APP_FEATURES,
+        "MAPS" => APP_MAPS,
+        "READY" => APP_READY,
+        "STDOUT" => APP_STDOUT,
+        "STDERR" => APP_STDERR,
+        "EXIT" => APP_EXIT,
+        "STOPPED" => APP_STOPPED,
+        "ERROR" => APP_ERROR,
+        _ => panic!("no frame kind is named {name}"),
     }
 }
 
+/// Returns the bytes of a vector's text as the host's text, which is UTF-8.
+fn utf8(bytes: &[u8]) -> String {
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// Each `RECORD` vector decodes, with the outer codec and with the NVXS record parser, to its
+/// values, which both encode to its bytes.
 #[test]
-fn golden_application_frames_round_trip() {
-    let fixtures: [(&str, u8, u64, i32, &[u8]); 4] = [
-        (
-            "4e5658430101000008070605040302010000000000000000",
-            APP_PING,
-            0x0102_0304_0506_0708,
-            0,
-            b"",
-        ),
-        (
-            "4e565843018200000900000000000000000000000300000068690a",
-            APP_STDOUT,
-            9,
-            0,
-            b"hi\n",
-        ),
-        (
-            "4e565843018400000900000000000000030000000400000065786974",
-            APP_EXIT,
-            9,
-            3,
-            b"exit",
-        ),
-        (
-            "4e56584301ff00000900000000000000020000000a0000006377642d6661696c6564",
-            APP_ERROR,
-            9,
-            2,
-            CWD_FAILED.as_bytes(),
-        ),
-    ];
-    for (fixture, kind, request_id, status, payload) in fixtures {
-        let frame = bytes(fixture);
+fn records_match_their_vectors() {
+    let names = ["HOST_ATTACH", "DATA_PING", "READY", "ACK", "CREDIT"];
+    for vector in of_kind(NVXC_V1, "RECORD", &names) {
+        let name = vector.name;
+        let mut values = vector.values();
+        let record_type = record_type(values.word());
+        let instance_id: [u8; 16] = array(&values.bytes());
+        let epoch: u64 = values.number();
+        let sequence: u64 = values.number();
+        let payload = values.bytes();
+        drop(values);
+        let code = record_type.code();
+        let encoded = encode_outer(code, &instance_id, epoch, sequence, &payload).unwrap();
+        assert_eq!(encoded, vector.bytes, "{name}");
+        let header = OuterHeader {
+            record_type: code,
+            instance_id,
+            epoch,
+            sequence,
+            length: payload.len(),
+        };
+        let decoded = decode_outer_header(&array(&vector.bytes[..OUTER_HEADER_LEN])).unwrap();
+        assert_eq!(decoded, header, "{name}");
+        let mut encoded = Vec::new();
+        encode_record(
+            record_type,
+            &instance_id,
+            epoch,
+            sequence,
+            &payload,
+            &mut encoded,
+        )
+        .unwrap();
+        assert_eq!(encoded, vector.bytes, "{name}");
+        let (consumed, record) = RecordParser::new().push(&vector.bytes).unwrap();
+        let record = record.unwrap();
+        assert_eq!(consumed, vector.bytes.len(), "{name}");
         assert_eq!(
-            hex(&encode_app(kind, request_id, status, payload)),
-            fixture,
-            "{kind:#x}"
+            (
+                record.record_type(),
+                record.instance_id(),
+                record.epoch(),
+                record.sequence()
+            ),
+            (record_type, instance_id, epoch, sequence),
+            "{name}"
         );
-        assert_eq!(
-            decode_app(&frame).unwrap(),
-            AppFrame {
-                kind,
-                request_id,
-                status,
-                payload,
+        assert_eq!(record.payload(), payload, "{name}");
+        // So do the codecs of the payloads of acknowledgements and credits.
+        match record_type {
+            RecordType::Ack => {
+                let window = decode_ack_payload(&payload).unwrap();
+                assert_eq!(encode_ack_payload(window).unwrap()[..], payload, "{name}");
             }
-        );
+            RecordType::Credit => {
+                let credit = decode_credit_payload(&payload).unwrap();
+                assert_eq!(
+                    encode_credit_payload(credit).unwrap()[..],
+                    payload,
+                    "{name}"
+                );
+            }
+            _ => {}
+        }
+    }
+    // The DATA record carries the PING frame.
+    let data = vector(NVXC_V1, "RECORD", "DATA_PING");
+    assert_eq!(
+        data.bytes[OUTER_HEADER_LEN..],
+        vector(NVXC_V1, "FRAME", "PING").bytes
+    );
+}
+
+/// Each `FRAME` vector decodes to its values, which encode to its bytes.
+#[test]
+fn frames_match_their_vectors() {
+    let names = ["PING", "STDOUT", "EXIT", "ERROR_CWD_FAILED"];
+    for vector in of_kind(NVXC_V1, "FRAME", &names) {
+        let name = vector.name;
+        let mut values = vector.values();
+        let kind = frame_kind(values.word());
+        let request_id: u64 = values.number();
+        let status: i32 = values.number();
+        let payload = values.bytes();
+        drop(values);
+        let encoded = encode_app(kind, request_id, status, &payload);
+        assert_eq!(encoded, vector.bytes, "{name}");
+        let frame = AppFrame {
+            kind,
+            request_id,
+            status,
+            payload: &payload,
+        };
+        assert_eq!(decode_app(&vector.bytes).unwrap(), frame, "{name}");
     }
 }
 
-/// `EXEC` payloads in their wire form, the workload that the host encodes into each, and the
-/// payload that the guest agent decodes from each.
+/// Each `EXEC` vector decodes, with the host's and with the guest's decoder, to its values, which
+/// the host encodes to its bytes. Without an explicit environment, the host's
+/// `inherit_default_env` is true, and the guest's, which follows the layering flag alone, false
+/// (microsoft/nvx#581).
 #[test]
-fn golden_exec_payloads_round_trip() {
-    let environment = strings(&["FOO=a b", "EMPTY="]);
-    let fixtures: [(&str, Workload<'_>, ExecPayload); 6] = [
-        (
-            concat!(
-                "8813000003000000",
-                "070000002f62696e2f7368",
-                "020000002d63",
-                "070000006563686f206869",
-            ),
-            Workload {
-                timeout_ms: 5000,
-                ..program(&["/bin/sh", "-c", "echo hi"])
-            },
-            ExecPayload {
-                timeout_ms: 5000,
-                argv: strings(&["/bin/sh", "-c", "echo hi"]),
-                cwd: None,
-                environment: None,
-                inherit_default_env: true,
-                limits: ExecLimits::default(),
-            },
-        ),
-        (
-            concat!("ffffffff01000000", "090000002f62696e2f74727565"),
-            Workload {
-                timeout_ms: MAX_TIMEOUT_MS,
-                ..program(&["/bin/true"])
-            },
-            ExecPayload {
-                timeout_ms: MAX_TIMEOUT_MS,
-                argv: strings(&["/bin/true"]),
-                cwd: None,
-                environment: None,
-                inherit_default_env: true,
-                limits: ExecLimits::default(),
-            },
-        ),
-        (
-            concat!(
-                "0000000001000100",
-                "0100000004000000",
-                "080000002f62696e2f707764",
-                "2f746d70",
-            ),
-            Workload {
-                cwd: Some("/tmp"),
-                ..program(&["/bin/pwd"])
-            },
-            ExecPayload {
-                timeout_ms: 0,
-                argv: strings(&["/bin/pwd"]),
-                cwd: Some("/tmp".to_owned()),
-                environment: None,
-                inherit_default_env: true,
-                limits: ExecLimits::default(),
-            },
-        ),
-        (
-            concat!(
-                "0000000001000100",
-                "0700020004000000",
-                "080000002f62696e2f656e76",
-                "2f746d70",
-                "07000000464f4f3d612062",
-                "06000000454d5054593d",
-            ),
-            Workload {
-                cwd: Some("/tmp"),
-                environment: WorkloadEnvironment::Layered(&environment),
-                ..program(&["/bin/env"])
-            },
-            ExecPayload {
-                timeout_ms: 0,
-                argv: strings(&["/bin/env"]),
-                cwd: Some("/tmp".to_owned()),
-                environment: Some(environment.clone()),
-                inherit_default_env: true,
-                limits: ExecLimits::default(),
-            },
-        ),
-        (
-            concat!(
-                "0000000001000100",
-                "0200020000000000",
-                "080000002f62696e2f656e76",
-                "07000000464f4f3d612062",
-                "06000000454d5054593d",
-            ),
-            Workload {
-                environment: WorkloadEnvironment::Replaced(&environment),
-                ..program(&["/bin/env"])
-            },
-            ExecPayload {
-                timeout_ms: 0,
-                argv: strings(&["/bin/env"]),
-                cwd: None,
-                environment: Some(environment.clone()),
-                inherit_default_env: false,
-                limits: ExecLimits::default(),
-            },
-        ),
-        (
-            concat!(
-                "0000000001000100",
-                "0200000000000000",
-                "080000002f62696e2f656e76",
-            ),
-            Workload {
-                environment: WorkloadEnvironment::Replaced(&[]),
-                ..program(&["/bin/env"])
-            },
-            ExecPayload {
-                timeout_ms: 0,
-                argv: strings(&["/bin/env"]),
-                cwd: None,
-                environment: Some(Vec::new()),
-                inherit_default_env: false,
-                limits: ExecLimits::default(),
-            },
-        ),
+fn exec_payloads_match_their_vectors() {
+    let names = [
+        "SHELL",
+        "LONGEST_TIMEOUT",
+        "DIRECTORY",
+        "LAYERED_ENVIRONMENT",
+        "REPLACED_ENVIRONMENT",
+        "EMPTY_ENVIRONMENT",
     ];
-    for (fixture, workload, decoded) in fixtures {
-        assert_eq!(
-            hex(&encode_exec_payload(&workload).unwrap()),
-            fixture,
-            "{workload:?}"
-        );
-        assert_eq!(decode_exec_payload(&bytes(fixture)).unwrap(), decoded);
+    for vector in of_kind(NVXC_V1, "EXEC", &names) {
+        let name = vector.name;
+        let mut values = vector.values();
+        let timeout_ms: u32 = values.number();
+        let argv = values.list(Values::text);
+        let cwd = values.optional(Values::text);
+        let mode = values.word();
+        let environment = match mode {
+            "DEFAULT" => None,
+            "LAYERED" | "REPLACED" => Some(values.list(Values::text)),
+            _ => panic!("{name} names the unknown environment {mode}"),
+        };
+        drop(values);
+        let host_argv: Vec<_> = argv.iter().map(|argument| utf8(argument)).collect();
+        let host_cwd = cwd.as_deref().map(utf8);
+        let host_environment: Option<Vec<_>> = environment
+            .as_ref()
+            .map(|entries| entries.iter().map(|entry| utf8(entry)).collect());
+        let workload = Workload {
+            argv: host_argv.clone(),
+            timeout_ms,
+            cwd: host_cwd.as_deref(),
+            environment: match (mode, &host_environment) {
+                ("LAYERED", Some(entries)) => WorkloadEnvironment::Layered(entries),
+                ("REPLACED", Some(entries)) => WorkloadEnvironment::Replaced(entries),
+                _ => WorkloadEnvironment::Default,
+            },
+        };
+        let encoded = encode_exec_payload(&workload).unwrap();
+        assert_eq!(encoded, vector.bytes, "{name}");
+        let host = ExecPayload {
+            timeout_ms,
+            argv: host_argv,
+            cwd: host_cwd.clone(),
+            environment: host_environment.clone(),
+            inherit_default_env: mode != "REPLACED",
+        };
+        assert_eq!(decode_exec_payload(&vector.bytes).unwrap(), host, "{name}");
+        let guest = GuestExecPayload {
+            timeout_ms,
+            argv,
+            cwd,
+            environment,
+            inherit_default_env: mode == "LAYERED",
+        };
+        let decoded = decode_guest_exec_payload(&vector.bytes).unwrap();
+        assert_eq!(decoded, guest, "{name}");
+    }
+}
+
+/// Each `MAPS` vector decodes, with the host's and with the guest's decoder, to its values, and the
+/// host encodes a mapping table that holds its entries to its bytes: the root of the export,
+/// which an empty source names, included.
+#[test]
+fn maps_payloads_match_their_vectors() {
+    let names = ["ONE_ENTRY", "TWO_ENTRIES", "CONTINUED", "ROOT_SOURCE"];
+    for vector in of_kind(NVXC_V1, "MAPS", &names) {
+        let name = vector.name;
+        let mut values = vector.values();
+        let first: u32 = values.number();
+        let entries = values.list(|values| {
+            let read_only = match values.word() {
+                "RO" => true,
+                "RW" => false,
+                access => panic!("{name} names the unknown access {access}"),
+            };
+            GuestHostMap {
+                source: values.text(),
+                target: values.text(),
+                read_only,
+            }
+        });
+        drop(values);
+        let maps: Vec<_> = entries
+            .iter()
+            .map(|entry| HostMap {
+                source: utf8(&entry.source),
+                target: utf8(&entry.target),
+                read_only: entry.read_only,
+            })
+            .collect();
+        // The host encodes a whole table, so the vector's entries follow `first` entries, each of
+        // which fills a payload of the vector's length alone.
+        let limit = vector.bytes.len();
+        let filler = "f".repeat(limit - MAPS_HEADER_LEN - MAP_ENTRY_HEADER_LEN - 2);
+        let filler = map("0", &format!("/{filler}"), false);
+        let table: Vec<_> = std::iter::repeat_n(filler, first as usize)
+            .chain(maps.iter().cloned())
+            .collect();
+        let payloads = encode_maps_payloads(&table, limit).unwrap();
+        assert_eq!(payloads.len(), first as usize + 1, "{name}");
+        assert_eq!(payloads.last(), Some(&vector.bytes), "{name}");
+        let host = MapsPayload { first, maps };
+        assert_eq!(decode_maps_payload(&vector.bytes).unwrap(), host, "{name}");
+        let guest = GuestMapsPayload {
+            first,
+            maps: entries,
+        };
+        let decoded = decode_guest_maps_payload(&vector.bytes).unwrap();
+        assert_eq!(decoded, guest, "{name}");
+    }
+}
+
+/// Each `FEATURES` vector decodes to its bits, which encode to its bytes.
+#[test]
+fn features_match_their_vectors() {
+    for vector in of_kind(NVXC_V1, "FEATURES", &["ALL"]) {
+        let mut values = vector.values();
+        let features = GuestFeatures::from_bits(values.number());
+        drop(values);
+        assert_eq!(features.encode()[..], vector.bytes, "{}", vector.name);
+        let decoded = GuestFeatures::decode(&vector.bytes).unwrap();
+        assert_eq!(decoded, features, "{}", vector.name);
     }
 }
 
 #[test]
-fn golden_maps_payload_round_trips() {
-    let fixture = concat!(
-        "0000000002000000",
-        "000001000200",
-        "30",
-        "2f77",
-        "010005000400",
-        "312f612062",
-        "2f742f78",
-    );
-    let maps = [map("0", "/w", false), map("1/a b", "/t/x", true)];
-    let payloads = encode_maps_payloads(&maps, OUTER_MAX_PAYLOAD - APP_HEADER_LEN).unwrap();
-    assert_eq!(payloads.len(), 1);
-    assert_eq!(hex(&payloads[0]), fixture);
-    assert_eq!(
-        decode_maps_payload(&bytes(fixture)).unwrap(),
-        MapsPayload {
-            first: 0,
-            maps: maps.to_vec(),
-        }
-    );
-    // A later request continues the table at its first entry's index.
-    let continued = concat!("0300000001000000", "000001000200", "35", "2f77");
-    assert_eq!(
-        decode_maps_payload(&bytes(continued)).unwrap(),
-        MapsPayload {
-            first: 3,
-            maps: vec![map("5", "/w", false)],
-        }
-    );
-}
-
-#[test]
-fn golden_features_payload_names_the_required_bits() {
-    assert_eq!(hex(&GuestFeatures::REQUIRED.encode()), "7d000000");
-    assert_eq!(
-        GuestFeatures::decode(&bytes("7d000000")).unwrap(),
-        GuestFeatures::REQUIRED
-    );
+fn the_host_requires_every_feature() {
     assert_eq!(
         GuestFeatures::CANCEL
             | GuestFeatures::WORKLOAD_ACCOUNT
@@ -397,6 +297,10 @@ fn golden_features_payload_names_the_required_bits() {
             | GuestFeatures::EXEC_CWD
             | GuestFeatures::HOST_MAPPING_TABLE,
         GuestFeatures::REQUIRED
+    );
+    assert_eq!(
+        GuestFeatures::REQUIRED.encode()[..],
+        vector(NVXC_V1, "FEATURES", "ALL").bytes
     );
 }
 
@@ -452,65 +356,6 @@ fn exec_payload_distinguishes_explicit_environments() {
     assert_eq!(&layered[8..10], &6u16.to_le_bytes());
     let default = encode_exec_payload(&program(&["/bin/env"])).unwrap();
     assert_eq!(&default[6..8], &[0, 0]);
-}
-
-/// A payload that carries per-execution limits uses the second extension, and the guest reads
-/// back the values the host wrote; a request outside the supported range is refused instead of
-/// being clipped.
-#[test]
-fn exec_limits_round_trip_and_are_bounded() {
-    let workload = |limits: ExecLimits| Workload {
-        limits,
-        ..program(&["/bin/true"])
-    };
-    let limits = ExecLimits {
-        mem_mb: 256,
-        cpu_percent: 50,
-        pids_max: 8,
-    };
-    let payload = encode_exec_payload(&workload(limits)).unwrap();
-    // The header announces the second extension, which is what a guest keys on.
-    assert_eq!(
-        u16::from_le_bytes([payload[6], payload[7]]),
-        EXEC_EXTENDED_V2,
-        "a payload with limits must use extension 2"
-    );
-    let decoded = decode_exec_payload(&payload).unwrap();
-    assert_eq!(decoded.limits, limits);
-    assert_eq!(decoded.argv, ["/bin/true"]);
-
-    // Without limits the payload stays what an older guest understands, and decodes to no limits.
-    let plain = encode_exec_payload(&workload(ExecLimits::default())).unwrap();
-    assert_ne!(
-        u16::from_le_bytes([plain[6], plain[7]]),
-        EXEC_EXTENDED_V2,
-        "a payload without limits must not claim the new extension"
-    );
-    assert_eq!(
-        decode_exec_payload(&plain).unwrap().limits,
-        ExecLimits::default()
-    );
-
-    // One field over its bound refuses the request: clipping a limit would be a silent promise.
-    for out_of_range in [
-        ExecLimits {
-            mem_mb: MAX_EXEC_MEMORY_MIB + 1,
-            ..limits
-        },
-        ExecLimits {
-            cpu_percent: MAX_EXEC_CPU_PERCENT + 1,
-            ..limits
-        },
-        ExecLimits {
-            pids_max: MAX_EXEC_PIDS + 1,
-            ..limits
-        },
-    ] {
-        assert!(
-            encode_exec_payload(&workload(out_of_range)).is_err(),
-            "an out-of-range limit must be refused: {out_of_range:?}"
-        );
-    }
 }
 
 #[test]
@@ -673,8 +518,6 @@ fn exit_categories_match_the_guest_agent() {
         ExitCategory::Timeout,
         ExitCategory::OutputLimit,
         ExitCategory::Signal,
-        ExitCategory::Oom,
-        ExitCategory::VmOom,
         ExitCategory::Failed,
         ExitCategory::Cancelled,
     ] {
@@ -836,7 +679,6 @@ fn maps_payloads_enforce_agent_limits() {
     let limit = OUTER_MAX_PAYLOAD - APP_HEADER_LEN;
     let too_long = format!("/{}", "t".repeat(MAX_MAP_PATH_BYTES));
     for invalid in [
-        map("", "/w", false),
         map("/0", "/w", false),
         map("0", "w", false),
         map("0", &too_long, false),
@@ -854,12 +696,22 @@ fn maps_payloads_enforce_agent_limits() {
         map("0", "/w/", false),
         map("0", "/tmp/../etc", false),
         map("0", "/w/./x", false),
+        // Only an empty source names the export's root, whose target is as any other's.
+        map("/", "/w", false),
+        map("", "", false),
+        map("", "w", false),
+        map("", "/", false),
+        map("", "/w/", false),
     ] {
         assert!(
             encode_maps_payloads(std::slice::from_ref(&invalid), limit).is_err(),
             "{invalid:?}"
         );
     }
+    // An empty source names the export's root itself.
+    let root = map("", "/data", true);
+    let payloads = encode_maps_payloads(std::slice::from_ref(&root), limit).unwrap();
+    assert_eq!(decode_maps_payload(&payloads[0]).unwrap().maps, [root]);
     // Names that merely start with dots are ordinary components.
     let dotted = map("0/.config", "/home/..data/...", false);
     let payloads = encode_maps_payloads(std::slice::from_ref(&dotted), limit).unwrap();
@@ -874,207 +726,762 @@ fn maps_payloads_enforce_agent_limits() {
     assert!(encode_maps_payloads(&[map("0", "/abcdefghijklmnop", true)], 20).is_err());
 }
 
+/// Both `MAPS` decoders refuse each `INVALID_MAPS` vector. The host's also refuses a source that
+/// is not UTF-8, which the guest's accepts.
 #[test]
-fn maps_decoding_refuses_what_the_guest_agent_refuses() {
-    let valid = bytes(concat!("0000000001000000", "000001000200", "30", "2f77"));
-    decode_maps_payload(&valid).unwrap();
-    let mut unknown_flag = valid.clone();
-    unknown_flag[8] = 2;
-    let mut relative_target = valid.clone();
-    relative_target[15] = b'w';
-    let mut nul_target = valid.clone();
-    nul_target[16] = 0;
-    let mut not_utf8 = valid.clone();
-    not_utf8[14] = 0xff;
-    let mut trailing = valid.clone();
-    trailing.push(0);
-    let mut dot_source = valid.clone();
-    dot_source[14] = b'.';
-    let mut nul_source = valid.clone();
-    nul_source[14] = 0;
-    let mut dot_target = valid.clone();
-    dot_target[16] = b'.';
-    for invalid in [
-        unknown_flag,
-        relative_target,
-        nul_target,
-        not_utf8,
-        trailing,
-        dot_source,
-        nul_source,
-        dot_target,
-        valid[..valid.len() - 1].to_vec(),
-        valid[..7].to_vec(),
-        // One more entry announced than the payload holds.
-        bytes(concat!("0000000002000000", "000001000200", "30", "2f77")),
-        // An empty source, the guest's root, a trailing slash, and a `..` component.
-        bytes(concat!("0000000001000000", "000000000200", "2f77")),
-        bytes(concat!("0000000001000000", "000001000100", "30", "2f")),
-        bytes(concat!("0000000001000000", "000001000300", "30", "2f772f")),
-        bytes(concat!(
-            "0000000001000000",
-            "000004000200",
-            "302f2e2e",
-            "2f77"
-        )),
-    ] {
-        assert!(decode_maps_payload(&invalid).is_err(), "{invalid:?}");
-    }
-}
-
-fn guest_agent_source() -> Option<String> {
-    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .join("guest")
-        .join("common")
-        .join("nvx-managed-agent.c");
-    std::fs::read_to_string(source).ok()
-}
-
-#[test]
-fn feature_definitions_match_the_guest_agent_source() {
-    let Some(source) = guest_agent_source() else {
-        return;
-    };
-    let mut definitions = vec![
-        format!("#define APP_FEATURES {APP_FEATURES}U"),
-        format!("#define APP_MAPS {APP_MAPS}U"),
+fn maps_decoders_refuse_the_invalid_vectors() {
+    let names = [
+        "TRUNCATED_HEADER",
+        "TRUNCATED_ENTRY",
+        "MISSING_ENTRY",
+        "TOO_MANY_ENTRIES",
+        "TRAILING_BYTE",
+        "UNKNOWN_FLAG",
+        "DOT_SOURCE",
+        "DOT_DOT_SOURCE",
+        "NUL_SOURCE",
+        "NOT_UTF8_THEN_TRUNCATED",
+        "RELATIVE_TARGET",
+        "ROOT_TARGET",
+        "TRAILING_SLASH",
+        "DOT_TARGET",
+        "NUL_TARGET",
     ];
-    for (name, feature) in [
-        ("CANCEL", GuestFeatures::CANCEL),
-        ("WORKLOAD_ACCOUNT", GuestFeatures::WORKLOAD_ACCOUNT),
-        ("EXEC_CGROUP", GuestFeatures::EXEC_CGROUP),
-        ("EXEC_ENVIRONMENT", GuestFeatures::EXEC_ENVIRONMENT),
-        ("EXEC_CWD", GuestFeatures::EXEC_CWD),
-        ("HOST_MAPPING_TABLE", GuestFeatures::HOST_MAPPING_TABLE),
-    ] {
-        let bit = feature.bits().trailing_zeros();
-        definitions.push(format!("#define FEATURE_{name} (1U << {bit})"));
+    for vector in of_kind(NVXC_V1, "INVALID_MAPS", &names) {
+        let name = vector.name;
+        assert!(decode_maps_payload(&vector.bytes).is_err(), "{name}");
+        assert!(decode_guest_maps_payload(&vector.bytes).is_err(), "{name}");
     }
-    for definition in definitions {
-        assert!(
-            source.contains(&definition),
-            "the guest agent does not define `{definition}`"
-        );
-    }
-    // The retired bit stays unused, so hosts that need it refuse the image.
-    assert!(!source.contains("(1U << 1)"));
+    let mut not_utf8 = vector(NVXC_V1, "MAPS", "ONE_ENTRY").bytes;
+    not_utf8[MAPS_HEADER_LEN + MAP_ENTRY_HEADER_LEN] = 0xff;
+    assert!(decode_maps_payload(&not_utf8).is_err());
+    assert!(decode_guest_maps_payload(&not_utf8).is_ok());
+}
+
+// Hosts and guests share the wire constants, so changing one passes every round trip between
+// them yet breaks compatibility with released peers. These tests pin each value literally.
+
+#[test]
+fn record_definitions_keep_their_wire_values() {
+    assert_eq!(OUTER_HEADER_LEN, 44);
+    assert_eq!(OUTER_MAX_PAYLOAD, 65_536);
+    assert_eq!(OUTER_VERSION, 1);
+    assert_eq!(OUTER_GUEST_ATTACH, 1);
+    assert_eq!(OUTER_RESET, 3);
+    assert_eq!(OUTER_ACK, 4);
+    assert_eq!(OUTER_DATA, 5);
+    assert_eq!(OUTER_CREDIT, 9);
+    assert_eq!(OUTER_RECEIVE_WINDOW, 1024 * 1024);
+    assert_eq!(APP_HEADER_LEN, 24);
+    assert_eq!(APP_VERSION, 1);
+    assert_eq!(APP_PING, 1);
+    assert_eq!(APP_EXEC, 2);
+    assert_eq!(APP_STOP, 3);
+    assert_eq!(APP_CANCEL, 4);
+    assert_eq!(APP_READY, 0x81);
+    assert_eq!(APP_STDOUT, 0x82);
+    assert_eq!(APP_STDERR, 0x83);
+    assert_eq!(APP_EXIT, 0x84);
+    assert_eq!(APP_STOPPED, 0x85);
+    assert_eq!(APP_ERROR, 0xff);
 }
 
 #[test]
-fn host_mapping_table_matches_the_guest_agent_source() {
-    let Some(source) = guest_agent_source() else {
-        return;
-    };
-    for expected in [
-        format!("#define MAX_HOST_MAPPINGS {MAX_HOST_MAPPINGS}U"),
-        format!("#define MAX_GUEST_PATH {}U", MAX_MAP_PATH_BYTES + 1),
-        format!("#define MAPS_HEADER_LEN {MAPS_HEADER_LEN}U"),
-        format!("#define MAP_ENTRY_HEADER_LEN {MAP_ENTRY_HEADER_LEN}U"),
-        format!("#define MAP_READ_ONLY {MAP_READ_ONLY}U"),
-        format!("#define MAPS_TOKEN \"{MAPS_TOKEN}\""),
-        format!("\"{MAPPINGS_INCOMPLETE}\""),
-        format!("\"{MAPPING_FAILED}\""),
-    ] {
-        assert!(
-            source.contains(&expected),
-            "the guest agent does not contain `{expected}`"
-        );
-    }
+fn feature_definitions_keep_their_wire_values() {
+    assert_eq!(APP_FEATURES, 5);
+    assert_eq!(APP_MAPS, 6);
+    assert_eq!(GuestFeatures::CANCEL.bits(), 0x01);
+    // Bit 1 is retired and stays unused, so hosts that still need it refuse the image.
+    assert_eq!(GuestFeatures::WORKLOAD_ACCOUNT.bits(), 0x04);
+    assert_eq!(GuestFeatures::EXEC_CGROUP.bits(), 0x08);
+    assert_eq!(GuestFeatures::EXEC_ENVIRONMENT.bits(), 0x10);
+    assert_eq!(GuestFeatures::EXEC_CWD.bits(), 0x20);
+    assert_eq!(GuestFeatures::HOST_MAPPING_TABLE.bits(), 0x40);
 }
 
 #[test]
-fn exec_extension_matches_the_guest_agent_source() {
-    // The agent accepts a working directory as long as one argument, more than any directory
-    // that a workload can enter.
+fn host_mapping_table_keeps_its_wire_values() {
+    assert_eq!(MAX_HOST_MAPPINGS, 4096);
+    assert_eq!(MAX_MAP_PATH_BYTES, 4095);
+    assert_eq!(MAPS_HEADER_LEN, 8);
+    assert_eq!(MAP_ENTRY_HEADER_LEN, 6);
+    assert_eq!(MAP_READ_ONLY, 1);
+    assert_eq!(MAPS_TOKEN, "nvx_maps=");
+    assert_eq!(MAPPINGS_INCOMPLETE, "mappings-incomplete");
+    assert_eq!(MAPPING_FAILED, "mapping-failed");
+}
+
+#[test]
+fn exec_extension_keeps_its_wire_values() {
+    assert_eq!(EXEC_EXTENDED, 1);
+    assert_eq!(EXEC_CWD_PRESENT, 1);
+    assert_eq!(EXEC_ENVIRONMENT_PRESENT, 2);
+    assert_eq!(EXEC_INHERIT_DEFAULT_ENV, 4);
+    assert_eq!(MAX_ARGUMENTS, 64);
+    assert_eq!(MAX_ARGUMENT_BYTES, 4096);
+    assert_eq!(MAX_ENVIRONMENT, 256);
+    assert_eq!(MAX_OUTPUT_BYTES, 1024 * 1024);
+    assert_eq!(CWD_FAILED, "cwd-failed");
+    assert_eq!(LAUNCH_FAILED, "launch-failed");
+    assert_eq!(INVALID_REQUEST, "invalid-request");
+    assert_eq!(BUSY, "busy");
+    assert_eq!(UNSUPPORTED_OPERATION, b"unsupported-operation");
+}
+
+#[test]
+fn exec_limits_support_linux_paths() {
+    // A working directory may be as long as one argument, and Linux cannot
+    // enter a directory longer than that argument limit.
     const { assert!(MAX_CWD_BYTES < MAX_ARGUMENT_BYTES) };
-    let Some(source) = guest_agent_source() else {
-        return;
-    };
-    for expected in [
-        format!("#define EXEC_EXTENDED {EXEC_EXTENDED}U"),
-        format!("#define EXEC_EXTENDED_V2 {EXEC_EXTENDED_V2}U"),
-        format!("#define EXEC_CWD_PRESENT {EXEC_CWD_PRESENT}U"),
-        format!("#define EXEC_ENVIRONMENT_PRESENT {EXEC_ENVIRONMENT_PRESENT}U"),
-        format!("#define EXEC_INHERIT_DEFAULT_ENV {EXEC_INHERIT_DEFAULT_ENV}U"),
-        // The guest refuses a limit outside these ranges, so a drift here would turn a valid
-        // request into a refused one (or the reverse) without either side noticing.
-        format!("#define MAX_EXEC_MEMORY_MIB {MAX_EXEC_MEMORY_MIB}U"),
-        format!("#define MAX_EXEC_CPU_PERCENT {MAX_EXEC_CPU_PERCENT}U"),
-        format!("#define MAX_EXEC_PIDS {MAX_EXEC_PIDS}U"),
-        format!("#define MAX_ARGUMENTS {MAX_ARGUMENTS}U"),
-        format!("#define MAX_ARGUMENT_LEN {MAX_ARGUMENT_BYTES}U"),
-        format!("#define MAX_ENVIRONMENT {MAX_ENVIRONMENT}U"),
-        format!(
-            "#define MAX_OUTPUT_BYTES ({}U * 1024U)",
-            MAX_OUTPUT_BYTES / 1024
-        ),
-        format!("\"{CWD_FAILED}\""),
-        format!("\"{LAUNCH_FAILED}\""),
-        format!("\"{INVALID_REQUEST}\""),
-        format!("\"{BUSY}\""),
-        format!("\"{}\"", String::from_utf8_lossy(UNSUPPORTED_OPERATION)),
+}
+
+#[test]
+fn guest_window_payloads_enforce_broker_bounds() {
+    for window in [
+        OUTER_MIN_RECEIVE_WINDOW,
+        OUTER_RECEIVE_WINDOW,
+        OUTER_MAX_RECEIVE_WINDOW,
+    ] {
+        let payload = encode_ack_payload(window).unwrap();
+        assert_eq!(decode_ack_payload(&payload).unwrap(), window);
+    }
+    for window in [
+        0,
+        OUTER_MIN_RECEIVE_WINDOW - 1,
+        OUTER_MAX_RECEIVE_WINDOW + 1,
+    ] {
+        assert!(encode_ack_payload(window).is_err(), "{window}");
+        assert!(
+            decode_ack_payload(&window.to_le_bytes()).is_err(),
+            "{window}"
+        );
+    }
+    for credit in [1, 24, OUTER_MAX_RECEIVE_WINDOW] {
+        let payload = encode_credit_payload(credit).unwrap();
+        assert_eq!(decode_credit_payload(&payload).unwrap(), credit);
+    }
+    for credit in [0, OUTER_MAX_RECEIVE_WINDOW + 1] {
+        assert!(encode_credit_payload(credit).is_err(), "{credit}");
+        assert!(
+            decode_credit_payload(&credit.to_le_bytes()).is_err(),
+            "{credit}"
+        );
+    }
+    assert!(decode_ack_payload(&[0; 3]).is_err());
+    assert!(decode_credit_payload(&[0; 5]).is_err());
+}
+
+#[test]
+fn host_mapping_count_matches_the_guest_command_line_parser() {
+    for (command_line, expected) in [
+        (&b""[..], 0),
+        (b"quiet nvx_map=0,/legacy,rw", 0),
+        (b"quiet\tnvx_maps=1\nlegacy", 1),
+        (b"nvx_maps=0001", 1),
+        (b"nvx_maps=4096", 4096),
+    ] {
+        assert_eq!(
+            parse_host_mapping_count(command_line).unwrap(),
+            expected,
+            "{:?}",
+            String::from_utf8_lossy(command_line)
+        );
+    }
+    for command_line in [
+        &b"nvx_maps="[..],
+        b"nvx_maps=0",
+        b"nvx_maps=4097",
+        b"nvx_maps=99999999999",
+        b"nvx_maps=1x",
+        b"nvx_maps=1 nvx_maps=1",
     ] {
         assert!(
-            source.contains(&expected),
-            "the guest agent does not contain `{expected}`"
+            parse_host_mapping_count(command_line).is_err(),
+            "{:?}",
+            String::from_utf8_lossy(command_line)
         );
     }
 }
 
 #[test]
-fn record_definitions_match_the_guest_agent_source() {
-    let Some(source) = guest_agent_source() else {
-        return;
-    };
-    for expected in [
-        format!("#define OUTER_HEADER_LEN {OUTER_HEADER_LEN}U"),
-        format!("#define OUTER_MAX_PAYLOAD {OUTER_MAX_PAYLOAD}U"),
-        format!("#define OUTER_VERSION {OUTER_VERSION}U"),
-        format!("#define OUTER_RESET {OUTER_RESET}U"),
-        format!("#define OUTER_DATA {OUTER_DATA}U"),
-        format!("#define APP_HEADER_LEN {APP_HEADER_LEN}U"),
-        format!("#define APP_VERSION {APP_VERSION}U"),
-        format!("#define APP_PING {APP_PING}U"),
-        format!("#define APP_EXEC {APP_EXEC}U"),
-        format!("#define APP_STOP {APP_STOP}U"),
-        format!("#define APP_CANCEL {APP_CANCEL}U"),
-        format!("#define APP_READY {APP_READY:#x}U"),
-        format!("#define APP_STDOUT {APP_STDOUT:#x}U"),
-        format!("#define APP_STDERR {APP_STDERR:#x}U"),
-        format!("#define APP_EXIT {APP_EXIT:#x}U"),
-        format!("#define APP_STOPPED {APP_STOPPED:#x}U"),
-        format!("#define APP_ERROR {APP_ERROR:#x}U"),
+fn host_mapping_count_splits_the_command_line_as_the_guest_init_does() {
+    // The init splits the command line at spaces, tabs, and newlines alone, without quoting and
+    // past a `--`, unlike the kernel, and the count's token is named `nvx_maps`, byte for byte,
+    // and has a value.
+    for (command_line, expected) in [
+        (&b"nvx_maps nvx_maps=2"[..], 2),
+        (b"quiet -- nvx_maps=2", 2),
+        (b"\"nvx_maps=2\"", 0),
+        (b"=nvx_maps=2", 0),
+        (b"nvx-maps=2", 0),
+        (b"quiet\rnvx_maps=2", 0),
+        (b"quiet\x0bnvx_maps=2", 0),
+        (b"quiet\xa0nvx_maps=2", 0),
     ] {
+        assert_eq!(
+            parse_host_mapping_count(command_line).unwrap(),
+            expected,
+            "{}",
+            command_line.escape_ascii()
+        );
+    }
+    // A byte at which the init does not split stays in the count.
+    for command_line in [&b"nvx_maps=2\r"[..], b"nvx_maps=2\xa0", b"nvx_maps=\"2\""] {
         assert!(
-            source.contains(&expected),
-            "the guest agent does not contain `{expected}`"
+            parse_host_mapping_count(command_line).is_err(),
+            "{}",
+            command_line.escape_ascii()
         );
     }
 }
 
 #[test]
-fn maps_continue_a_table_at_the_first_index() {
-    let maps = [HostMap {
-        source: "dyn0".to_owned(),
-        target: "/mnt/dyn0".to_owned(),
-        read_only: true,
-    }];
-    let payloads = encode_maps_payloads_from(3, &maps, 4096).unwrap();
-    assert_eq!(payloads.len(), 1);
-    let decoded = decode_maps_payload(&payloads[0]).unwrap();
-    assert_eq!(decoded.first, 3);
-    assert_eq!(decoded.maps, maps);
-    // The plain encoder still starts a table at entry 0.
-    let plain = encode_maps_payloads(&maps, 4096).unwrap();
-    assert_eq!(decode_maps_payload(&plain[0]).unwrap().first, 0);
-    // A runtime sequence number is not an index into the 4096-entry table, so it may pass the
-    // table's bound; it still has to fit the 32-bit field.
-    let late = encode_maps_payloads_from(MAX_HOST_MAPPINGS + 10, &maps, 4096).unwrap();
+fn both_agent_modes_announce_the_host_mapping_table() {
+    assert_eq!(GuestFeatures::DIRECT_AGENT.bits(), 0x7d);
+    // The layered root creates no account, so it announces no workload accounts (bit 2).
+    assert_eq!(GuestFeatures::SANDBOX_AGENT.bits(), 0x51);
+    assert!(!GuestFeatures::SANDBOX_AGENT.contains(GuestFeatures::WORKLOAD_ACCOUNT));
+    assert!(GuestFeatures::DIRECT_AGENT.contains(GuestFeatures::WORKLOAD_ACCOUNT));
+    for features in [GuestFeatures::DIRECT_AGENT, GuestFeatures::SANDBOX_AGENT] {
+        assert!(features.contains(GuestFeatures::HOST_MAPPING_TABLE));
+    }
     assert_eq!(
-        decode_maps_payload(&late[0]).unwrap().first,
-        u32::try_from(MAX_HOST_MAPPINGS + 10).unwrap()
+        GuestFeatures::DIRECT_AGENT.bits() & (1 << 1),
+        0,
+        "retired bit one stays clear"
     );
-    assert!(encode_maps_payloads_from(u32::MAX as usize, &maps, 4096).is_err());
-    assert!(encode_maps_payloads_from(u32::MAX as usize - 1, &maps, 4096).is_ok());
+}
+
+#[test]
+fn layered_sandboxes_need_per_execution_environments_and_mapping_tables() {
+    // The CLI's exec sends working directories and environments, and its start sends the
+    // mappings of the shares; it never cancels a workload or asks for a workload account
+    // (microsoft/nvx#566).
+    assert_eq!(GuestFeatures::LAYERED_SANDBOX.bits(), (1 << 4) | (1 << 6));
+    assert!(GuestFeatures::SANDBOX_AGENT.contains(GuestFeatures::LAYERED_SANDBOX));
+    assert!(
+        GuestFeatures::SANDBOX_AGENT
+            .missing(GuestFeatures::LAYERED_SANDBOX)
+            .is_empty()
+    );
+    assert_eq!(
+        (GuestFeatures::CANCEL | GuestFeatures::WORKLOAD_ACCOUNT)
+            .missing(GuestFeatures::LAYERED_SANDBOX),
+        ["per-execution environments", "host path mapping tables"]
+    );
+}
+
+#[test]
+fn host_exec_encoding_round_trips_through_the_guest_decoder() {
+    let environment = strings(&["FOO=a b", "EMPTY="]);
+    let workload = Workload {
+        argv: strings(&["/bin/sh", "-c", "printf ok"]),
+        timeout_ms: u32::MAX,
+        cwd: Some("/work"),
+        environment: WorkloadEnvironment::Layered(&environment),
+    };
+    let payload = encode_exec_payload(&workload).unwrap();
+    let decoded = decode_guest_exec_payload(&payload).unwrap();
+    assert_eq!(decoded.timeout_ms, u32::MAX);
+    assert_eq!(
+        decoded.argv,
+        [b"/bin/sh".to_vec(), b"-c".to_vec(), b"printf ok".to_vec()]
+    );
+    assert_eq!(decoded.cwd, Some(b"/work".to_vec()));
+    assert_eq!(
+        decoded.environment,
+        Some(vec![b"FOO=a b".to_vec(), b"EMPTY=".to_vec()])
+    );
+    assert!(decoded.inherit_default_env);
+}
+
+#[test]
+fn guest_exec_decoder_accepts_linux_bytes_and_the_c_cwd_boundary() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&1u16.to_le_bytes());
+    payload.extend_from_slice(&EXEC_EXTENDED.to_le_bytes());
+    payload.extend_from_slice(&(EXEC_CWD_PRESENT | EXEC_ENVIRONMENT_PRESENT).to_le_bytes());
+    payload.extend_from_slice(&1u16.to_le_bytes());
+    payload.extend_from_slice(&(MAX_GUEST_CWD_BYTES as u32).to_le_bytes());
+    payload.extend_from_slice(&2u32.to_le_bytes());
+    payload.extend_from_slice(b"/\xff");
+    payload.push(b'/');
+    payload.extend(std::iter::repeat_n(b'x', MAX_GUEST_CWD_BYTES - 1));
+    payload.extend_from_slice(&3u32.to_le_bytes());
+    payload.extend_from_slice(b"K=\xff");
+
+    assert!(decode_exec_payload(&payload).is_err());
+    let decoded = decode_guest_exec_payload(&payload).unwrap();
+    assert_eq!(decoded.argv, [b"/\xff".to_vec()]);
+    assert_eq!(decoded.cwd.as_ref().unwrap().len(), MAX_GUEST_CWD_BYTES);
+    assert_eq!(decoded.environment, Some(vec![b"K=\xff".to_vec()]));
+}
+
+/// Encodes an extended exec request field by field, so that its flags, environment count, and
+/// working-directory length may contradict what follows them.
+fn raw_extended(
+    flags: u16,
+    environment_count: u16,
+    cwd: &[u8],
+    argv: &[&[u8]],
+    environment: &[&[u8]],
+) -> Vec<u8> {
+    let length = |bytes: &[u8]| u32::try_from(bytes.len()).unwrap().to_le_bytes();
+    let mut payload = 0u32.to_le_bytes().to_vec();
+    payload.extend_from_slice(&u16::try_from(argv.len()).unwrap().to_le_bytes());
+    payload.extend_from_slice(&EXEC_EXTENDED.to_le_bytes());
+    payload.extend_from_slice(&flags.to_le_bytes());
+    payload.extend_from_slice(&environment_count.to_le_bytes());
+    payload.extend_from_slice(&length(cwd));
+    for argument in argv {
+        payload.extend_from_slice(&length(argument));
+        payload.extend_from_slice(argument);
+    }
+    payload.extend_from_slice(cwd);
+    for entry in environment {
+        payload.extend_from_slice(&length(entry));
+        payload.extend_from_slice(entry);
+    }
+    payload
+}
+
+#[test]
+fn guest_exec_decoder_accepts_what_the_c_agent_accepted() {
+    fn with_environment(flags: u16, entries: &[&[u8]]) -> GuestExecPayload {
+        let count = u16::try_from(entries.len()).unwrap();
+        decode_guest_exec_payload(&raw_extended(flags, count, b"", &[b"/bin/true"], entries))
+            .unwrap()
+    }
+
+    let empty = with_environment(EXEC_ENVIRONMENT_PRESENT, &[]);
+    assert_eq!(empty.environment, Some(Vec::new()));
+    assert!(!empty.inherit_default_env);
+    let exact = with_environment(
+        EXEC_ENVIRONMENT_PRESENT,
+        &[b"EMPTY=", b"VALUE=space = value"],
+    );
+    assert_eq!(
+        exact.environment,
+        Some(vec![b"EMPTY=".to_vec(), b"VALUE=space = value".to_vec()])
+    );
+    assert!(!exact.inherit_default_env);
+    let layered = with_environment(
+        EXEC_ENVIRONMENT_PRESENT | EXEC_INHERIT_DEFAULT_ENV,
+        &[b"VALUE=layered"],
+    );
+    assert_eq!(layered.environment, Some(vec![b"VALUE=layered".to_vec()]));
+    assert!(layered.inherit_default_env);
+
+    for timeout_ms in [0, 3_600_001, 86_400_000, u32::MAX] {
+        let mut payload = raw_extended(EXEC_ENVIRONMENT_PRESENT, 0, b"", &[b"/bin/true"], &[]);
+        payload[..4].copy_from_slice(&timeout_ms.to_le_bytes());
+        assert_eq!(
+            decode_guest_exec_payload(&payload).unwrap().timeout_ms,
+            timeout_ms
+        );
+    }
+}
+
+#[test]
+fn guest_exec_decoder_refuses_what_the_c_agent_refused() {
+    // The agent decodes with its own byte-oriented decoder, so each refusal that the host
+    // decoder's table pins is pinned here too, with the cases that the C agent refused.
+    const PROGRAM: &[u8] = b"/bin/true";
+    fn with_environment(entries: &[&[u8]]) -> Vec<u8> {
+        let count = u16::try_from(entries.len()).unwrap();
+        raw_extended(EXEC_ENVIRONMENT_PRESENT, count, b"", &[PROGRAM], entries)
+    }
+    fn with_cwd(flags: u16, environment_count: u16, cwd: &[u8]) -> Vec<u8> {
+        raw_extended(flags, environment_count, cwd, &[PROGRAM], &[])
+    }
+
+    let mut unknown_extension = 0u32.to_le_bytes().to_vec();
+    unknown_extension.extend_from_slice(&1u16.to_le_bytes());
+    unknown_extension.extend_from_slice(&2u16.to_le_bytes());
+    unknown_extension.extend_from_slice(&9u32.to_le_bytes());
+    unknown_extension.extend_from_slice(PROGRAM);
+    let mut truncated_header = 0u32.to_le_bytes().to_vec();
+    truncated_header.extend_from_slice(&1u16.to_le_bytes());
+    truncated_header.extend_from_slice(&EXEC_EXTENDED.to_le_bytes());
+    truncated_header.extend_from_slice(&EXEC_CWD_PRESENT.to_le_bytes());
+    let longest_cwd = [b"/".as_slice(), &[b'd'; MAX_GUEST_CWD_BYTES]].concat();
+    let mut truncated_cwd = with_cwd(EXEC_CWD_PRESENT, 0, b"/work");
+    truncated_cwd.pop();
+    let mut trailing = with_cwd(EXEC_CWD_PRESENT, 0, b"/work");
+    trailing.push(b'x');
+
+    for (case, payload) in [
+        (
+            "repeated name",
+            with_environment(&[b"VALUE=one", b"VALUE=two"]),
+        ),
+        ("entry without a value", with_environment(&[b"NO_EQUALS"])),
+        ("entry without a name", with_environment(&[b"=empty-key"])),
+        ("NUL in an entry", with_environment(&[b"KEY=embedded\0nul"])),
+        ("unknown extension", unknown_extension),
+        ("truncated extended header", truncated_header),
+        (
+            "unknown flag",
+            with_cwd(EXEC_CWD_PRESENT | 0x08, 0, b"/work"),
+        ),
+        // Only the agent tells its launch helper that it entered the directory.
+        (
+            "launch-helper flag",
+            with_cwd(EXEC_CWD_PRESENT | 0x8000, 0, b"/work"),
+        ),
+        (
+            "layering without an environment",
+            with_cwd(EXEC_CWD_PRESENT | EXEC_INHERIT_DEFAULT_ENV, 0, b"/work"),
+        ),
+        (
+            "entries without the environment flag",
+            with_cwd(EXEC_CWD_PRESENT, 1, b"/work"),
+        ),
+        (
+            "flag without a directory",
+            with_cwd(EXEC_CWD_PRESENT, 0, b""),
+        ),
+        ("directory without the flag", with_cwd(0, 0, b"/work")),
+        (
+            "directory over the limit",
+            with_cwd(EXEC_CWD_PRESENT, 0, &longest_cwd),
+        ),
+        ("relative directory", with_cwd(EXEC_CWD_PRESENT, 0, b"work")),
+        (
+            "NUL in the directory",
+            with_cwd(EXEC_CWD_PRESENT, 0, b"/wo\0rk"),
+        ),
+        ("truncated directory", truncated_cwd),
+        ("trailing bytes", trailing),
+        ("no arguments", raw_extended(0, 0, b"", &[], &[])),
+        (
+            "relative program",
+            raw_extended(0, 0, b"", &[b"bin/true"], &[]),
+        ),
+    ] {
+        assert!(decode_guest_exec_payload(&payload).is_err(), "{case}");
+    }
+}
+
+/// Both `EXEC` decoders refuse an argument, a working directory, or an environment entry with the
+/// same message, except where they differ by design: the host's requires each string to be UTF-8
+/// as soon as it reads it, and they word the refusals of an entry's name differently, the host's
+/// naming the variable that repeats.
+#[test]
+fn exec_decoders_refuse_strings_with_the_same_messages() {
+    const PROGRAM: &[u8] = b"/bin/true";
+    fn arguments(argv: &[&[u8]]) -> Vec<u8> {
+        raw_extended(0, 0, b"", argv, &[])
+    }
+    fn with_cwd(cwd: &[u8]) -> Vec<u8> {
+        raw_extended(EXEC_CWD_PRESENT, 0, cwd, &[PROGRAM], &[])
+    }
+    fn with_environment(entries: &[&[u8]]) -> Vec<u8> {
+        let count = u16::try_from(entries.len()).unwrap();
+        raw_extended(EXEC_ENVIRONMENT_PRESENT, count, b"", &[PROGRAM], entries)
+    }
+    fn truncated(mut payload: Vec<u8>) -> Vec<u8> {
+        payload.pop();
+        payload
+    }
+
+    let truncated_message = "the exec request is truncated";
+    let long = vec![b'a'; MAX_ARGUMENT_BYTES + 1];
+    let mut trailing = with_cwd(b"/work");
+    trailing.push(b'x');
+    for (case, payload, expected) in [
+        (
+            "NUL in an argument",
+            arguments(&[PROGRAM, b"a\0b"]),
+            "exec arguments must not contain NUL characters",
+        ),
+        (
+            "empty argument",
+            arguments(&[PROGRAM, b""]),
+            "exec arguments must be 1 to 4096 bytes",
+        ),
+        (
+            "argument over the limit",
+            arguments(&[PROGRAM, &long]),
+            "exec arguments must be 1 to 4096 bytes",
+        ),
+        (
+            "truncated argument",
+            truncated(arguments(&[PROGRAM])),
+            truncated_message,
+        ),
+        (
+            "relative program",
+            arguments(&[b"bin/true"]),
+            "exec program must be an absolute guest path",
+        ),
+        (
+            "NUL in the directory",
+            with_cwd(b"/wo\0rk"),
+            "exec working directory must not contain NUL characters",
+        ),
+        (
+            "truncated directory",
+            truncated(with_cwd(b"/work")),
+            truncated_message,
+        ),
+        (
+            "relative directory",
+            with_cwd(b"work"),
+            "exec working directory must be an absolute guest path",
+        ),
+        (
+            "NUL in an entry",
+            with_environment(&[b"KEY=embedded\0nul"]),
+            "exec environment entries must not contain NUL characters",
+        ),
+        (
+            "empty entry",
+            with_environment(&[b""]),
+            "exec environment entries must be 1 to 4096 bytes",
+        ),
+        (
+            "truncated entry",
+            truncated(with_environment(&[b"KEY=value"])),
+            truncated_message,
+        ),
+        (
+            "trailing bytes",
+            trailing,
+            "the exec request has trailing bytes",
+        ),
+    ] {
+        assert_eq!(
+            decode_exec_payload(&payload).unwrap_err().message(),
+            expected,
+            "{case}"
+        );
+        assert_eq!(
+            decode_guest_exec_payload(&payload).unwrap_err().message(),
+            expected,
+            "{case}"
+        );
+    }
+
+    let unnamed = "exec environment entries must be KEY=VALUE strings";
+    let unnamed_bytes = "exec environment entries must be KEY=VALUE byte strings";
+    for (case, payload, host, guest) in [
+        (
+            "entry without a value",
+            with_environment(&[b"NO_EQUALS"]),
+            unnamed,
+            unnamed_bytes,
+        ),
+        (
+            "entry without a name",
+            with_environment(&[b"=empty-key"]),
+            unnamed,
+            unnamed_bytes,
+        ),
+        (
+            "repeated name",
+            with_environment(&[b"VALUE=one", b"VALUE=two"]),
+            "exec environment names must be unique, but \"VALUE\" repeats",
+            "exec environment names must be unique",
+        ),
+        (
+            "argument that is not UTF-8, then a truncated one",
+            truncated(arguments(&[PROGRAM, b"\xff", b"x"])),
+            "exec arguments must be valid UTF-8",
+            truncated_message,
+        ),
+        (
+            "relative program that is not UTF-8",
+            arguments(&[b"\xff"]),
+            "exec arguments must be valid UTF-8",
+            "exec program must be an absolute guest path",
+        ),
+        (
+            "relative directory that is not UTF-8",
+            with_cwd(b"\xff"),
+            "exec working directory must be valid UTF-8",
+            "exec working directory must be an absolute guest path",
+        ),
+        (
+            "entry without a value that is not UTF-8",
+            with_environment(&[b"\xff"]),
+            "exec environment entries must be valid UTF-8",
+            unnamed_bytes,
+        ),
+    ] {
+        assert_eq!(
+            decode_exec_payload(&payload).unwrap_err().message(),
+            host,
+            "{case}"
+        );
+        assert_eq!(
+            decode_guest_exec_payload(&payload).unwrap_err().message(),
+            guest,
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn host_maps_encoding_round_trips_through_the_guest_decoder() {
+    let maps = [
+        map("", "/data", true),
+        map("0/src", "/work", true),
+        map("1/file", "/etc/value", false),
+    ];
+    let payloads = encode_maps_payloads(&maps, OUTER_MAX_PAYLOAD - APP_HEADER_LEN).unwrap();
+    let decoded = decode_guest_maps_payload(&payloads[0]).unwrap();
+    assert_eq!(decoded.first, 0);
+    assert_eq!(
+        decoded.maps,
+        [
+            GuestHostMap {
+                source: Vec::new(),
+                target: b"/data".to_vec(),
+                read_only: true,
+            },
+            GuestHostMap {
+                source: b"0/src".to_vec(),
+                target: b"/work".to_vec(),
+                read_only: true,
+            },
+            GuestHostMap {
+                source: b"1/file".to_vec(),
+                target: b"/etc/value".to_vec(),
+                read_only: false,
+            },
+        ]
+    );
+}
+
+#[test]
+fn guest_maps_decoder_accepts_non_utf8_linux_paths() {
+    let mut payload = encode_maps_payloads(
+        &[map("0/x", "/work", false)],
+        OUTER_MAX_PAYLOAD - APP_HEADER_LEN,
+    )
+    .unwrap()
+    .remove(0);
+    let source_offset = MAPS_HEADER_LEN + MAP_ENTRY_HEADER_LEN;
+    payload[source_offset + 2] = 0xff;
+    assert!(decode_maps_payload(&payload).is_err());
+    let decoded = decode_guest_maps_payload(&payload).unwrap();
+    assert_eq!(decoded.maps[0].source, b"0/\xff");
+}
+
+/// Both `MAPS` decoders refuse an entry with the same message, except that the host's requires
+/// each path to be UTF-8 as soon as it reads it, and the guest's bounds the number of entries
+/// before it reads any.
+#[test]
+fn maps_decoders_refuse_entries_with_the_same_messages() {
+    let invalid = |name: &str| vector(NVXC_V1, "INVALID_MAPS", name).bytes;
+    let truncated = "the host mapping request is truncated";
+    let refused = "a host mapping has unknown flags or a source or target that the guest agent \
+                   refuses";
+    for (name, expected) in [
+        ("TRUNCATED_HEADER", truncated),
+        ("TRUNCATED_ENTRY", truncated),
+        (
+            "TRAILING_BYTE",
+            "the host mapping request has trailing bytes",
+        ),
+        ("UNKNOWN_FLAG", refused),
+        ("RELATIVE_TARGET", refused),
+    ] {
+        let payload = invalid(name);
+        assert_eq!(
+            decode_maps_payload(&payload).unwrap_err().message(),
+            expected,
+            "{name}"
+        );
+        assert_eq!(
+            decode_guest_maps_payload(&payload).unwrap_err().message(),
+            expected,
+            "{name}"
+        );
+    }
+    let not_utf8_then_truncated = invalid("NOT_UTF8_THEN_TRUNCATED");
+    assert_eq!(
+        decode_maps_payload(&not_utf8_then_truncated)
+            .unwrap_err()
+            .message(),
+        "a host mapping is not valid UTF-8"
+    );
+    assert_eq!(
+        decode_guest_maps_payload(&not_utf8_then_truncated)
+            .unwrap_err()
+            .message(),
+        truncated
+    );
+    assert_eq!(
+        decode_guest_maps_payload(&invalid("TOO_MANY_ENTRIES"))
+            .unwrap_err()
+            .message(),
+        "the host mapping request has too many entries"
+    );
+}
+
+/// Returns bytes near the vectors of `kinds`: the bytes of one of them, with up to four bytes
+/// overwritten, perhaps truncated, and with up to eight bytes appended.
+fn near_vectors(kinds: &'static [&'static str]) -> impl Strategy<Value = Vec<u8>> {
+    let encodings: Vec<_> = vectors(NVXC_V1)
+        .into_iter()
+        .filter(|vector| kinds.contains(&vector.kind))
+        .map(|vector| vector.bytes)
+        .collect();
+    (
+        prop::sample::select(encodings),
+        prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 0..4),
+        prop::option::of(any::<prop::sample::Index>()),
+        prop::collection::vec(any::<u8>(), 0..8),
+    )
+        .prop_map(|(mut bytes, writes, cut, tail)| {
+            for (index, byte) in writes {
+                if !bytes.is_empty() {
+                    let index = index.index(bytes.len());
+                    bytes[index] = byte;
+                }
+            }
+            if let Some(cut) = cut {
+                bytes.truncate(cut.index(bytes.len() + 1));
+            }
+            bytes.extend(tail);
+            bytes
+        })
+}
+
+proptest! {
+    /// The host's and the guest's `EXEC` and `MAPS` decoders return, never panic, on arbitrary
+    /// bytes and on bytes near their vectors, which reach past the checks of the headers.
+    #[test]
+    fn decoders_never_panic(
+        payload in prop_oneof![
+            prop::collection::vec(any::<u8>(), 0..256),
+            near_vectors(&["EXEC", "MAPS", "INVALID_MAPS"]),
+        ]
+    ) {
+        let _ = decode_exec_payload(&payload);
+        let _ = decode_guest_exec_payload(&payload);
+        let _ = decode_maps_payload(&payload);
+        let _ = decode_guest_maps_payload(&payload);
+    }
+
+    /// Whatever bytes the host's `EXEC` decoder accepts, the guest's accepts with the same
+    /// strings, whereas the guest's also accepts strings that are not UTF-8.
+    #[test]
+    fn the_guest_decodes_every_exec_payload_that_the_host_decodes(
+        payload in near_vectors(&["EXEC"])
+    ) {
+        if let Ok(host) = decode_exec_payload(&payload) {
+            let guest = decode_guest_exec_payload(&payload).unwrap();
+            let bytes = |strings: &[String]| -> Vec<Vec<u8>> {
+                strings.iter().map(|string| string.as_bytes().to_vec()).collect()
+            };
+            prop_assert_eq!(guest.timeout_ms, host.timeout_ms);
+            prop_assert_eq!(guest.argv, bytes(&host.argv));
+            prop_assert_eq!(guest.cwd, host.cwd.map(String::into_bytes));
+            prop_assert_eq!(guest.environment, host.environment.as_deref().map(bytes));
+        }
+    }
 }

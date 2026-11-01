@@ -139,6 +139,24 @@ guest resume behavior:
 python3 scripts/nvx.py benchmark --suite snapshot-restore-vcpu --backend mshv --processors 8 --memory-mib 128 --warmups 1 --runs 5 --snapshot-profile --skip-build --output-dir data/runs/restore-vcpu-mshv-capacity-8
 ```
 
+Measure the same activation from one platform snapshot, the clone tier that
+a fleet restores with a different size each time:
+
+```console
+python3 scripts/nvx.py benchmark --suite platform-snapshot-restore-vcpu --backend kvm --processors 8 --memory-mib 512 --warmups 1 --runs 5 --skip-build --output-dir data/runs/platform-restore-vcpu-kvm
+```
+
+A platform command line carries no tenant configuration, so the suite cannot
+use the pre-banner capture: the capture boots with `maxcpus=1` as its only
+command-line option, a distro layer, and a scratch disk, and the guest captures
+from its shell with `--snapshot-tier platform`. Each restore reattaches the
+blocks and reaches its marker after the guest finishes the platform repair,
+which brings the target prefix online, refreshes the clone's identity, and
+acknowledges the restore gate. Its latency is therefore comparable between
+targets and backends, not with `snapshot-restore-vcpu`. `--snapshot-profile`
+adds the lifecycle phases of each target, and the results stay out of the
+performance CSVs.
+
 Measure restore-time memory activation from one immutable 512 MiB snapshot
 with 2 GiB of ABI-reserved capacity:
 
@@ -214,8 +232,10 @@ MSHV, and WHP. They do not create TAP devices or require host firewall rules.
 Each workload directory includes `benchmark-metadata.json` with the platform, backend, ABI,
 processor count, host affinity set, memory sizes, artifact revisions, repository dirty state,
 warmups, measured run counts, and SHA-256 values for the VMM, kernel, initramfs, and coordinator.
-Device metadata also records helper source and packaged-binary hashes. Collection rejects
-mismatched lifecycle/workload metadata and duplicate topology rows.
+Device metadata also records the aggregate Rust guest-source digest, pinned
+toolchain and target, and the packaged `nvx-device-io` binary hash from the
+initramfs manifest. Collection rejects mismatched lifecycle/workload metadata
+and duplicate topology rows.
 
 Use a fixed affinity set containing one logical processor per physical core
 and at least `N+2` processors for an `N`-vCPU guest. The additional processors
@@ -258,6 +278,7 @@ python3 scripts/nvx.py performance collect --platform linux-kvm-baremetal --comm
 | Shell snapshot | `benchmark --suite shell-snapshot` | Compares cold boot with lifecycle-aligned snapshot restore at 128, 256, and 512 MiB. |
 | Shell snapshot restore | `benchmark --suite shell-snapshot-restore` | Captures an unmeasured lifecycle-aligned snapshot and measures only restore latency for the selected memory sizes. |
 | Restore-time vCPU activation | `benchmark --suite snapshot-restore-vcpu --processors 8` | Restores one boot-online-1, capacity-8 snapshot at online targets 1/2/4/8 and reports latency plus peak RSS. |
+| Platform restore-time vCPU activation | `benchmark --suite platform-snapshot-restore-vcpu --processors 8` | Restores one boot-online-1, capacity-8 platform snapshot at online targets 1/2/4/8, through the platform repair, and reports latency plus peak RSS. |
 | Network snapshot | `benchmark --suite network-snapshot` | Compares a network-ready cold boot with snapshot restore and verifies gateway connectivity. |
 | Snapshot lifecycle profile | `benchmark --suite snapshot-profile` | Retains raw capture and restore phase records and summarizes 128/256/512/1024 MiB warm/cold restores. |
 | Virtio device restore profile | `benchmark --suite device-restore-profile` | Verifies active and driver-unbound deferred restore for console, network, and virtio-fs; emits standalone diagnostic JSON and raw logs. |
@@ -327,6 +348,14 @@ launch, or one killed after a teardown timeout, fails on a time ABI power-off st
 the status of its termination. A guest exit with a nonzero status fails the run regardless; the
 scan reads what the console delivers within a second, so that a time ABI power-off is reported
 with its event.
+When the harness kills OpenVMM, after a timeout or a failure, it waits up to 30 s for the
+process to exit. A killed process exits only once the I/O that its threads wait for completes,
+so a stalled disk can hold it, while a hung microVM otherwise exits within tens of
+milliseconds: an exit that takes longer than a second prints a warning with its time, and a
+process that still runs after 30 s fails the run's cleanup. Such a process can also keep its
+output reader from stopping, so every later cleanup step still runs, and the error that led to
+the kill keeps its message and OpenVMM output with each cleanup failure appended under
+`--- cleanup failures ---`. A process that the harness gave up on is not killed again.
 Benchmarks never ask the guest for its time ABI status, as the correctness jobs do after cold
 boots and restores, so the guest prints nothing extra. Up to the marker, the scan only parses
 output the harness reads anyway, and the harness reads the rest of the console only after it
@@ -394,12 +423,17 @@ measures complete process wall time while host and guest exchange files through 
 | `virtfs_live_read` | MB/s | Sequential guest read from the host file after dropping guest page cache. |
 | `virtfs_live_roundtrip` | ms | Guest creates a marker observed by the host, then observes a host rewrite before that VM exits. |
 
+`virtfs.log` follows the summaries of each series with its retained samples in measurement order.
+A host slowdown that delays part of a series splits its samples into two groups, which the median
+alone hides.
+
 ### Device operation rates
 
 The dedicated suite always uses the canonical microVM and attaches the block
 backing object as the writable `scratch` role. There is no ABI selector or
-legacy unroled `--virtio-blk` control. Every guest has 256 MiB RAM and runs the same static, dependency-free
-x86-64 helper from the reproducible initramfs. Canonical runs execute five warmups followed by 30
+legacy unroled `--virtio-blk` control. Every guest has 256 MiB RAM and runs the
+same static Rust x86-64 binary from the reproducible initramfs.
+Canonical runs execute five warmups followed by 30
 retained attempts for each device. Every operation window lasts ten seconds against a 512 MiB
 backing object.
 
@@ -430,6 +464,18 @@ the default output directory, so v1 and v2 records cannot mix. Changed controls 
 disks, shared directories, the UDP server, and each benchmark-owned VMM are cleaned on success,
 failure, or interruption.
 
+An attempt that times out also describes the host in its error before the harness kills
+OpenVMM: the files of the attempt's directory, with their sizes and modification times; the
+OpenVMM processes that still run; and, on Windows, the scratch volume's write rate, latency,
+queue, and busy time, with the CPU, cache, and Defender activity, over 3 s, from the counters of
+the [snapshot lifecycle profile's](#snapshot-lifecycle-profile) storage telemetry. A stalled
+volume can block each of them, so each that does not finish within 10 s says so instead.
+`nvx-device-io` reports a file benchmark's progress on standard error, which the guest console
+shows: `nvx-device-io: opened` once it has opened, and when creating, sized the file,
+`nvx-device-io: transferred N blocks` once its timed loop ends, and, for a write,
+`nvx-device-io: flushed` or `nvx-device-io: flush failed`, so the console of a hung attempt
+shows the phase that it hung in.
+
 ### Shell snapshot
 
 Each memory size normally uses five cold boots and five restores. Cold values
@@ -456,6 +502,20 @@ The 64 MiB pair, `shell_snapshot_cold_64_mib` and
 | `shell_snapshot_restore_256_mib` | Restore process launch through lifecycle-aligned verification of a 256 MiB snapshot. |
 | `shell_snapshot_cold_512_mib` | OpenVMM launch to a shell-ready guest with 512 MiB of memory. |
 | `shell_snapshot_restore_512_mib` | Restore process launch through lifecycle-aligned verification of a 512 MiB snapshot. |
+
+Each memory section of `shell-snapshot.log`, and of `shell-snapshot-restore.log` for the
+restore-only suite, lists the retained restore samples in measurement order after the restore
+summary.
+
+On MSHV and WHP, collection rejects a restore series of at least ten samples that a transient
+host stall split, with the limits that guard snapshot generation: a p50 more than 25% above p25,
+or a gap of more than 25% between adjacent sorted samples with at least two samples on each side.
+Such a series must list its samples, and the list must match the summary's count and median.
+`performance validate-workload` applies the same check without collecting, so that CI can
+remeasure the series, as [CI collection](#ci-collection) describes. KVM restore series are
+exempt: the KVM CI runners restore a snapshot in two modes about twice apart, so 1,933 of the
+6,192 KVM restore series that CI measured from 2026-10-04 to 2026-10-27 exceed those limits
+without a stall, against 4 of 6,144 on MSHV and 2 of 5,646 on WHP (#345).
 
 ### Snapshot lifecycle profile
 
@@ -498,9 +558,14 @@ All captures emit a guest marker immediately before `nvx-snapshot`;
 `console_command_round_trip` ends when the host observes that marker, and
 `guest_dispatch_to_publication` spans that observation through snapshot publication.
 Each observed record also includes available process counters. Linux reports RSS, peak RSS,
-minor and major faults, total page faults, and, when `smaps_rollup` is available, private dirty
-and private RSS bytes. Windows reports working set, peak working set, private commit, and page
-faults.
+and minor, major, and total page faults from `/proc/<pid>/status` and `/proc/<pid>/stat`,
+which the kernel fills from counters that it maintains. The coordinator reads them while
+OpenVMM runs the intervals that the benchmark measures, so it reads nothing that walks
+OpenVMM's memory map. Reading `smaps_rollup` there delayed OpenVMM's quiesce and state save
+on MSHV, which raised the snapshot-generation p50 by about 30% on the MSHV CI runner and more
+than doubled it on a bare-metal host, and spread its samples until the stability guard
+rejected some series (#383). Windows reports working set, peak working set, private commit,
+and page faults.
 
 On Windows, each retained capture sample also carries `storage_telemetry`. From just before the
 host requests the snapshot until the source process exits, a coordinator thread samples
@@ -525,7 +590,7 @@ throughput, IOPS, average latency, average queue length, busy time, and peak que
 time; the lazy-writer, flush, and page-writer rates; the peak dirty cache and its threshold; and
 Defender CPU time and I/O. A counter group whose samples differ from the summary's, such as
 Defender's sparser process counters, reports its own interval.
-Linux captures do not flush a file-backed guest RAM image, take about 1 to 4 ms, and record no
+Linux captures do not flush a file-backed guest RAM image, take about 1 to 3 ms, and record no
 storage telemetry.
 
 `profile.phases` groups samples by `operation.phase` and stores raw `samples_ms` plus p50,
@@ -569,35 +634,47 @@ collection uses `--require-shell-snapshot-restore-512`, which requires exactly
 `shell_snapshot_restore_512_mib` plus canonical one-warmup/five-sample metadata for a 2-, 4-, or
 8-vCPU guest. A `device-io` directory is recognized from metadata and must contain exactly its five
 metrics and every configured attempt. Each backend job publishes its p50 tables and one-vCPU lifecycle diagnostics to
-`$GITHUB_STEP_SUMMARY`. Pull-request regression checks compare KVM, MSHV, and WHP results with the
-latest base-branch history.
+`$GITHUB_STEP_SUMMARY`. Pull-request and merge-group regression checks compare KVM, MSHV, and
+WHP results with the latest base-branch history.
 
 These jobs consume, gate, publish, or persist the KVM benchmark results (#286); MSHV and WHP
 follow the same flow with their own platform jobs:
 - `Platform / Linux / KVM / Virtual machine` (`platform-kvm`) runs the benchmarks and publishes the
   results: the run-scoped `benchmark-linux-kvm-virtual-machine-<run-id>` artifact, the per-attempt
   diagnostics artifact, and the p50 tables in its step summary.
-- `Performance regression gate` (`performance-gate`, pull requests only) consumes the three
-  platform artifacts once all three platform jobs succeeded and gates them against the base
+- `Performance regression gate` (`performance-gate`, pull requests and merge groups only) consumes
+  the three platform artifacts once all three platform jobs succeeded and gates them against the
+  base
   branch's history. It publishes and persists nothing.
-- `Persist performance baseline` (`performance-persist`, `dev` pushes only) consumes them and
-  persists them to `data/*.csv`.
+- `Record performance results` (`performance-record`, `dev` pushes only) consumes them, checks
+  them against the history as persisting them would, and uploads the p50 results with their hosts
+  as the `performance-results-<run-id>` artifact, which GitHub keeps for seven days.
+- `Persist performance baselines` (`performance-persist`, full runs of `dev` only, the nightly one
+  included) persists to `data/*.csv`, in one commit, the recorded results of every completed `dev`
+  push run whose commit is newer than the newest that the history holds, oldest first in `dev`'s
+  first-parent order, so that `dev` takes the history once a night rather than after each merge;
+  see [Development releases and performance history](ci.md#development-releases-and-performance-history).
 - `Publish development release` (`release`, `dev` pushes only) doesn't read them, but it and
-  `performance-persist` run only when both NVX CLI jobs and the three platform jobs succeeded
-  and every correctness job, `nvx-microvm-tests-kvm` included, succeeded or was skipped.
+  `performance-record` run only when both `nvx-rs` builds, both NVX CLI jobs, the three
+  platform jobs, and their three package jobs succeeded and every correctness job,
+  `nvx-microvm-tests-kvm` included, succeeded or was skipped.
 - `Required status check` fails unless every job that the change schedules, including
-  `platform-kvm`, `performance-gate`, and `nvx-microvm-tests-kvm`, has its expected result.
+  `platform-kvm`, `package-kvm`, `performance-gate`, and `nvx-microvm-tests-kvm`, has its
+  expected result.
 
-Each platform job runs on its backend's benchmark runner. The job targets the pool's labels
-plus `benchmark`, which exactly one runner of each pool carries, so every run measures the
-series on the same VM, and the gate compares a pull request with history from that VM. The
-pools mix VMs whose results differ by more than the run-to-run noise: over the same `dev`
+Each platform job runs on its backend's dedicated benchmark runner. The job targets the
+pool's labels plus `benchmark`, which exactly one runner of each pool carries instead of
+`general`. Every other backend job requires `general`, so it cannot occupy the
+benchmark runner. Every run therefore measures the series on the same VM without waiting for
+an unrelated build or test, and the gate compares a pull request or merge group with history
+from that VM.
+Platform jobs from overlapping runs still serialize on their one eligible runner. The pools
+mix VMs whose results differ by more than the run-to-run noise: over the same `dev`
 commits, the WHP runners on Emerald Rapids hosts measured about 10% slower than those on Ice
 Lake hosts, and MSHV runners in another scale set measured guest-exit teardown several times
 slower (#415). A pooled series compared each pull request with whichever runners had measured
-the base-branch window, so runner placement alone could fail the gate. The benchmark runner
-also takes other jobs of its pool, so a platform job may wait for it, and the platform jobs of
-concurrent runs measure one after another. List the benchmark runners with
+the base-branch window, so runner placement alone could fail the gate. List the benchmark
+runners with
 `gh api repos/microsoft/nvx/actions/runners --jq '.runners[] | select(any(.labels[]; .name == "benchmark")) | .name'`,
 and provision them with the benchmark switch of the
 [runner setup scripts](../scripts/setup/README.md#github-actions-runners). Before it
@@ -624,7 +701,7 @@ unstable result still fails the job. The stability guard rejects a p50 more than
 lie on each side.
 Singleton outliers remain tolerated, while a host stall cannot publish a bimodal
 series into the history. On the Linux CI runners,
-snapshot generation takes about 1 ms on KVM and about 4 ms on MSHV, so a
+snapshot generation takes about 1 ms on KVM and about 3 ms on MSHV, so a
 sub-millisecond CPU stall in two samples is enough to cross the gap limit.
 
 Each validation also appends the attempt's file, SHA-256 digest, outcome (`valid`,
@@ -637,6 +714,15 @@ published lifecycle metrics. The step summary lists every attempt with its outco
 snapshot-generation p50, and whether it was published, and reports the storage
 telemetry of each attempt, rejected ones included.
 
+CI likewise validates the [shell-snapshot restore series](#shell-snapshot) after the
+one-vCPU `performance` suite and after each 2-, 4-, and 8-vCPU `shell-snapshot-restore`
+suite. Each attempt writes its logs to its own `performance-attempt-N` or
+`shell-snapshot-restore-attempt-N` directory, and `performance validate-workload`
+checks it. Status 75 on the first attempt remeasures the whole suite once, and only a
+validated attempt's files are copied to the result directory for collection. Other
+validation failures stop immediately, and a second unstable attempt fails the job. On
+KVM, whose restore series have no stability guard, validation accepts every attempt.
+
 Before updating the run-scoped `benchmark-<platform>-<run-id>` artifact, each platform
 uploads its raw results and lifecycle profiles to the immutable
 `benchmark-diagnostics-<platform>-<run-id>-attempt-<run-attempt>` artifact, including
@@ -644,16 +730,49 @@ after a benchmark failure. Both artifacts are retained for one day. Rerunning a
 workflow cannot overwrite an earlier attempt's diagnostics. Downstream gates still
 use the run-scoped artifact so a failed-jobs-only rerun can reuse successful
 platform results from an earlier workflow attempt. The `acceptance-attempt-N.json`
-files identify the bounded lifecycle remeasurements within one workflow attempt,
-not the workflow's `github.run_attempt`.
+files and the `performance-attempt-N` and `shell-snapshot-restore-attempt-N`
+directories identify the bounded remeasurements within one workflow attempt, not the
+workflow's `github.run_attempt`.
+
+A storage stall on a Windows runner leaves events that a reimage of the runner erases, so when a
+Windows platform job's benchmark fails, the job saves the storage events of its window in the
+diagnostics artifact's `storage-events` directory. The window starts with the job's first step,
+which records the time in `NVX_JOB_STARTED_AT`, and ends as the events are saved. The diagnostics
+upload, which runs whatever failed, keeps them, and both uploads precede the scratch removal,
+which a stalled volume can hold up past the job's timeout, when no later step runs.
+`python scripts\nvx.py performance storage-events --since <time> --output-dir <dir>` exports,
+with `wevtutil`, the `Microsoft-Windows-Storage-Storport/Operational` events and the System
+log's events of the storage drivers and file systems as rendered XML, in
+`storport-operational.xml` and `system-storage.xml`, and writes `storage-events.txt`, which the
+job log repeats up to its list of every event. It counts each log's events by ID, and then lists
+the notable ones: I/Os that took longer than Storport's threshold, 30 seconds by default (event
+557), request timeouts (500), resets (550), the resets that storage miniports such as `storvsc`
+issue (129), and the hourly latency summaries (505) that counted I/Os above a second, by latency
+bucket. Storport names each device by its SCSI port, path, target, and LUN, which host
+provenance records for the benchmark's volumes, so the summary names the volume, such as
+`workspace/scratch F:`, of each device that it knows. A stalled volume can stall what reads it
+too, so the command abandons a query after 120 seconds, and probes the volumes only once the
+events are saved, for at most 30 seconds, after which the summary says why it names none. It also
+abandons a write of its files after 30 seconds, as the workspace can share that volume, and the
+summary in the job log and a warning then name the file. I/Os
+slower than Storport's threshold also raise a `Slow storage I/O` warning with their count and
+the slowest, and a log that can't be read raises a `Storage events` warning. Network Service,
+the runners' account, may read both logs as a service account; locally, reading the Storport log
+takes an elevated prompt or membership in Event Log Readers.
 
 Lifecycle JSON results and workload `benchmark-metadata.json` files record host
 provenance under `host`: the runner name from `RUNNER_NAME`, the machine name, the
 operating system with its kernel release or Windows build and cumulative-update
-revision (UBR), the CPU model with its vendor, family, model, stepping, and microcode
-revision, the logical processor count, and physical memory, and the
+revision (UBR), the hypervisor that a Linux host runs under, the CPU model with its
+vendor, family, model, stepping, and microcode revision, the logical processor count,
+and physical memory, and the
 volume, file system, size, system-volume flag, disk number, and SCSI address behind
-the workspace, temporary, and scratch directories. The disk number and SCSI address
+the workspace, temporary, and scratch directories. On x86-64 Linux, the coordinator runs
+CPUID without privileges, from a private page that it makes executable only after writing
+the code into it. It records the hypervisor's vendor under `hypervisor.vendor`, `null`
+without a hypervisor, and a Microsoft hypervisor's version under `hypervisor.build`, such
+as `10.0.26100.9444`. A kernel that forbids executable anonymous memory leaves a
+`hypervisor.error`, and other hosts record no hypervisor. The disk number and SCSI address
 tell the Azure OS disk from a data-disk LUN or the temporary disk. On a possible Azure
 VM, the coordinator queries the instance metadata service once, directly rather than
 through a proxy and with up to three attempts when the service doesn't respond, and
@@ -672,7 +791,10 @@ When investigating instability, compare each attempt's
 slow `capture.mapped_memory_flush` with otherwise stable capture phases localizes
 the delay to host-side mapped RAM flushing, not guest boot or snapshot restore.
 Extra time in `capture.quiesce`, `capture.save_state`, or between profiled phases
-while the flush and publication phases stay flat instead points to a host CPU stall.
+while the flush and publication phases stay flat instead points to a host CPU stall,
+or to a process that reads OpenVMM's memory map during the capture, as the profile's
+own `smaps_rollup` reads did until #383. A delay that recurs on an idle bare-metal
+host of the same backend is not a host stall.
 Reproduce with the exact executable and guest artifact hashes on the same host
 before attributing the delay to a source change. Keep the stability thresholds and
 bounded remeasurement unchanged when collecting diagnostic evidence.
@@ -699,8 +821,11 @@ and the raw samples show how the rates change within a flush.
 Snapshot generation is bounded by the write throughput of the benchmark's
 temporary directory, because capture flushes guest RAM through a backing file
 created there. The Windows backing file stays dense so restore keeps the
-captured pages cached; NTFS therefore zero-fills the unwritten range below the
-guest's top-of-RAM pages, and a 128 MiB guest writes about 150 MiB per capture.
+captured pages cached. Because NTFS zero-fills a dense file below any write
+past its valid data length, OpenVMM first marks every guest RAM page modified
+and then flushes the range with one ascending write sequence, so a 128 MiB
+guest writes at most 128 MiB per capture and the flush lasts about that size
+divided by the scratch volume's write throughput.
 The Windows CI runners' 128 GiB Premium SSD system disk also holds the runner
 work tree, caches, and builds. Under load it alternates between its burst limit
 of about 173 MB/s and its baseline of about 102 MB/s in blocks of tens of
@@ -731,12 +856,23 @@ host doesn't record, such as a performance tier or bursting setting, reset at le
 affected metrics by removing them from the series' history files, such as
 `data/windows-whp-virtual-machine-microvm-v2-1vcpu.csv`, so that the gate restarts
 their ten-point warmup instead of comparing the new storage with the old baseline.
+Results measured before such a reset commit are not persisted into the reset
+series, so a `dev` run that finishes after the reset cannot refill it. The
+persistence finds the reset by the rows that it removed, though, and a full run of
+`dev` persists the results of `dev` pushes only once a night: a series that an
+earlier reset emptied can hold no rows yet while results measured since that reset
+wait to be persisted. Before resetting such a series, dispatch a full run of `dev`
+and let its `Persist performance baselines` job finish, so that the reset removes
+the rows that it persisted instead of finding none.
 
 The regression gate compares the target p50 with the median of the latest 10
 p50 values on the pull request's base branch and requires all 10
-matching history points. A metric regresses only when it is more than 40%
-worse. Lower-is-better millisecond metrics must also be more than 5 ms
+matching history points. A metric regresses only when it is more than 50%
+worse. Lower-is-better millisecond metrics must also be more than 10 ms
 slower; higher-is-better metrics use the percentage comparison alone.
+[`ci.yml`](../.github/workflows/ci.yml) sets these thresholds;
+[`performance gate`](usage.md#performance-gate) defaults to 40% and 5 ms when
+it runs without them.
 Missing or insufficient history is a warmup, not a failure. Successful `dev`
 builds append collected results to topology-specific files in `data/`. Every
 new ABI/count series begins as a warmup baseline before its regression gate
@@ -755,13 +891,14 @@ Each tracked series names the host that measured its history in `data/<platform>
 such as [`data/windows-whp-virtual-machine-host.json`](../data/windows-whp-virtual-machine-host.json).
 The file is the identity of that host's provenance: the runner and machine names; the CPU's
 vendor, family, model, stepping, brand string, and microcode revision; the logical processors
-and memory; the operating system with its kernel release, or its Windows build and UBR; the
-Azure VM size and the Azure disks that can back the benchmark's volumes; and the mount point,
-file system, and system-volume flag of the workspace, temporary, and scratch volumes. The OS
-disk counts when a volume is the system volume, and the data and temporary disks when a volume
-is on another disk, so the data disk of a Linux runner, whose scratch is on tmpfs, doesn't.
-Paths, device names, SCSI addresses, and volume sizes are left out because they differ between
-identical VMs.
+and memory; the operating system with its kernel release, or its Windows build and UBR; on
+Linux/MSHV, the build of the Microsoft hypervisor beneath the kernel; the Azure VM size and the
+Azure disks that can back the benchmark's volumes; and the mount point, file system, and
+system-volume flag of the workspace, temporary, and scratch volumes. The OS disk counts when a
+volume is the system volume, and the data and temporary disks when a volume is on another
+disk, so the data disk of a Linux runner, whose scratch is on tmpfs, doesn't. Paths, device
+names, SCSI addresses, and volume sizes are left out because they differ between identical
+VMs.
 
 Before its first benchmark, the platform job's `Check Linux benchmark host` or `Check Windows
 benchmark host` step runs `nvx.py performance check-host`, which compares the runner with the
@@ -772,6 +909,7 @@ file. Each field is required or advisory:
 | CPU | Vendor, family, model, stepping, and brand string | Microcode revision |
 | Processors and memory | Logical processors; memory within 5% | |
 | Linux | Kernel major and minor version and flavor, the release tokens that contain letters, such as `mshv3` and `azl3` | Kernel patch release |
+| Linux/MSHV | Hypervisor build, the whole version of CPUID leaf `0x40000002`, such as `10.0.26100.9444` | |
 | Windows | Build, such as `10.0.26100` | Cumulative-update revision (UBR) |
 | Azure | VM size; each disk's SKU, size, caching, write accelerator, ephemeral option, and limits | |
 | Volumes | Mount point, file system, and system-volume flag | |
@@ -783,17 +921,31 @@ which the diagnostics artifact also keeps as `<platform>-host.json`. The memory 
 absorbs kernel reservations, which differ between VMs of one size: the KVM and MSHV runners,
 both `Standard_D8s_v5`, report 31.3 and 30.9 GiB. The kernel flavor is required because the
 `azure-mshv-scus` runners of #415, on `6.6.137.mshv2-2.azl3` rather than `6.6.148-200.azl3`,
-measured guest-exit teardown several times slower. An advisory difference, such as a
-microcode or Windows cumulative update, a kernel patch release, or a VM replaced by an
-identical one, only warns. To acknowledge it, replace the file with the runner's host; that
-needs no history reset.
+measured guest-exit teardown several times slower. The hypervisor build is required because
+the hypervisor comes from the `mshv` package and the kernel from `kernel-mshv`, so an update
+can replace one without the other, and the kernel release doesn't show a new hypervisor
+(#980). The provenance reads it from CPUID without privileges, as `major.minor.build.service`,
+the version that OpenVMM's CPU fingerprint records, and the service number counts:
+`10.0.26100.9444` and `10.0.26100.30000` are both build 26100. A hypervisor that can't be read
+records an unknown build, which matches none, not even another unknown one. KVM and Windows
+hosts don't record it: a KVM VM's hypervisor is its cloud host's, and a Windows build and UBR
+identify Windows' own hypervisor.
+An advisory difference, such as a microcode or Windows cumulative update, a kernel patch
+release, or a VM replaced by an identical one, only warns. To acknowledge it, replace the file
+with the runner's host; that needs no history reset. Host files and results that predate the
+hypervisor build don't record it, which also only warns, so adding the build to an expected
+host needs no history reset either.
 
 `performance collect` writes the host that results record next to them as
 `<platform>-host.json`. It refuses inputs of which only some record a host, and refuses to
 collect results of two hosts, or results with and without a recorded host, into one directory. `performance persist` refuses to append results
 whose recorded host differs from the history's `<platform>-host.json` in a required field, or
-that record no host for a history that records one. `Persist performance baseline` also passes
-`--require-host`, which requires both host files, as a backstop for `dev` pushes.
+that record no host for a history that records one. `Record performance results` and
+`Persist performance baselines` also pass `--require-host`, which requires both host files, as a
+backstop for `dev` pushes; the persistence compares each run's results with the hosts that the
+history expected at the run's commit, so a host that `dev` accepted since refuses none of them.
+It keeps a platform's results out of the platform's series, though, when `dev` accepted another
+host for it after the run's commit, even when the series held no rows for that reset to remove.
 
 To accept a new host, for example after a redeploy, resize, reimage, or OS update changed a
 required property, or after the `benchmark` label moved to a runner whose host differs, open a
@@ -803,6 +955,12 @@ pull request that, in one change:
    summary or diagnostics artifact.
 2. Resets the series by truncating each of its history files, such as
    `data/<platform>-microvm-v2-1vcpu.csv`, to its header line.
+3. For a Linux/MSHV host with another hypervisor build or kernel, moves the pins of the MSHV
+   packages in [`linux_mshv.py`](../scripts/setup/azure/nvx_azure/linux_mshv.py) to the new
+   host's releases, which a test compares with the host file. Runners install the pinned
+   releases whenever they're provisioned, as after a reimage, so that a reimage alone never
+   moves the series to another hypervisor
+   ([Azure CI runner provisioning](../scripts/setup/azure/README.md#configuration)).
 
 The pull request's platform job compares the runner with the new file, and the gate treats the
 reset metrics as warmup. The gate compares the pull request's expected hosts with the base
@@ -814,7 +972,11 @@ After the merge, `dev` pushes restart the series' ten-point warmup.
 
 The lifecycle benchmark uses the optimized 128 MiB shell-ready guest as one baseline across KVM,
 MSHV, and WHP. Host timing starts immediately before `Popen`, so cold-start and restore values
-include OpenVMM process startup and VM construction. Snapshot generation uses OpenVMM's monotonic
+include OpenVMM process startup and VM construction. On Linux, that startup includes the execs of
+`setpriv` and of a shell that checks that the coordinator still runs, which make the coordinator's
+exit kill OpenVMM (see [Cancellation](ci.md#cancellation)). On a Xeon Silver 4114 host, they added
+2.1 ms to the time until OpenVMM ran with Dash as `/bin/sh`, and 3.5 ms with Bash, which the Azure
+Linux runners use. Snapshot generation uses OpenVMM's monotonic
 process clock from the beginning of input gating, after the guest requests the snapshot, through
 atomic publication. It does not include delivery of `nvx-snapshot` over the polling console.
 Host request-to-publication and first publication observation (polled every 1 ms) remain diagnostics.

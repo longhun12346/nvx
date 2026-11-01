@@ -29,7 +29,10 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Disabled while tools/nvxd is ported onto the nvx library: the crate does not compile now because
+  # the aci_edge_sandboxes crate it was built on was removed upstream. Re-enable it with that port.
   sidecar:
+    if: ${{ false }}
     name: nvxd / windows
     runs-on: windows-latest
     timeout-minutes: 40
@@ -195,11 +198,6 @@ jobs:
           cargo "+${{ steps.rust.outputs.channel }}" build --locked --release
           -p openvmm --bin openvmm -p whp --bin whp-legacy-cpuid-probe
 
-      - name: Build nvxd (release)
-        working-directory: tools/nvxd
-        run: >
-          cargo "+${{ steps.rust.outputs.channel }}" build --locked --release
-
       - name: Collect the binaries and prove they are 64-bit
         run: |
           set -euo pipefail
@@ -207,7 +205,6 @@ jobs:
           mkdir -p "${out}"
           cp openvmm/target/release/openvmm.exe "${out}/"
           cp openvmm/target/release/whp-legacy-cpuid-probe.exe "${out}/"
-          cp tools/nvxd/target/release/nvxd.exe "${out}/"
           cp LICENSE THIRD_PARTY_NOTICES.md "${out}/"
           # PE header: the machine field must be 0x8664 (x86-64) in every executable.
           for exe in "${out}"/*.exe; do

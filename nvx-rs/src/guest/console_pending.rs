@@ -5,19 +5,13 @@ use std::ffi::CString;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use super::status::{CommandError, ExitStatus};
+use super::status::{CommandError, run_main};
 use super::sys::{self, Errno, Mode, OpenFlags};
 
 /// Runs `nvx-console-pending` with the process's arguments. It exits with 0, 1 when an operation
 /// fails, or 2 for a usage error.
 pub fn main() -> ExitCode {
-    sys::restore_sigpipe();
-    ExitStatus::from(run(
-        &sys::args(),
-        &mut sys::Stdout::new(),
-        &mut io::stderr(),
-    ))
-    .into()
+    run_main(|args| run(args, &mut sys::Stdout::new(), &mut io::stderr()))
 }
 
 /// Opens the requested device, queries and closes it, and prints its pending byte count.
@@ -40,22 +34,17 @@ fn run(args: &[CString], out: &mut dyn Write, err: &mut dyn Write) -> Result<(),
                 b"\n",
             ],
         );
+        CommandError::Operation
     };
 
     let flags =
         OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC | OpenFlags::O_NOCTTY | OpenFlags::O_NONBLOCK;
-    let descriptor = sys::open(device, flags, Mode::empty()).map_err(|error| {
-        fail(err, b"open", error);
-        CommandError::Operation
-    })?;
-    let pending = sys::console_pending(&descriptor).map_err(|error| {
-        fail(err, b"ioctl", error);
-        CommandError::Operation
-    })?;
-    descriptor.close().map_err(|error| {
-        fail(err, b"close", error);
-        CommandError::Operation
-    })?;
+    let descriptor =
+        sys::open(device, flags, Mode::empty()).map_err(|error| fail(err, b"open", error))?;
+    let pending = sys::console_pending(&descriptor).map_err(|error| fail(err, b"ioctl", error))?;
+    descriptor
+        .close()
+        .map_err(|error| fail(err, b"close", error))?;
     if let Err(errno) = sys::print(out, format!("{pending}\n").as_bytes()) {
         let text = errno.desc().as_bytes();
         sys::report(err, &[b"nvx-console-pending: write: ", text, b"\n"]);
@@ -72,15 +61,11 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use crate::guest::status::{ExitStatus, command_line};
     use crate::guest::sys::tests::Failing;
 
     fn console_pending(arguments: &[&[u8]]) -> (u8, Vec<u8>, Vec<u8>) {
-        let mut args = vec![CString::new("nvx-console-pending").unwrap()];
-        args.extend(
-            arguments
-                .iter()
-                .map(|argument| CString::new(*argument).unwrap()),
-        );
+        let args = command_line("nvx-console-pending", arguments);
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let status = ExitStatus::from(run(&args, &mut out, &mut err));
         (status as u8, out, err)
@@ -156,10 +141,7 @@ mod tests {
     #[test]
     fn reports_a_failed_write() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let args = [
-            CString::new("nvx-console-pending").unwrap(),
-            CString::new(file.path().as_os_str().as_bytes()).unwrap(),
-        ];
+        let args = command_line("nvx-console-pending", &[file.path().as_os_str().as_bytes()]);
         let mut err = Vec::new();
         assert_eq!(
             ExitStatus::from(run(&args, &mut Failing(Errno::EIO), &mut err)),

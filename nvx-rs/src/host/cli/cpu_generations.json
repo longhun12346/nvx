@@ -1,0 +1,69 @@
+[
+  {
+    "id": "intel.skylake-sp.v1",
+    "vendor": "GenuineIntel",
+    "generation": {
+      "name": "skylake-sp",
+      "cpus": [{ "family": 6, "model": 85, "steppings": [0, 4] }]
+    }
+  },
+  {
+    "id": "intel.icelake-sp.v1",
+    "vendor": "GenuineIntel",
+    "generation": {
+      "name": "icelake-sp",
+      "cpus": [{ "family": 6, "model": 106, "steppings": [0, 15] }]
+    }
+  },
+  {
+    "id": "intel.emeraldrapids.v1",
+    "vendor": "GenuineIntel",
+    "generation": {
+      "name": "emeraldrapids",
+      "cpus": [{ "family": 6, "model": 207, "steppings": [0, 15] }]
+    }
+  },
+  {
+    "id": "intel.alderlake.v1",
+    "vendor": "GenuineIntel",
+    "generation": {
+      "name": "alderlake",
+      "cpus": [
+        { "family": 6, "model": 151, "steppings": [0, 15] },
+        { "family": 6, "model": 154, "steppings": [0, 15] }
+      ]
+    }
+  },
+  {
+    "id": "amd.milan.v1",
+    "vendor": "AuthenticAMD",
+    "generation": {
+      "name": "milan",
+      "cpus": [{ "family": 25, "model": 1, "steppings": [0, 15] }]
+    }
+  },
+  {
+    "id": "amd.genoa.v1",
+    "vendor": "AuthenticAMD",
+    "generation": {
+      "name": "genoa",
+      "cpus": [{ "family": 25, "model": 17, "steppings": [0, 15] }]
+    }
+  },
+  {
+    "id": "amd.genoa.v2",
+    "vendor": "AuthenticAMD",
+    "generation": {
+      "name": "genoa",
+      "cpus": [{ "family": 25, "model": 17, "steppings": [0, 15] }]
+    }
+  },
+  {
+    "id": "amd.turin.v1",
+    "vendor": "AuthenticAMD",
+    "generation": {
+      "name": "turin",
+      "cpus": [{ "family": 26, "model": 2, "steppings": [0, 15] }]
+    }
+  }
+]

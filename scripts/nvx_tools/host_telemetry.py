@@ -6,19 +6,21 @@
 """Record safe benchmark host provenance and bounded storage telemetry.
 
 Provenance names the runner and machine, the operating system with its kernel
-release or Windows build and cumulative-update revision, the CPU with its
-signature and microcode revision, the memory, the Azure VM size and
-managed-disk configuration, and the volumes behind the benchmark's workspace,
-temporary, and scratch directories. It never records credentials, network
-addresses, Azure resource identifiers, names, or tags.
+release or Windows build and cumulative-update revision, the hypervisor that a
+Linux host runs under with its build, the CPU with its signature and microcode
+revision, the memory, the Azure VM size and managed-disk configuration, and the
+volumes behind the benchmark's workspace, temporary, and scratch directories.
+It never records credentials, network addresses, Azure resource identifiers,
+names, or tags.
 
 Storage telemetry samples cumulative operating-system counters while a
 snapshot capture runs, so that each profiled capture phase can be compared
 with the disk, CPU, writeback, and Microsoft Defender activity that overlapped
-it. Windows CI jobs run as Network Service, which cannot read performance
-counters, so the sampler uses only interfaces that any account can query:
-volume performance IOCTLs, whose on-demand counters an open disk performance
-WMI data block enables, GetSystemTimes, and NtQuerySystemInformation.
+it, and for a few seconds when a device-io attempt hangs. Windows CI jobs run
+as Network Service, which cannot read performance counters, so the sampler
+uses only interfaces that any account can query: volume performance IOCTLs,
+whose on-demand counters an open disk performance WMI data block enables,
+GetSystemTimes, and NtQuerySystemInformation.
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from pathlib import Path
 from typing import NamedTuple, Protocol, cast
 
@@ -61,6 +63,8 @@ AZURE_IMDS_URL = (
 AZURE_IMDS_TIMEOUT_SECONDS = 2.0
 AZURE_IMDS_ATTEMPTS = 3
 AZURE_CHASSIS_ASSET_TAG = "7783-7084-3265-9085-8269-3286-77"
+WINDOWS_AZURE_METADATA_SNAPSHOT = Path(r"C:\ProgramData\NvxCiHostMetadata\compute.json")
+LINUX_AZURE_METADATA_SNAPSHOT = Path("/var/lib/nvx-ci-host-metadata/compute.json")
 DEFENDER_PROCESS_NAMES = frozenset({"msmpeng.exe", "mpdefendercoreservice.exe"})
 MIB = 1024 * 1024
 GIB = 1024 * MIB
@@ -76,6 +80,31 @@ _WINDOWS_CURRENT_VERSION_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
 _WINDOWS_PROCESSOR = re.compile(r"Family (\d+) Model (\d+) Stepping (\d+), (\S+)")
 _CPUINFO = Path("/proc/cpuinfo")
 _SCSI_ADDRESS = re.compile(r"\d+:\d+:\d+:\d+")
+# The x86-64 System V machine code of
+# void cpuid(uint32_t leaf, uint32_t subleaf, uint32_t registers[4]),
+# which runs CPUID and stores EAX, EBX, ECX, and EDX in registers.
+_CPUID_CODE = bytes.fromhex(
+    "53"  # push rbx, which CPUID overwrites and the function must preserve
+    "4989d0"  # mov r8, rdx
+    "89f8"  # mov eax, edi
+    "89f1"  # mov ecx, esi
+    "0fa2"  # cpuid
+    "418900"  # mov [r8], eax
+    "41895804"  # mov [r8 + 4], ebx
+    "41894808"  # mov [r8 + 8], ecx
+    "4189500c"  # mov [r8 + 12], edx
+    "5b"  # pop rbx
+    "c3"  # ret
+)
+_HYPERVISOR_PRESENT = 1 << 31
+"""CPUID.1:ECX[31], set when the OS runs under a hypervisor."""
+_HYPERVISOR_VENDOR_LEAF = 0x4000_0000
+_HYPERVISOR_INTERFACE_LEAF = 0x4000_0001
+_HYPERVISOR_VERSION_LEAF = 0x4000_0002
+_MICROSOFT_HYPERVISOR_INTERFACE = "Hv#1"
+
+Cpuid = Callable[[int, int], tuple[int, int, int, int]]
+"""Runs CPUID with a leaf and a subleaf, and returns EAX, EBX, ECX, and EDX."""
 
 
 def host_provenance(volumes: Mapping[str, Path]) -> dict[str, object]:
@@ -89,6 +118,7 @@ def host_provenance(volumes: Mapping[str, Path]) -> dict[str, object]:
         "machine_name": platform.node() or None,
         "os": platform.platform(),
         "os_version": os_version(),
+        "hypervisor": hypervisor_provenance(),
         "cpu_model": cpu_model(),
         "cpu": cpu_signature(),
         "logical_processors": os.cpu_count(),
@@ -196,6 +226,122 @@ def _cpuinfo() -> dict[str, str]:
     return fields
 
 
+def hypervisor_provenance() -> dict[str, object] | None:
+    """Return the hypervisor that the host OS runs under, as CPUID reports it
+    to the OS: the Microsoft hypervisor that runs an MSHV root partition and
+    its VMs, or the hypervisor of a VM's host.
+
+    ``vendor`` is the signature of CPUID leaf 0x40000000, such as
+    ``Microsoft Hv``, or None without a hypervisor. ``build`` is the version
+    of a Microsoft hypervisor in leaf 0x40000002, ``major.minor.build.service``,
+    such as ``10.0.26100.9444``, which Linux logs as its ``Hyper-V: Host
+    Build`` and OpenVMM's CPU fingerprint records. Only x86-64 Linux hosts
+    read CPUID, without privileges; elsewhere, this returns None, and a host
+    that cannot run CPUID records the error.
+    """
+    if (
+        sys.platform != "linux"
+        or platform.machine() != "x86_64"
+        or ctypes.sizeof(ctypes.c_void_p) != 8
+    ):
+        return None
+    try:
+        with _linux_cpuid() as cpuid:
+            return identify_hypervisor(cpuid)
+    except OSError as error:
+        return {"error": f"CPUID is unavailable: {error}"}
+
+
+def identify_hypervisor(cpuid: Cpuid) -> dict[str, object]:
+    """Return the vendor and build of the hypervisor that ``cpuid`` reports,
+    as OpenVMM's CPU fingerprint identifies them: the build only for the
+    Microsoft hypervisor interface, ``Hv#1``, and without the service branch
+    of EDX[31:24]."""
+    if not cpuid(1, 0)[2] & _HYPERVISOR_PRESENT:
+        return {"vendor": None, "build": None}
+    max_leaf, ebx, ecx, edx = cpuid(_HYPERVISOR_VENDOR_LEAF, 0)
+    interface = None
+    if max_leaf >= _HYPERVISOR_INTERFACE_LEAF:
+        interface = _register_text(cpuid(_HYPERVISOR_INTERFACE_LEAF, 0)[0])
+    build = None
+    if (
+        interface == _MICROSOFT_HYPERVISOR_INTERFACE
+        and max_leaf >= _HYPERVISOR_VERSION_LEAF
+    ):
+        number, version, _, service = cpuid(_HYPERVISOR_VERSION_LEAF, 0)
+        build = f"{version >> 16}.{version & 0xFFFF}.{number}.{service & 0xFF_FFFF}"
+    return {"vendor": _register_text(ebx, ecx, edx) or None, "build": build}
+
+
+def _register_text(*registers: int) -> str:
+    """Return the text of the little-endian bytes of CPUID ``registers``,
+    without the NULs and spaces that pad it."""
+    data = b"".join(register.to_bytes(4, "little") for register in registers)
+    return data.decode("utf-8", "replace").rstrip("\0").strip()
+
+
+@contextlib.contextmanager
+def _linux_cpuid() -> Generator[Cpuid, None, None]:
+    """Yield a function that runs CPUID on this x86-64 Linux host until the
+    context exits.
+
+    Python can't execute CPUID itself, so the function runs ``_CPUID_CODE``
+    from a private anonymous page, which is only writable while the code is
+    copied into it and only executable once it runs. Any account may do that
+    unless the kernel forbids executable anonymous memory, as some SELinux
+    policies do; mmap and mprotect then fail with their errno.
+    """
+    if sys.platform != "linux":
+        raise OSError("CPUID runs only on x86-64 Linux")
+    libc = ctypes.CDLL(None, use_errno=True)
+    allocate = libc.mmap
+    allocate.restype = ctypes.c_void_p
+    allocate.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_long,
+    )
+    protect = libc.mprotect
+    protect.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    release = libc.munmap
+    release.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+    size = mmap.PAGESIZE
+    address = allocate(
+        None,
+        size,
+        mmap.PROT_READ | mmap.PROT_WRITE,
+        mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+        -1,
+        0,
+    )
+    if address is None or address == ctypes.c_void_p(-1).value:
+        raise _errno_error("mmap")
+    try:
+        ctypes.memmove(address, _CPUID_CODE, len(_CPUID_CODE))
+        if protect(address, size, mmap.PROT_READ | mmap.PROT_EXEC) != 0:
+            raise _errno_error("mprotect")
+        function = ctypes.CFUNCTYPE(
+            None, ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)
+        )(address)
+
+        def cpuid(leaf: int, subleaf: int) -> tuple[int, int, int, int]:
+            registers = (ctypes.c_uint32 * 4)()
+            function(leaf, subleaf, registers)
+            return (registers[0], registers[1], registers[2], registers[3])
+
+        yield cpuid
+    finally:
+        release(address, size)
+
+
+def _errno_error(call: str) -> OSError:
+    number = ctypes.get_errno()
+    return OSError(number, f"{call} failed: {os.strerror(number)}")
+
+
 def _windows_registry_value(key: str, name: str) -> object:
     """Return a value under HKEY_LOCAL_MACHINE, which any account can read."""
     if sys.platform != "win32":
@@ -241,9 +387,9 @@ def physical_memory_bytes() -> int | None:
 def azure_vm_provenance() -> dict[str, object] | None:
     """Return the Azure VM size and disks, or None off Azure.
 
-    The instance metadata service is queried once per process, with up to
-    ``AZURE_IMDS_ATTEMPTS`` attempts when it can't be reached: unavailable
-    metadata fails the benchmark host check.
+    Provisioned runners read their administrator-owned metadata snapshot.
+    Other hosts query instance metadata once per process, with up to
+    ``AZURE_IMDS_ATTEMPTS`` attempts: unavailable metadata fails the host check.
     """
     return copy.deepcopy(_azure_vm_provenance())
 
@@ -252,6 +398,35 @@ def azure_vm_provenance() -> dict[str, object] | None:
 def _azure_vm_provenance() -> dict[str, object] | None:
     if not may_be_azure_vm():
         return None
+    snapshot = (
+        WINDOWS_AZURE_METADATA_SNAPSHOT
+        if sys.platform == "win32"
+        else LINUX_AZURE_METADATA_SNAPSHOT
+    )
+    if snapshot.parent.is_dir():
+        try:
+            with snapshot.open("rb") as stream:
+                payload = stream.read(65537)
+            if len(payload) > 65536:
+                raise ValueError("snapshot exceeds 65536 bytes")
+            parsed: object = json.loads(payload)
+            if not isinstance(parsed, dict):
+                raise ValueError("snapshot has no compute disk profile")
+            compute = cast(dict[str, object], parsed)
+            profile = compute.get("storageProfile")
+            if not isinstance(profile, dict):
+                raise ValueError("snapshot has no complete disk profile")
+            disks = cast(dict[str, object], profile)
+            if (
+                not isinstance(disks.get("osDisk"), dict)
+                or not isinstance(disks.get("dataDisks"), list)
+                or not disks["dataDisks"]
+                or not isinstance(disks.get("resourceDisk"), dict)
+            ):
+                raise ValueError("snapshot has no complete disk profile")
+            return azure_compute_provenance(compute)
+        except (OSError, ValueError) as invalid:
+            return {"error": f"Azure host metadata snapshot is invalid: {invalid}"}
     error: Exception | None = None
     for _ in range(AZURE_IMDS_ATTEMPTS):
         try:
@@ -513,6 +688,9 @@ def host_provenance_rows(host: Mapping[str, object]) -> list[tuple[str, str]]:
         ("Machine", _text(host.get("machine_name")) or "unknown"),
         ("Operating system", system),
     ]
+    hypervisor = _string_keys(host.get("hypervisor"))
+    if hypervisor:
+        rows.append(("Hypervisor", _describe_hypervisor(hypervisor)))
     cpu = _text(host.get("cpu_model")) or "unknown CPU"
     signature = describe_cpu_signature(_string_keys(host.get("cpu")))
     if signature:
@@ -537,6 +715,16 @@ def host_provenance_rows(host: Mapping[str, object]) -> list[tuple[str, str]]:
 def describe_host_provenance(host: Mapping[str, object]) -> str:
     """Return recorded host provenance as one line."""
     return "; ".join(f"{label}: {value}" for label, value in host_provenance_rows(host))
+
+
+def _describe_hypervisor(hypervisor: Mapping[str, object]) -> str:
+    """Return a recorded hypervisor, such as ``Microsoft Hv 10.0.26100.9444``,
+    ``none``, or the error that kept it from being read."""
+    error = _text(hypervisor.get("error"))
+    if error is not None:
+        return error
+    parts = [_text(hypervisor.get(name)) for name in ("vendor", "build")]
+    return " ".join(part for part in parts if part is not None) or "none"
 
 
 def describe_cpu_signature(cpu: Mapping[str, object]) -> str:
@@ -1276,6 +1464,27 @@ class StorageTelemetry:
             "phases": phases,
         }
 
+    def describe(self, start_ns: int, end_ns: int) -> str:
+        """Stop sampling and describe the counters from ``start_ns`` to
+        ``end_ns`` on the sample clock in one line."""
+        self.stop()
+        description = self._reader.description()
+        page_size = description.get("page_size_bytes")
+        window = summarize_storage_window(
+            self._samples,
+            start_ns,
+            end_ns,
+            page_size=page_size if isinstance(page_size, int) else mmap.PAGESIZE,
+        )
+        text = (
+            "no two samples bound the window"
+            if window is None
+            else describe_storage_window(window, _group(description, "volumes"))
+        )
+        if self._errors:
+            text += f" (errors: {'; '.join(self._errors)})"
+        return text
+
     def _run(self) -> None:
         while not self._stop_requested.wait(self._interval_seconds):
             if not self._sample(final=False):
@@ -1317,6 +1526,18 @@ def create_storage_telemetry(
     if sys.platform != "win32" or ctypes.sizeof(ctypes.c_void_p) != 8:
         return None
     return StorageTelemetry(WindowsCounterReader(volumes), origin_ns)
+
+
+def describe_volume_activity(volumes: Mapping[str, Path], seconds: float) -> str | None:
+    """Sample ``volumes`` for ``seconds`` and describe their activity in one
+    line, or return None where storage telemetry is unsupported."""
+    origin_ns = time.perf_counter_ns()
+    telemetry = create_storage_telemetry(volumes, origin_ns)
+    if telemetry is None:
+        return None
+    telemetry.start()
+    time.sleep(seconds)
+    return telemetry.describe(0, time.perf_counter_ns() - origin_ns)
 
 
 class _Endpoints(NamedTuple):

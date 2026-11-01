@@ -1,3 +1,9 @@
+# STATUS: does not build. The aci_edge_sandboxes crate below was removed upstream (it is not in
+# this tree any more), so nothing builds or tests this crate, including the fork workflows
+# (the sidecar job in .github/workflows/fork-ci.yml is switched off). The sidecar is being
+# ported onto the `nvx` library in nvx-rs; until then this file only records what it needs.
+# The sources of the removed control client are in reference/ for the port.
+
 [package]
 name = "nvxd"
 version = "0.1.0"

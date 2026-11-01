@@ -1,13 +1,14 @@
 """Public CLI acceptance for the managed sandbox lifecycle and security profile.
 
-The scenario runs `nvx.py sandbox` as subprocesses against the real kernel, the
+The scenario runs `nvx-rs sandbox` as subprocesses against the real kernel, the
 Alpine control initramfs, the Ubuntu EROFS layer, and ext4 scratch copies. It
 checks identity admission, fail-closed lifecycle transitions, that overlapping
 starts launch one VM, warm-guest state across exec requests and restarts, the
 guest security profile and resource limits, bounded output and outcome reports,
-and that stop, a crash, and deprovision leave no OpenVMM process, control
-endpoint, capability, or runtime record behind while the supplied layer and
-scratch artifacts stay intact.
+that the CLI of artifacts of another runtime identity drives no VM that these
+started and its stop terminates OpenVMM, and that stop, a crash, and
+deprovision leave no OpenVMM process, control endpoint, capability, or runtime
+record behind while the supplied layer and scratch artifacts stay intact.
 """
 
 from __future__ import annotations
@@ -25,11 +26,17 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from . import sandbox_lifecycle
-from .build_constants import BuildConstants
+from . import nvx_rs
+from .build_constants import (
+    BuildConstants,
+    InitramfsBuildConstants,
+    KernelBuildConstants,
+    OpenVMMBuildConstants,
+)
 from .common import sha256_file
 from .managed_exec_tests import (
     WorkloadArtifacts,
@@ -66,16 +73,49 @@ EXT4_INCOMPAT_RECOVER = 0x4
 MANAGED_SUCCESS = {"operation": "managed", "category": "success", "status_code": 0}
 # The guest powers off with status 125 when it refuses the workload identity,
 # and a managed start reports the status from OpenVMM's outcome report.
-MANAGED_REFUSAL = {"operation": "managed", "category": "guest-exit", "status_code": 125}
-REFUSED_START = b"error: OpenVMM exited during startup: guest-exit status 125"
+REFUSAL_CATEGORY = "guest-exit"
+MANAGED_REFUSAL = {
+    "operation": "managed",
+    "category": REFUSAL_CATEGORY,
+    "status_code": 125,
+}
 
-CONFIG = sandbox_lifecycle.CONFIG_NAME
-RUNTIME = sandbox_lifecycle.RUNTIME_NAME
-CAPABILITY = sandbox_lifecycle.CAPABILITY_NAME
-LOG = sandbox_lifecycle.LOG_NAME
-SOCKET = sandbox_lifecycle.CONTROL_SOCKET_NAME
-OUTCOME = sandbox_lifecycle.OUTCOME_NAME
-LOCK = sandbox_lifecycle.LOCK_NAME
+
+@dataclass(frozen=True)
+class Refusal:
+    """An error that a public operation must report: the stable code of
+    nvx-rs's error, and stable fragments of its message, such as the names of
+    options, files, and parts, which the wording around them may change."""
+
+    code: str
+    fragments: tuple[str, ...] = ()
+
+    def matches(self, stderr: bytes) -> bool:
+        reported = nvx_rs.reported_error(stderr)
+        return (
+            reported is not None
+            and reported.code == self.code
+            and all(fragment in reported.message for fragment in self.fragments)
+        )
+
+    def __str__(self) -> str:
+        named = "".join(f" naming {fragment!r}" for fragment in self.fragments)
+        return f"error {self.code!r}{named}"
+
+
+# A start that OpenVMM ended names the category of its outcome report.
+REFUSED_START = Refusal("exited", (REFUSAL_CATEGORY,))
+
+# The files of a state directory, as nvx-rs sandbox documents them.
+CONFIG = "config.json"
+RUNTIME = "runtime.json"
+CAPABILITY = "control.capability"
+LOG = "openvmm.log"
+SOCKET = "control.sock"
+OUTCOME = "outcome.json"
+LOCK = "sandbox.lock"
+# The fields of the store's runtime record.
+RUNTIME_FIELDS = frozenset({"format", "launch", "process", "endpoint", "runtime"})
 PROVISIONED_ENTRIES = frozenset({CONFIG, LOCK})
 # Windows hosts serve the control endpoint as a named pipe outside the state.
 RUNNING_ENTRIES = frozenset(
@@ -84,7 +124,57 @@ RUNNING_ENTRIES = frozenset(
     else {CONFIG, LOCK, RUNTIME, CAPABILITY, LOG, SOCKET}
 )
 STOPPED_ENTRIES = frozenset({CONFIG, LOCK, LOG, OUTCOME})
-ALREADY_RUNNING = b"sandbox is already running or has stale runtime state"
+# OpenVMM that exits without a stop publishes no outcome report, and the
+# transition that finds it exited clears its runtime record.
+CRASHED_ENTRIES = frozenset({CONFIG, LOCK, LOG})
+ALREADY_RUNNING = Refusal("sandbox-running")
+STALE = Refusal("sandbox-exited")
+NOT_RUNNING = Refusal("sandbox-not-running")
+NOT_PROVISIONED = Refusal("sandbox-not-provisioned")
+# nvx-rs reads the runtime identity of a checkout from the build provenance of
+# its OpenVMM, kernel, and initramfs alone, without hashing an artifact.
+PROVENANCE_NAMES = (
+    OpenVMMBuildConstants.PROVENANCE_NAME,
+    KernelBuildConstants.PROVENANCE_NAME,
+    InitramfsBuildConstants.PROVENANCE_NAME,
+)
+INITRAMFS_DIGEST = "initramfs_sha256"
+
+
+def other_runtime_refusal(pid: int) -> Refusal:
+    """Returns the error of a start or exec of a VM that the artifacts of another
+    initramfs started, whose OpenVMM process is pid."""
+    return Refusal("runtime-mismatch", ("initramfs", str(pid)))
+
+
+def is_other_runtime_termination(stderr: bytes, pid: int) -> bool:
+    """Returns whether `stderr` is only the warning of a stop that terminated
+    the OpenVMM process pid of a VM that the artifacts of another initramfs
+    started, which names the part that differs and the process."""
+    text = stderr.replace(b"\r\n", b"\n").decode("utf-8", errors="replace")
+    return (
+        text.startswith("warning: ")
+        and text.count("\n") == 1
+        and text.endswith("\n")
+        and "initramfs" in text
+        and str(pid) in text
+    )
+
+
+def read_build_provenance() -> dict[str, dict[str, Any]]:
+    """Returns the build provenance from which nvx-rs reads the runtime identity
+    of the checkout, by file name."""
+    provenance: dict[str, dict[str, Any]] = {}
+    for name in PROVENANCE_NAMES:
+        path = BuildConstants.BUILD_DIR / name
+        try:
+            value: object = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"build provenance is unreadable: {path}") from error
+        if not isinstance(value, dict):
+            raise RuntimeError(f"build provenance is not an object: {path}")
+        provenance[name] = cast(dict[str, Any], value)
+    return provenance
 
 
 def openvmm_processes(marker: str) -> tuple[int, ...]:
@@ -125,8 +215,20 @@ def openvmm_processes(marker: str) -> tuple[int, ...]:
     return tuple(sorted(processes))
 
 
+def recorded_pid(runtime: dict[str, Any]) -> int:
+    """Returns the ID of the OpenVMM process that a runtime record names."""
+    return int(runtime["process"]["pid"])
+
+
+def openvmm_running(runtime: dict[str, Any], marker: str) -> bool:
+    """Returns whether the OpenVMM process of a runtime record still runs: an
+    OpenVMM process with its ID whose arguments contain marker, the name of
+    the fixture, which no other process names."""
+    return recorded_pid(runtime) in openvmm_processes(marker)
+
+
 def control_endpoint_present(runtime: dict[str, Any]) -> bool:
-    endpoint = str(runtime["control_endpoint"])
+    endpoint = str(runtime["endpoint"])
     if sys.platform == "win32":
         return endpoint.rsplit("/", 1)[-1] in os.listdir("//./pipe/")
     return os.path.lexists(endpoint)
@@ -139,19 +241,49 @@ def terminate_process(pid: int) -> None:
         os.kill(pid, signal.SIGKILL)
 
 
-def kill_openvmm(runtime: dict[str, Any], timeout: float) -> None:
-    """Ends the OpenVMM process of a runtime record, as a crash would."""
-    if sandbox_lifecycle.runtime_process_running(runtime):
+def openvmm_threads_remain(runtime: dict[str, Any]) -> bool:
+    """Returns whether a thread of the OpenVMM process of a runtime record
+    remains on Linux, where nvx-rs counts a process as running until its last
+    thread exits: a killed process's main thread can be a zombie, whose command
+    line is empty, while its other threads still exit."""
+    if sys.platform == "win32":
+        return False
+    pid = recorded_pid(runtime)
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    fields = stat[stat.rindex(b")") + 1 :].split()
+    if int(fields[19]) != int(runtime["process"]["startTime"]):
+        # The ID names another process.
+        return False
+    if fields[0] == b"X":
+        return False
+    if fields[0] != b"Z":
+        return True
+    try:
+        return len(os.listdir(f"/proc/{pid}/task")) > 1
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+
+
+def kill_openvmm(runtime: dict[str, Any], timeout: float, marker: str) -> None:
+    """Ends the OpenVMM process of a runtime record, as a crash would, and waits
+    until it has exited as nvx-rs tells; marker names the fixture, as for
+    openvmm_running."""
+    if openvmm_running(runtime, marker):
         try:
-            terminate_process(int(runtime["pid"]))
+            terminate_process(recorded_pid(runtime))
         except OSError:
             # The process may have exited since the check.
-            if sandbox_lifecycle.runtime_process_running(runtime):
+            if openvmm_running(runtime, marker):
                 raise
     deadline = time.monotonic() + timeout
-    while sandbox_lifecycle.runtime_process_running(runtime):
+    while openvmm_running(runtime, marker) or openvmm_threads_remain(runtime):
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"OpenVMM process {runtime['pid']} survived its kill")
+            raise RuntimeError(
+                f"OpenVMM process {recorded_pid(runtime)} survived its kill"
+            )
         time.sleep(0.05)
 
 
@@ -172,10 +304,63 @@ def state_entries(state: Path) -> list[str] | None:
 
 def managed_outcome(state: Path) -> object:
     """Returns the outcome section of the OpenVMM report in a state directory."""
+    return managed_report(state).get("outcome")
+
+
+def managed_report(state: Path) -> dict[str, object]:
+    """Returns the OpenVMM report in a state directory, or an empty mapping if
+    it is not an object."""
     report: object = json.loads((state / OUTCOME).read_text(encoding="utf-8"))
     if not isinstance(report, dict):
-        return None
-    return cast(dict[str, object], report).get("outcome")
+        return {}
+    return cast(dict[str, object], report)
+
+
+def check_managed_report(
+    report: dict[str, object],
+    backend: str,
+    network_policy: dict[str, object] | None = None,
+) -> None:
+    """Checks the report of a managed sandbox that stopped cleanly.
+
+    These are the report checks of the direct-mode managed lifecycle
+    (nvx-rs/tests/managed_lifecycle.rs) that hold for the layered root too: the
+    report names the backend, reports `network_policy`, or that no network
+    policy was requested when that is None, and every teardown step completed.
+    """
+    outcome = report.get("outcome")
+    if outcome != MANAGED_SUCCESS:
+        raise RuntimeError(f"the managed outcome is {outcome!r}")
+    if report.get("backend") != backend:
+        raise RuntimeError(
+            f"the managed report names backend {report.get('backend')!r}"
+        )
+    policy = report.get("network_policy")
+    if network_policy is not None:
+        if policy != network_policy:
+            raise RuntimeError(f"the managed report has network policy {policy!r}")
+    else:
+        status = (
+            cast(dict[str, object], policy).get("status")
+            if isinstance(policy, dict)
+            else None
+        )
+        if status != "not-requested":
+            raise RuntimeError(
+                f"the managed report has network policy status {status!r}"
+            )
+    # microvm_tests, which runs this scenario, imports this module.
+    from .microvm_tests import OUTCOME_TEARDOWN_FIELDS
+
+    teardown = report.get("teardown")
+    if (
+        not isinstance(teardown, dict)
+        or set(cast(dict[str, object], teardown)) != set(OUTCOME_TEARDOWN_FIELDS)
+        or not all(
+            value is True for value in cast(dict[str, object], teardown).values()
+        )
+    ):
+        raise RuntimeError(f"the managed report has incomplete teardown: {teardown!r}")
 
 
 def bounded_evidence(data: bytes, omitted: int = 0) -> bytes:
@@ -199,12 +384,15 @@ def read_runtime(state: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RuntimeError(f"sandbox runtime record is not an object: {path}")
     runtime = cast(dict[str, Any], value)
-    if set(runtime) != {"format", "pid", "start_time", "control_endpoint"}:
+    if frozenset(runtime) != RUNTIME_FIELDS:
         raise RuntimeError(f"sandbox runtime record has unexpected fields: {path}")
     return runtime
 
 
 class LifecycleAcceptance:
+    # The prefix of the evidence files in the output directory.
+    evidence_prefix = EVIDENCE_PREFIX
+
     def __init__(
         self,
         backend: str,
@@ -222,6 +410,8 @@ class LifecycleAcceptance:
         self.state = root / "state"
         self.identity_state = root / "identity-state"
         self.scratch = root / "scratch.ext4"
+        # An artifact root whose runtime identity differs in the initramfs.
+        self.other_root = root / "other-runtime"
         self.checks: list[dict[str, object]] = []
 
     def launch_options(self, scratch: Path) -> list[str]:
@@ -237,14 +427,15 @@ class LifecycleAcceptance:
         ]
 
     def run_cli(
-        self, operation: str, *arguments: str, state: Path | None
+        self,
+        operation: str,
+        *arguments: str,
+        state: Path | None,
+        root: Path | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
-        command = [
-            sys.executable,
-            str(BuildConstants.REPO_ROOT / "scripts" / "nvx.py"),
-            "sandbox",
-            operation,
-        ]
+        """Runs one public operation with `nvx-rs sandbox`, under the artifact
+        root `root`, or else under this checkout."""
+        command = nvx_rs.command_line(("sandbox", operation), root=root)
         if state is not None:
             command.extend(("--state-dir", str(state)))
         command.extend(("--timeout", str(self.timeout), *arguments))
@@ -263,12 +454,14 @@ class LifecycleAcceptance:
         state: Path | None,
         expected: int | None,
     ) -> None:
+        reported = nvx_rs.reported_error(result.stderr)
         self.checks.append(
             {
                 "operation": operation,
                 "argv": evidence_argv([str(value) for value in result.args]),
                 "expected_returncode": expected,
                 "returncode": result.returncode,
+                "error_code": None if reported is None else reported.code,
                 "stdout_bytes": len(result.stdout),
                 "stderr_bytes": len(result.stderr),
                 "state_entries": None if state is None else state_entries(state),
@@ -281,19 +474,21 @@ class LifecycleAcceptance:
         *arguments: str,
         state: Path | None,
         expected: int | None = 0,
-        diagnostic: bytes | None = None,
+        refusal: Refusal | None = None,
+        root: Path | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         """Runs one public operation and records only its bounded observations.
 
-        It requires status `expected` unless that is None, and `diagnostic` in
-        standard error when given.
+        It requires status `expected` unless that is None, and the error of
+        `refusal` on standard error when given. With `root`, the operation runs
+        under that artifact root.
         """
-        result = self.run_cli(operation, *arguments, state=state)
+        result = self.run_cli(operation, *arguments, state=state, root=root)
         self.record(operation, result, state=state, expected=expected)
         if (expected is not None and result.returncode != expected) or (
-            diagnostic is not None and diagnostic not in result.stderr
+            refusal is not None and not refusal.matches(result.stderr)
         ):
-            wanted = "" if diagnostic is None else f" with {diagnostic.decode()!r}"
+            wanted = "" if refusal is None else f" with {refusal}"
             raise RuntimeError(
                 f"public sandbox {operation} returned {result.returncode}, expected "
                 f"{expected}{wanted}; stdout={bounded_text(result.stdout)!r}; "
@@ -306,7 +501,7 @@ class LifecycleAcceptance:
         entrypoint: str,
         *arguments: str,
         expected: int | None = 0,
-        diagnostic: bytes | None = None,
+        refusal: Refusal | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         return self.invoke(
             "exec",
@@ -315,7 +510,7 @@ class LifecycleAcceptance:
             *arguments,
             state=self.state,
             expected=expected,
-            diagnostic=diagnostic,
+            refusal=refusal,
         )
 
     def require_entries(
@@ -347,7 +542,7 @@ class LifecycleAcceptance:
             )
 
     def save_evidence(self, name: str, data: bytes, omitted: int = 0) -> None:
-        (self.output_dir / f"{EVIDENCE_PREFIX}{name}").write_bytes(
+        (self.output_dir / f"{self.evidence_prefix}{name}").write_bytes(
             bounded_evidence(data, omitted)
         )
 
@@ -361,7 +556,7 @@ class LifecycleAcceptance:
         self.save_evidence(name, data, size - len(data))
 
     def write_checks(self) -> None:
-        (self.output_dir / f"{EVIDENCE_PREFIX}checks.json").write_text(
+        (self.output_dir / f"{self.evidence_prefix}checks.json").write_text(
             json.dumps(self.checks, indent=2) + "\n", encoding="utf-8"
         )
 
@@ -380,6 +575,8 @@ class LifecycleAcceptance:
         restarted = self.start_overlapping()
         result = self.exec("/bin/cat", f"--arg={STATE_PATH}", expected=None)
         self.require_output(result, STATE_CONTENT, "the restarted sandbox's state")
+        self.check_other_runtime(restarted)
+        restarted = self.start(description="start after the termination")
         self.check_crash(restarted)
         self.check_deprovision()
         if not self.scratch.is_file():
@@ -397,7 +594,7 @@ class LifecycleAcceptance:
             "0:0",
             state=self.state,
             expected=2,
-            diagnostic=b"--workload-user UID must be between 1 and 4294967295",
+            refusal=Refusal("argument-invalid", ("--workload-user",)),
         )
         if self.state.exists():
             raise RuntimeError("a rejected root identity created sandbox state")
@@ -437,10 +634,14 @@ class LifecycleAcceptance:
             state=self.identity_state,
         )
         self.invoke(
-            "start", state=self.identity_state, expected=1, diagnostic=REFUSED_START
+            "start", state=self.identity_state, expected=1, refusal=REFUSED_START
         )
         self.copy_evidence(self.identity_state / LOG, "identity-openvmm.log")
         self.copy_evidence(self.identity_state / OUTCOME, "identity-outcome.json")
+        # OpenVMM publishes its report before it exits, rather than being ended
+        # while it writes it, which left only the report's staging file (#438).
+        if not (self.identity_state / OUTCOME).is_file():
+            raise RuntimeError("the refused managed start published no outcome report")
         self.require_entries(
             self.identity_state, STOPPED_ENTRIES, "after a refused managed start"
         )
@@ -458,7 +659,7 @@ class LifecycleAcceptance:
                 operation,
                 state=self.state,
                 expected=1,
-                diagnostic=b"sandbox state path is not a plain directory",
+                refusal=NOT_PROVISIONED,
             )
             if self.state.exists():
                 raise RuntimeError(f"{operation} created unprovisioned sandbox state")
@@ -482,7 +683,7 @@ class LifecycleAcceptance:
             *options,
             state=self.state,
             expected=1,
-            diagnostic=b"sandbox is already provisioned",
+            refusal=Refusal("sandbox-provisioned"),
         )
         if (self.state / CONFIG).read_bytes() != config:
             raise RuntimeError("a repeated provision changed the configuration")
@@ -491,7 +692,7 @@ class LifecycleAcceptance:
                 operation,
                 state=self.state,
                 expected=1,
-                diagnostic=b"sandbox is not running",
+                refusal=NOT_RUNNING,
             )
             self.require_entries(
                 self.state, PROVISIONED_ENTRIES, f"after {operation} before start"
@@ -519,10 +720,8 @@ class LifecycleAcceptance:
         for result in results:
             self.record("start", result, state=self.state, expected=None)
         refused = [result for result in results if result.returncode != 0]
-        if (
-            sorted(result.returncode for result in results) != [0, 1]
-            or ALREADY_RUNNING not in refused[0].stderr
-        ):
+        statuses = sorted(result.returncode for result in results)
+        if statuses != [0, 1] or not ALREADY_RUNNING.matches(refused[0].stderr):
             raise RuntimeError(
                 "overlapping public starts returned "
                 + "; ".join(
@@ -530,7 +729,7 @@ class LifecycleAcceptance:
                     f"stderr={bounded_text(result.stderr)!r}"
                     for result in results
                 )
-                + f", expected one success and one {ALREADY_RUNNING.decode()!r}"
+                + f", expected one success and one {ALREADY_RUNNING}"
             )
         return self.require_started("overlapping restart")
 
@@ -540,13 +739,13 @@ class LifecycleAcceptance:
         self.save_evidence(
             "runtime.json", (json.dumps(runtime, indent=2) + "\n").encode()
         )
-        if not sandbox_lifecycle.runtime_process_running(runtime):
+        if not openvmm_running(runtime, self.root.name):
             raise RuntimeError(f"OpenVMM is not running after the {description}")
         if not control_endpoint_present(runtime):
             raise RuntimeError(
                 f"the control endpoint is absent after the {description}"
             )
-        self.require_processes((int(runtime["pid"]),), f"after the {description}")
+        self.require_processes((recorded_pid(runtime),), f"after the {description}")
         return runtime
 
     def check_running_transitions(self, runtime: dict[str, Any]) -> None:
@@ -559,14 +758,14 @@ class LifecycleAcceptance:
             "start",
             state=self.state,
             expected=1,
-            diagnostic=ALREADY_RUNNING,
+            refusal=ALREADY_RUNNING,
         )
         if (self.state / RUNTIME).read_bytes() != record:
             raise RuntimeError("a repeated start changed the runtime record")
         if capability_digest() != capability:
             raise RuntimeError("a repeated start changed the control capability")
         self.require_entries(self.state, RUNNING_ENTRIES, "after a repeated start")
-        self.require_processes((int(runtime["pid"]),), "after a repeated start")
+        self.require_processes((recorded_pid(runtime),), "after a repeated start")
 
     def check_warm_state(self) -> None:
         # Managed arguments keep their whitespace, and a later request sees the
@@ -588,11 +787,16 @@ class LifecycleAcceptance:
         # probe's check that each container mount appears once also shows
         # that they did not mount into the agent's namespace.
         result = self.exec(
-            PROBE, "--arg=limits", f"--arg={MEMORY_MAX}", f"--arg={PIDS_MAX}"
+            PROBE,
+            "--arg=entry",
+            "--arg=limits",
+            f"--arg={MEMORY_MAX}",
+            f"--arg={PIDS_MAX}",
         )
         self.save_evidence("probe.log", result.stdout + result.stderr)
         for marker in (
             b"NVX-UBUNTU-SANDBOX-PROFILE-OK uid=65534 gid=65534",
+            b"NVX-UBUNTU-SANDBOX-ENTRY-OK",
             f"NVX-UBUNTU-SANDBOX-LIMITS-OK memory_max={MEMORY_MAX} "
             f"pids_max={PIDS_MAX}".encode(),
             b"NVX-UBUNTU-SANDBOX-OK uid=65534 gid=65534",
@@ -638,7 +842,7 @@ class LifecycleAcceptance:
             "--outcome-report",
             str(existing),
             expected=1,
-            diagnostic=b"outcome report already exists",
+            refusal=Refusal("outcome-report-exists", (existing.name,)),
         )
         if existing.read_text(encoding="utf-8") != FOREIGN_CONTENT:
             raise RuntimeError("a refused request overwrote an existing report")
@@ -653,12 +857,12 @@ class LifecycleAcceptance:
             "deprovision",
             state=self.state,
             expected=1,
-            diagnostic=b"sandbox must be stopped before deprovision",
+            refusal=ALREADY_RUNNING,
         )
         self.require_entries(self.state, RUNNING_ENTRIES, "after deprovision refused")
         if (self.state / RUNTIME).read_bytes() != record:
             raise RuntimeError("a refused deprovision changed the runtime record")
-        self.require_processes((int(runtime["pid"]),), "after deprovision refused")
+        self.require_processes((recorded_pid(runtime),), "after deprovision refused")
         result = self.exec("/bin/cat", f"--arg={STATE_PATH}", expected=None)
         self.require_output(
             result, STATE_CONTENT, "the state after deprovision refused"
@@ -667,15 +871,13 @@ class LifecycleAcceptance:
     def stop(self, runtime: dict[str, Any], layer_digest: str) -> None:
         self.invoke("stop", state=self.state)
         self.require_entries(self.state, STOPPED_ENTRIES, "after stop")
-        if sandbox_lifecycle.runtime_process_running(runtime):
+        if openvmm_running(runtime, self.root.name):
             raise RuntimeError("OpenVMM still runs after stop")
         if control_endpoint_present(runtime):
             raise RuntimeError("stop left the control endpoint behind")
         self.require_processes((), "after stop")
         self.copy_evidence(self.state / OUTCOME, "outcome.json")
-        outcome = managed_outcome(self.state)
-        if outcome != MANAGED_SUCCESS:
-            raise RuntimeError(f"the managed outcome is {outcome!r}")
+        check_managed_report(managed_report(self.state), self.backend)
         # A clean journal shows that stop unmounted the overlay and scratch
         # before the VM powered off.
         if not scratch_journal_clean(self.scratch):
@@ -687,29 +889,109 @@ class LifecycleAcceptance:
                 operation,
                 state=self.state,
                 expected=1,
-                diagnostic=b"sandbox is not running",
+                refusal=NOT_RUNNING,
             )
             self.require_entries(
                 self.state, STOPPED_ENTRIES, f"after {operation} after stop"
             )
 
+    def write_other_runtime(self) -> None:
+        """Writes the checkout's build provenance into the other artifact root,
+        with another initramfs digest, so that nvx-rs reads a runtime identity
+        there that differs from the checkout's in the initramfs."""
+        build = self.other_root / BuildConstants.BUILD_DIRECTORY_NAME
+        build.mkdir(parents=True)
+        for name, provenance in read_build_provenance().items():
+            if name == InitramfsBuildConstants.PROVENANCE_NAME:
+                digest = provenance.get(INITRAMFS_DIGEST)
+                if not isinstance(digest, str):
+                    raise RuntimeError(f"build provenance {name} names no initramfs")
+                provenance = {
+                    **provenance,
+                    INITRAMFS_DIGEST: hashlib.sha256(digest.encode()).hexdigest(),
+                }
+            (build / name).write_text(json.dumps(provenance), encoding="utf-8")
+
+    def check_other_runtime(self, runtime: dict[str, Any]) -> None:
+        # The CLI of other artifacts, as after an upgrade, reattaches to the VM
+        # but drives it through no control session, since the VM may speak
+        # other contracts: it refuses to start or exec, and its stop terminates
+        # OpenVMM without a guest shutdown, so OpenVMM reports no outcome.
+        self.write_other_runtime()
+        pid = recorded_pid(runtime)
+        record = (self.state / RUNTIME).read_bytes()
+        for operation, arguments, refusal in (
+            ("exec", ("--entrypoint", "/bin/true"), other_runtime_refusal(pid)),
+            ("start", (), other_runtime_refusal(pid)),
+            ("deprovision", (), ALREADY_RUNNING),
+        ):
+            self.invoke(
+                operation,
+                *arguments,
+                state=self.state,
+                expected=1,
+                refusal=refusal,
+                root=self.other_root,
+            )
+        self.require_entries(
+            self.state, RUNNING_ENTRIES, "after the refusals of another runtime"
+        )
+        if (self.state / RUNTIME).read_bytes() != record:
+            raise RuntimeError("another runtime changed the runtime record")
+        self.require_processes((pid,), "after the refusals of another runtime")
+        # The artifacts that started the VM still drive it.
+        result = self.exec("/bin/cat", f"--arg={STATE_PATH}", expected=None)
+        self.require_output(
+            result, STATE_CONTENT, "the state after the refusals of another runtime"
+        )
+
+        result = self.invoke("stop", state=self.state, root=self.other_root)
+        if result.stdout or not is_other_runtime_termination(result.stderr, pid):
+            raise RuntimeError(
+                "the stop of another runtime printed "
+                f"stdout={bounded_text(result.stdout)!r}, "
+                f"stderr={bounded_text(result.stderr)!r}, expected a warning that "
+                f"names the initramfs and OpenVMM process {pid}"
+            )
+        self.require_entries(
+            self.state, CRASHED_ENTRIES, "after the stop of another runtime"
+        )
+        if openvmm_running(runtime, self.root.name):
+            raise RuntimeError("OpenVMM still runs after the stop of another runtime")
+        if control_endpoint_present(runtime):
+            raise RuntimeError(
+                "the stop of another runtime left the control endpoint behind"
+            )
+        self.require_processes((), "after the stop of another runtime")
+        self.invoke(
+            "stop",
+            state=self.state,
+            expected=1,
+            refusal=NOT_RUNNING,
+            root=self.other_root,
+        )
+        self.require_entries(
+            self.state, CRASHED_ENTRIES, "after a repeated stop of another runtime"
+        )
+
     def check_crash(self, runtime: dict[str, Any]) -> None:
-        # OpenVMM exits without a stop, so its runtime record goes stale.
-        kill_openvmm(runtime, self.timeout)
+        # OpenVMM exits without a stop. The next transition finds that it
+        # exited, reports it once, and clears its runtime record.
+        kill_openvmm(runtime, self.timeout, self.root.name)
         self.require_processes((), "after OpenVMM was killed")
         if sys.platform == "win32" and control_endpoint_present(runtime):
             raise RuntimeError("the control pipe outlived OpenVMM")
-        stale = b"sandbox runtime state is stale because the OpenVMM process"
-        for operation, diagnostic in (
-            ("exec", stale),
-            ("stop", stale),
-            ("start", ALREADY_RUNNING),
+        for operation, refusal in (
+            ("exec", STALE),
+            ("stop", NOT_RUNNING),
         ):
-            self.invoke(operation, state=self.state, expected=1, diagnostic=diagnostic)
+            self.invoke(operation, state=self.state, expected=1, refusal=refusal)
             self.require_entries(
-                self.state, RUNNING_ENTRIES, f"after {operation} with stale state"
+                self.state, CRASHED_ENTRIES, f"after {operation} of a crashed sandbox"
             )
-        self.require_processes((), "after the stale-state requests")
+        if control_endpoint_present(runtime):
+            raise RuntimeError("the crashed sandbox kept its control endpoint")
+        self.require_processes((), "after the requests of a crashed sandbox")
 
     def check_deprovision(self) -> None:
         self.copy_evidence(self.state / LOG, "openvmm.log")
@@ -719,10 +1001,7 @@ class LifecycleAcceptance:
             "deprovision",
             state=self.state,
             expected=1,
-            diagnostic=(
-                b"sandbox state directory contains files not owned by NVX: "
-                + FOREIGN_NAME.encode()
-            ),
+            refusal=Refusal("foreign-files", (FOREIGN_NAME,)),
         )
         self.require_entries(
             self.state, frozenset({FOREIGN_NAME}), "after deprovision kept foreign data"
@@ -739,7 +1018,7 @@ class LifecycleAcceptance:
             "/bin/true",
             state=self.state,
             expected=1,
-            diagnostic=b"sandbox state path is not a plain directory",
+            refusal=NOT_PROVISIONED,
         )
         if self.state.exists():
             raise RuntimeError("exec recreated a deprovisioned sandbox's state")
@@ -757,12 +1036,11 @@ class LifecycleAcceptance:
                 if (state / RUNTIME).is_file():
                     runtime = read_runtime(state)
                     self.run_cli("stop", state=state)
-                    kill_openvmm(runtime, self.timeout)
+                    kill_openvmm(runtime, self.timeout, self.root.name)
             except Exception as error:
                 errors.append(error)
         # Every OpenVMM process whose arguments name the fixture is the
         # acceptance's own, even one that no runtime record names.
-        ended = False
         try:
             for pid in openvmm_processes(self.root.name):
                 with contextlib.suppress(OSError):
@@ -772,18 +1050,14 @@ class LifecycleAcceptance:
                 if time.monotonic() >= deadline:
                     raise RuntimeError(f"OpenVMM processes {list(strays)} survived")
                 time.sleep(0.05)
-            ended = True
         except Exception as error:
             errors.append(error)
         for state, label in states:
             try:
                 self.copy_evidence(state / LOG, f"{label}openvmm.log")
                 (state / FOREIGN_NAME).unlink(missing_ok=True)
-                if ended and not (state / RUNTIME).exists():
-                    # With no fixture OpenVMM left, runtime files that no record
-                    # names are stale, and deprovision refuses them.
-                    (state / CAPABILITY).unlink(missing_ok=True)
-                    (state / SOCKET).unlink(missing_ok=True)
+                # Deprovision ends a start that was interrupted, and clears the
+                # runtime record of an OpenVMM that exited.
                 result = self.run_cli("deprovision", state=state)
                 if result.returncode != 0:
                     raise RuntimeError(
@@ -795,32 +1069,51 @@ class LifecycleAcceptance:
         return errors
 
 
-def run_sandbox_lifecycle(backend: str, *, timeout: float, output_dir: Path) -> None:
-    artifacts = load_workload_artifacts()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    root = Path(tempfile.mkdtemp(prefix="nvx-public-lifecycle-"))
-    acceptance = LifecycleAcceptance(
-        backend,
-        timeout=timeout,
-        output_dir=output_dir,
-        artifacts=artifacts,
-        root=root,
-    )
+def run_acceptance(acceptance: LifecycleAcceptance) -> None:
+    """Runs an acceptance, then removes its fixture, which a failure keeps only
+    if its cleanup leaves a sandbox's state behind.
+
+    An interruption, as when CI cancels the job (#946), stops the sandboxes
+    that the acceptance started, as a failure does, and then propagates as it
+    is, after a warning that names any cleanup errors."""
     try:
         acceptance.run()
-    except Exception as error:
+    except BaseException as error:
         errors = acceptance.clean_up()
         try:
             acceptance.write_checks()
         except Exception as evidence_error:
             errors.append(evidence_error)
         if acceptance.state.exists() or acceptance.identity_state.exists():
-            preserved = bounded_text(str(root).encode("utf-8", errors="replace"))
+            preserved = bounded_text(
+                str(acceptance.root).encode("utf-8", errors="replace")
+            )
             errors.append(RuntimeError(f"fixture preserved for recovery: {preserved}"))
         else:
-            shutil.rmtree(root, ignore_errors=True)
-        if errors:
+            shutil.rmtree(acceptance.root, ignore_errors=True)
+        if errors and isinstance(error, Exception):
             raise RuntimeError(f"{error}; cleanup: {format_errors(errors)}") from error
+        if errors:
+            print(
+                f"warning: cleanup after the interruption: {format_errors(errors)}",
+                file=sys.stderr,
+                flush=True,
+            )
         raise
     acceptance.write_checks()
-    shutil.rmtree(root)
+    shutil.rmtree(acceptance.root)
+
+
+def run_sandbox_lifecycle(backend: str, *, timeout: float, output_dir: Path) -> None:
+    artifacts = load_workload_artifacts()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    root = Path(tempfile.mkdtemp(prefix="nvx-public-lifecycle-"))
+    run_acceptance(
+        LifecycleAcceptance(
+            backend,
+            timeout=timeout,
+            output_dir=output_dir,
+            artifacts=artifacts,
+            root=root,
+        )
+    )

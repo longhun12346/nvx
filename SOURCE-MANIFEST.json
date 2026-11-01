@@ -6,8 +6,14 @@
   },
   "openvmm": {
     "microvm_abi_version": 2,
+    "time_abi_version": 2,
+    "restore_packet_version": 5,
     "control_session_protocol_version": 1,
     "control_contract_revision": "nvx-microvm-v2-control-v2"
+  },
+  "guest_rust": {
+    "toolchain": "1.95.0",
+    "target": "x86_64-unknown-linux-musl"
   },
   "linux": {
     "version": "6.18.38",
@@ -20,7 +26,8 @@
     "patches": [
       "kernel/patches/0001-microvm-xe9-earlycon.patch",
       "kernel/patches/0002-microvm-hvc-xe9.patch",
-      "kernel/patches/0003-microvm-virtio-mmio-shared-status.patch"
+      "kernel/patches/0003-microvm-virtio-mmio-shared-status.patch",
+      "kernel/patches/0004-hvc-push-flip-buffer-under-lock.patch"
     ]
   },
   "alpine": {
@@ -31,7 +38,9 @@
     "minirootfs_sha256": "41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081",
     "guest_sources": [
       "guest/common",
-      "guest/alpine"
+      "guest/alpine",
+      "nvx-rs",
+      "rust-toolchain.toml"
     ],
     "package_manifests": [
       "build/initramfs.cpio.gz.packages.json"
@@ -52,7 +61,9 @@
     "guest_sources": [
       "guest/common",
       "guest/ubuntu",
-      "ubuntu/packages.lock.json"
+      "ubuntu/packages.lock.json",
+      "nvx-rs",
+      "rust-toolchain.toml"
     ],
     "package_manifests": [
       "build/initramfs-ubuntu.cpio.gz.packages.json",
@@ -70,7 +81,9 @@
     "package_lock_sha256": "f2014a858f46482778f138b374f80c36df389206ae677870d58a7e919bec182b",
     "guest_sources": [
       "guest/common",
-      "azurelinux/packages.lock.json"
+      "azurelinux/packages.lock.json",
+      "nvx-rs",
+      "rust-toolchain.toml"
     ],
     "package_manifests": [
       "build/initramfs-azurelinux.cpio.gz.packages.json"

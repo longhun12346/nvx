@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
+import dataclasses
 import io
 import json
+import math
 import queue
 import re
 import shutil
@@ -13,7 +16,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+import types
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
 from unittest.mock import patch
@@ -97,6 +103,76 @@ def write_openvmm_profiles(
             json.dumps(document), encoding="utf-8"
         )
     return checkout
+
+
+# A Rust integer constant, `[pub] const NAME: TYPE = EXPRESSION;`.
+RUST_INTEGER_CONSTANT = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?const\s+(\w+)\s*:\s*[iu](?:8|16|32|64|128|size)"
+    r"\s*=\s*([^;]+);",
+    re.MULTILINE,
+)
+
+
+def rust_integer_constants(source: str) -> dict[str, int]:
+    """Return the integer constants of a Rust source whose values are integer
+    literals, or sums, differences, products, and left shifts of literals and
+    of earlier such constants."""
+    constants: dict[str, int] = {}
+
+    def evaluate(node: ast.expr) -> int:
+        if isinstance(node, ast.Constant) and type(node.value) is int:
+            return node.value
+        if isinstance(node, ast.Name):
+            return constants[node.id]
+        if isinstance(node, ast.BinOp):
+            left, right = evaluate(node.left), evaluate(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.LShift):
+                return left << right
+        raise ValueError(f"unsupported expression {ast.dump(node)}")
+
+    for name, expression in RUST_INTEGER_CONSTANT.findall(source):
+        try:
+            constants[name] = evaluate(ast.parse(expression.strip(), mode="eval").body)
+        except (KeyError, SyntaxError, ValueError):
+            continue
+    return constants
+
+
+def pinned_openvmm_file(test: unittest.TestCase, path: str) -> str:
+    """Return the file at ``path`` in the OpenVMM submodule's pinned revision.
+
+    The file is read from the gitlink's commit, not from the submodule's
+    working tree, which can hold another revision: a self-hosted CI runner
+    keeps an earlier job's OpenVMM checkout until the job checks out its own.
+    Skips ``test`` where the submodule lacks the pinned revision.
+    """
+    root = Path(__file__).resolve().parents[1]
+    submodule = root / "openvmm"
+    if not (submodule / ".git").exists():
+        test.skipTest("the OpenVMM submodule is not initialized")
+
+    def git(directory: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(directory), *arguments],
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+        )
+
+    pin = git(root, "rev-parse", ":openvmm").stdout.strip()
+    if not pin or git(submodule, "cat-file", "-e", f"{pin}^{{commit}}").returncode:
+        test.skipTest(
+            f"the OpenVMM submodule lacks its pinned revision {pin or '(unknown)'}"
+        )
+    shown = git(submodule, "show", f"{pin}:{path}")
+    test.assertEqual(shown.returncode, 0, f"{path} at {pin}: {shown.stderr}")
+    return shown.stdout
 
 
 class FieldParsingTests(unittest.TestCase):
@@ -201,7 +277,8 @@ class FieldParsingTests(unittest.TestCase):
                 self.assertIsNone(time_abi.cpu_generation(vendor, family, model, 1))
 
     def test_names_the_catalog_profiles(self):
-        # One profile per generation serves every backend.
+        # Each generation's latest profile, which auto selects, serves every
+        # backend.
         self.assertEqual(
             [generation.profile_id for generation in time_abi.CPU_GENERATIONS],
             [
@@ -210,10 +287,15 @@ class FieldParsingTests(unittest.TestCase):
                 "intel.emeraldrapids.v1",
                 "intel.alderlake.v1",
                 "amd.milan.v1",
-                "amd.genoa.v1",
+                "amd.genoa.v2",
                 "amd.turin.v1",
             ],
         )
+        # A generation is the CPUs that it covers, whatever its profile's
+        # revision.
+        genoa = time_abi.cpu_generation("AuthenticAMD", 25, 17, 1)
+        assert genoa is not None
+        self.assertEqual(dataclasses.replace(genoa, revision=1), genoa)
         self.assertEqual(
             time_abi.describe_cpu_generations(),
             "skylake-sp 6/85 steppings 0-4, icelake-sp 6/106, emeraldrapids 6/207, "
@@ -268,8 +350,8 @@ class FieldParsingTests(unittest.TestCase):
             (profiles / Path(path).name).write_text(content, encoding="utf-8")
             document = json.loads(content)
             generation = document["generation"]
-            # Keyed by profile ID, so that a second pinned revision of a
-            # generation fails the comparison instead of replacing the first.
+            # Keyed by profile ID, so that a revision that the copy lacks fails
+            # the comparison instead of replacing another.
             pinned[document["id"]] = (
                 generation["name"],
                 document["vendor"],
@@ -283,8 +365,11 @@ class FieldParsingTests(unittest.TestCase):
                 ),
             )
         self.assertTrue(pinned)
+        # OpenVMM keeps every earlier revision of a generation's profile
+        # pinned.
         copy = {
-            generation.profile_id: (
+            f"{time_abi.PROFILE_VENDORS[generation.vendor]}.{generation.name}"
+            f".v{revision}": (
                 generation.name,
                 generation.vendor,
                 tuple(
@@ -292,6 +377,7 @@ class FieldParsingTests(unittest.TestCase):
                 ),
             )
             for generation in time_abi.CPU_GENERATIONS
+            for revision in range(1, generation.revision + 1)
         }
         self.assertEqual(copy, pinned)
         # benchmark reads the same generations from these documents, as it
@@ -414,109 +500,6 @@ class FieldParsingTests(unittest.TestCase):
             with self.subTest(profile_id=profile_id):
                 self.assertEqual(time_abi.is_catalog_profile_id(profile_id), catalog)
                 self.assertEqual(time_abi.is_host_profile_id(profile_id), host)
-
-    def test_guides_hosts_that_no_built_in_profile_serves(self):
-        def guide(cpu_profile: str | None, host: time_abi.HostCpu | None) -> str | None:
-            return time_abi.host_cpu_profile_guidance(
-                cpu_profile, host, "/nvx/openvmm", "kvm"
-            )
-
-        tiger_lake = time_abi.HostCpu(
-            "GenuineIntel", 6, 140, 1, "11th Gen Intel(R) Core(TM) i7-1185G7"
-        )
-        guidance = guide(None, tiger_lake)
-        assert guidance is not None
-        lines = guidance.splitlines()
-        self.assertTrue(all(line.startswith("nvx: ") for line in lines), guidance)
-        # auto falls back on the CPU, so the guidance says what auto does there,
-        # not which code ended this run, which run cannot read.
-        self.assertEqual(
-            lines[0],
-            "nvx: no built-in CPU profile serves this host's CPU, GenuineIntel "
-            "6/140/1 (11th Gen Intel(R) Core(TM) i7-1185G7), so --cpu-profile "
-            "auto, the default, falls back on it to a CPU profile derived from "
-            "this host, which OpenVMM warns about with NVX-CPU-PROFILE-FALLBACK:; "
-            f"the built-in profiles cover {time_abi.describe_cpu_generations()}.",
-        )
-        self.assertIn("OpenVMM's error above names the cause", lines[1])
-        self.assertNotIn("E_PROFILE_HOST_UNKNOWN", guidance)
-        self.assertNotIn("rerun with", guidance)
-        # It asks for the CPU's fingerprint through the CPU profile request
-        # form, which the link prefills with the CPU.
-        self.assertEqual(
-            lines[2:],
-            [
-                "nvx: Help NVX add a built-in profile for this CPU: run",
-                "nvx:   /nvx/openvmm --hypervisor kvm --cpu-fingerprint "
-                "fingerprint.json",
-                "nvx: and attach fingerprint.json to a CPU profile request:",
-                f"nvx:   {time_abi.cpu_profile_request_url(tiger_lake)}",
-                "nvx: https://github.com/microsoft/nvx/issues/408 tracks CPU "
-                "profiles for more Intel CPUs.",
-            ],
-        )
-        self.assertEqual(guidance, guide("auto", tiger_lake))
-        # A host profile that fails on this CPU fails for a reason that
-        # OpenVMM's own error explains.
-        self.assertIsNone(guide("host", tiger_lake))
-
-        # Host profiles serve AMD CPUs too: an AMD CPU without a built-in
-        # profile, such as Raphael (Ryzen 7000), falls back as an Intel one
-        # does, with the issue that tracks profiles for more AMD CPUs.
-        raphael = time_abi.HostCpu("AuthenticAMD", 25, 97, 2)
-        guidance = guide(None, raphael)
-        assert guidance is not None
-        self.assertIn(
-            "this host's CPU, AuthenticAMD 25/97/2, so --cpu-profile auto, the "
-            "default, falls back on it",
-            guidance,
-        )
-        self.assertIn(time_abi.cpu_profile_request_url(raphael), guidance)
-        self.assertIn(
-            "https://github.com/microsoft/nvx/issues/409 tracks CPU profiles for "
-            "more AMD CPUs.",
-            guidance,
-        )
-        self.assertNotIn("issues/408", guidance)
-        self.assertIsNone(guide("host", raphael))
-        # Another vendor's CPU fails with either request, and gets no request
-        # form and no issue: the time ABI does not serve its CPUs.
-        hygon = time_abi.HostCpu("HygonGenuine", 24, 0, 1)
-        guidance = guide("auto", hygon)
-        assert guidance is not None
-        self.assertIn(
-            "this host's CPU, HygonGenuine 24/0/1, so a cold boot with "
-            "--cpu-profile auto, the default, fails on it with "
-            "E_PROFILE_HOST_UNKNOWN;",
-            guidance,
-        )
-        self.assertIn("host CPU profiles serve only Intel and AMD CPUs", guidance)
-        self.assertNotIn("falls back", guidance)
-        self.assertNotIn("github.com", guidance)
-        self.assertEqual(guidance, guide("host", hygon))
-
-        # A CPU that a built-in profile serves, an explicit profile, and an
-        # unknown CPU get none.
-        alder_lake = time_abi.HostCpu("GenuineIntel", 6, 154, 3)
-        milan = time_abi.HostCpu("AuthenticAMD", 25, 1, 1)
-        genoa = time_abi.HostCpu("AuthenticAMD", 25, 17, 1)
-        turin = time_abi.HostCpu("AuthenticAMD", 26, 2, 1)
-        for cpu_profile, host in (
-            (None, alder_lake),
-            ("host", alder_lake),
-            (None, milan),
-            ("host", milan),
-            (None, genoa),
-            (None, turin),
-            ("host", turin),
-            ("intel.alderlake.v1", tiger_lake),
-            ("intel.alderlake.v1", raphael),
-            ("intel.skylake-sp.v1", milan),
-            ("intel.skylake-sp.v1", hygon),
-            (None, None),
-        ):
-            with self.subTest(cpu_profile=cpu_profile, host=host):
-                self.assertIsNone(guide(cpu_profile, host))
 
     def test_names_cpus_and_prefills_cpu_profile_requests(self):
         granite_rapids = time_abi.HostCpu(
@@ -890,7 +873,7 @@ class MonitorTests(unittest.TestCase):
         with self.assertRaisesRegex(
             TimeAbiFailure,
             "did not report the NVX-TIME-ABI boot marker before nvx-time status "
-            "exited; the guest image or OpenVMM does not implement time ABI v1",
+            "exited; the guest image or OpenVMM does not implement time ABI v2",
         ):
             quiet.feed(b"NVX-TIME-STATUS-EXIT status=0\r\n")
 
@@ -1942,6 +1925,25 @@ def completed(stdout: str, returncode: int = 0, stderr: str = ""):
     return subprocess.CompletedProcess(["x"], returncode, stdout, stderr)
 
 
+# Why a host whose chronyd keeps the kernel's PLL off has no PLL frequency.
+PLL_OFF = "the kernel PLL is off (adjtimex status=0x0000)"
+
+
+class FakeClock:
+    """A monotonic clock that advances only when something sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
 CPU = {
     "vendor": "GenuineIntel",
     "family": "6",
@@ -2493,6 +2495,36 @@ class DoctorTests(unittest.TestCase):
             result = doctor.check_openvmm_preflight(context_with_files())
         self.assertTrue(result.passed, result.detail)
 
+    def test_the_rate_limit_is_the_guests_frequency_budget(self):
+        # #1008: H4's limit is what the guest's wall-clock discipline leaves
+        # for the host's clock correction: Linux's frequency limit, to which
+        # nvx-rs clamps the correction, less a restore's rate deviation,
+        # which nvx-rs's restore packet decoder bounds by the time ABI's
+        # restore tolerance, the one that OpenVMM's rate policy applies.
+        root = Path(__file__).resolve().parents[1]
+        decoders = rust_integer_constants(
+            (root / "nvx-rs" / "src" / "guest" / "time" / "decoders.rs").read_text(
+                encoding="utf-8"
+            )
+        )
+        scaled_ppm = decoders["SCALED_PPM"]
+        self.assertEqual(scaled_ppm, 1 << 16)
+        self.assertEqual(
+            decoders["FREQUENCY_LIMIT"], doctor.GUEST_FREQUENCY_LIMIT_PPM * scaled_ppm
+        )
+        self.assertEqual(
+            decoders["RATE_DEVIATION_LIMIT"], doctor.RESTORE_TOLERANCE_PPM * scaled_ppm
+        )
+        self.assertEqual(
+            doctor.RATE_TOLERANCE_PPM,
+            (decoders["FREQUENCY_LIMIT"] - decoders["RATE_DEVIATION_LIMIT"])
+            / scaled_ppm,
+        )
+        rate = rust_integer_constants(
+            pinned_openvmm_file(self, "vmm_core/virt/src/time_abi/rate.rs")
+        )
+        self.assertEqual(rate["TSC_TOLERANCE_PPM"], doctor.RESTORE_TOLERANCE_PPM)
+
     def test_rate_check_applies_the_spec_bounds_to_sleep_separated_samples(self):
         def records(
             rates: list[float],
@@ -2528,18 +2560,56 @@ class DoctorTests(unittest.TestCase):
                 result.append(("sample", sample))
             return result
 
+        synchronized = doctor.HostClockDiscipline(
+            "synchronized",
+            12.5,
+            1000,
+            "adjtimex status=0x2001 freq=819200 tick=10000 maxerror=1000",
+        )
+
         def check(
             context: doctor.DoctorContext,
             probe_records: list[tuple[str, dict[str, str]]],
             clocksource: str = "tsc",
             windows: bool = False,
+            chrony: doctor.ChronyFrequency
+            | str
+            | Sequence[doctor.ChronyFrequency | str] = "chronyc is not installed",
+            clock: FakeClock | None = None,
+            kernel: doctor.KernelFrequency | str = PLL_OFF,
+            boot: doctor.BootCorrection | None = None,
+            discipline: doctor.HostClockDiscipline = synchronized,
         ) -> doctor.CheckResult:
+            """Run H4; a list of chronyd readings answers its re-reads too."""
+            clock = clock or FakeClock()
+            readings = chrony if isinstance(chrony, list | tuple) else None
             with (
                 patch.object(doctor, "run_probe", return_value=probe_records) as run,
                 patch.object(doctor, "host_clocksource", return_value=clocksource),
                 patch.object(doctor, "host_is_windows", return_value=windows),
+                patch.object(
+                    doctor,
+                    "chrony_frequency",
+                    return_value=None if readings else chrony,
+                    side_effect=readings,
+                ) as frequency,
+                patch.object(doctor, "kernel_frequency", return_value=kernel) as pll,
+                patch.object(doctor, "boot_correction", return_value=boot) as average,
+                patch.object(
+                    doctor, "host_clock_discipline", return_value=discipline
+                ) as published,
+                patch.object(doctor.time, "monotonic", clock.monotonic),
+                patch.object(doctor.time, "sleep", clock.sleep),
             ):
                 result = doctor.check_rate(context)
+            # Windows reads QueryPerformanceCounter, which no daemon steers.
+            self.assertEqual(frequency.called, not windows)
+            self.assertEqual(average.called, not windows)
+            # H4 reads the kernel's PLL only without chronyd's estimate.
+            first = readings[0] if readings else chrony
+            self.assertEqual(pll.called, not windows and isinstance(first, str))
+            # Every backend reads the correction that OpenVMM publishes.
+            self.assertTrue(published.called)
             self.assertEqual(
                 run.call_args.args[1:],
                 (
@@ -2578,10 +2648,24 @@ class DoctorTests(unittest.TestCase):
             "0.125 ppm, largest interval uncertainty 0.004 ppm",
             result.detail,
         )
-        self.assertIn("0.0 ppm from the backend's 2793437000 Hz", result.detail)
+        self.assertIn("0.013 ppm from the backend's 2793437000 Hz", result.detail)
         self.assertIn("host clocksource tsc (evidence)", result.detail)
+        self.assertIn(
+            "no chronyd frequency estimate: chronyc is not installed (evidence); "
+            f"no kernel PLL frequency: {PLL_OFF} (evidence)",
+            result.detail,
+        )
+        self.assertIn(
+            "host UTC is synchronized, correction +12.500 ppm, maximum error "
+            "1000 us (adjtimex status=0x2001 freq=819200 tick=10000 "
+            "maxerror=1000)",
+            result.detail,
+        )
+        self.assertEqual(context.facts["host_clock_status"], "synchronized")
+        self.assertEqual(context.facts["host_correction_ppm"], "+12.500")
         self.assertEqual(context.facts["rate_agreement_ppm"], "0.125")
-        self.assertEqual(context.facts["rate_deviation_ppm"], "0.0")
+        self.assertEqual(context.facts["rate_deviation_ppm"], "0.013")
+        self.assertEqual(context.facts["rate_reference"], "CLOCK_MONOTONIC")
         # chrony steers CLOCK_MONOTONIC's rate by ppm between seconds, which
         # says nothing about the TSC: the undisciplined clock judges stability,
         # and the disciplined one the rate.
@@ -2592,7 +2676,7 @@ class DoctorTests(unittest.TestCase):
         self.assertTrue(result.passed, result.detail)
         self.assertIn("agree within 0.000 ppm", result.detail)
         self.assertEqual(context.facts["measured_tsc_hz"], "2300000867")
-        self.assertIn("0.4 ppm from the backend's 2300000000 Hz", result.detail)
+        self.assertIn("0.377 ppm from the backend's 2300000000 Hz", result.detail)
         # CI's short schedule; Windows reads QueryPerformanceCounter, which time
         # synchronization never steers, in both roles. Its 100 ns tick keeps a
         # 1 s interval conclusive at 0.1 ppm.
@@ -2604,8 +2688,19 @@ class DoctorTests(unittest.TestCase):
             resolution_ns=100.0,
             names=("QueryPerformanceCounter", "QueryPerformanceCounter"),
         )
-        windows = check(ci_context("whp"), qpc, windows=True)
+        adjusted = doctor.HostClockDiscipline(
+            "synchronized",
+            -17.2,
+            None,
+            "GetSystemTimeAdjustmentPrecise adjustment=10000172 "
+            "increment=10000000 disabled=0",
+        )
+        windows = check(ci_context("whp"), qpc, windows=True, discipline=adjusted)
         self.assertTrue(windows.passed, windows.detail)
+        self.assertIn(
+            "host UTC is synchronized, correction -17.200 ppm (",
+            windows.detail,
+        )
         self.assertIn(
             "against QueryPerformanceCounter from 3 samples 1 s apart", windows.detail
         )
@@ -2637,7 +2732,7 @@ class DoctorTests(unittest.TestCase):
                 records([2793437000.0] * 2, interval_s=1.0, bracket=400),
                 "inconclusive: an interval's uncertainty is 0.401 ppm > 0.25 ppm",
             ),
-            (records([2794000000.0] * 12), "201.5 ppm from the measured rate"),
+            (records([2794200000.0] * 12), "273.140 ppm from the measured rate"),
             (records([100_000_000.0] * 12), "[E_TSC_RATE_IMPLAUSIBLE]"),
         ):
             with self.subTest(message=message):
@@ -2670,6 +2765,524 @@ class DoctorTests(unittest.TestCase):
         standalone = check(ci_context(), records([2300000100.0] * 2, interval_s=1.0))
         self.assertTrue(standalone.passed, standalone.detail)
         self.assertIn("not compared with the backend's rate", standalone.detail)
+        # The correction's status is a gate, while its directly published size
+        # is evidence: the rate budget above independently qualifies the rate
+        # against the backend when H3 runs.
+        steady = records([2300000000.0] * 2, interval_s=1.0)
+        for status in ("free-running", "unreliable", "unknown"):
+            with self.subTest(status=status):
+                context = ci_context("mshv")
+                context.facts["native_tsc_hz"] = "2300000000"
+                discipline = doctor.HostClockDiscipline(status, 0.0, None, "evidence")
+                result = check(context, steady, discipline=discipline)
+                self.assertFalse(result.passed)
+                self.assertTrue(
+                    result.detail.startswith(
+                        "the host publishes no synchronized clock correction: host "
+                        f"UTC is {status}; "
+                    ),
+                    result.detail,
+                )
+                self.assertEqual(result.warning, "")
+                self.assertEqual(context.facts["host_clock_status"], status)
+        large = doctor.HostClockDiscipline(
+            "synchronized", 10_000.0, None, "adjtimex tick=10100"
+        )
+        without_h3 = check(ci_context("mshv"), steady, discipline=large)
+        self.assertTrue(without_h3.passed, without_h3.detail)
+        self.assertIn("correction +10000.000 ppm", without_h3.detail)
+        # #768: on azure-mshv-1, whose host clock jumps, chronyd slewed
+        # CLOCK_MONOTONIC so that a 2 s window read 946.1 ppm, while the
+        # TSC ran at its usual rate, 44 ppm from the declared one, against
+        # chronyd's frequency estimate.
+        slewed = records(
+            [2300000000.0] * 2, disciplined=[2302176486.0] * 2, interval_s=1.0
+        )
+        estimate = doctor.ChronyFrequency("PHC0", 44.3, 4.2)
+        context = ci_context("mshv")
+        context.facts["native_tsc_hz"] = "2300000507"
+        result = check(context, slewed, chrony=estimate)
+        self.assertTrue(result.passed, result.detail)
+        self.assertIn(
+            "tsc_hz=2300101895 against CLOCK_MONOTONIC_RAW corrected by chronyd's "
+            "frequency estimate of +44.300 ppm (skew 4.200 ppm, reference PHC0) "
+            "from 3 samples 1 s apart",
+            result.detail,
+        )
+        self.assertIn("44.082 ppm from the backend's 2300000507 Hz", result.detail)
+        self.assertIn(
+            "2302176486 Hz against CLOCK_MONOTONIC, which chronyd also slews "
+            "(evidence)",
+            result.detail,
+        )
+        self.assertEqual(context.facts["measured_tsc_hz"], "2300101895")
+        self.assertEqual(
+            context.facts["rate_reference"], "chronyd +44.300 ppm (skew 4.200 ppm)"
+        )
+        # Without chronyd's estimate or a kernel PLL, the slewed window is all
+        # H4 can measure; a chronyd that isn't synchronized leaves the kernel
+        # clock unsynchronized too.
+        context = ci_context("mshv")
+        context.facts["native_tsc_hz"] = "2300000507"
+        unsynchronized = (
+            "the kernel clock is not synchronized (adjtimex state=5 status=0x0041)"
+        )
+        result = check(
+            context,
+            slewed,
+            chrony="chronyd is not synchronized",
+            kernel=unsynchronized,
+        )
+        self.assertFalse(result.passed)
+        self.assertIn(
+            "the backend rate is 946.078 ppm from the measured rate (limit 250 ppm)",
+            result.detail,
+        )
+        self.assertIn(
+            "no chronyd frequency estimate: chronyd is not synchronized (evidence); "
+            f"no kernel PLL frequency: {unsynchronized} (evidence)",
+            result.detail,
+        )
+        # #1008: a kernel PLL that another time service drives, such as
+        # systemd-timesyncd, keeps its frequency estimate apart from the
+        # offsets that it slews, so H4 corrects CLOCK_MONOTONIC_RAW by that
+        # instead of reading the slewed window.
+        context = ci_context("mshv")
+        context.facts["native_tsc_hz"] = "2300000507"
+        result = check(context, slewed, kernel=doctor.KernelFrequency(-44.3))
+        self.assertTrue(result.passed, result.detail)
+        self.assertIn(
+            "tsc_hz=2300101895 against CLOCK_MONOTONIC_RAW corrected by the kernel "
+            "PLL's frequency of -44.300 ppm from 3 samples 1 s apart",
+            result.detail,
+        )
+        self.assertIn("44.082 ppm from the backend's 2300000507 Hz", result.detail)
+        self.assertIn(
+            "no chronyd frequency estimate: chronyc is not installed (evidence); "
+            "2302176486 Hz against CLOCK_MONOTONIC, which the kernel PLL also slews "
+            "(evidence)",
+            result.detail,
+        )
+        self.assertEqual(context.facts["rate_reference"], "kernel PLL -44.300 ppm")
+        # #1008: the average correction since boot, CLOCK_MONOTONIC_RAW's rate
+        # against CLOCK_MONOTONIC over the uptime, averages the reference's
+        # wander out. On azure-mshv-1, it read +43.559 ppm over 38.5 h while
+        # chronyd's estimate wandered. It is evidence only.
+        boot = doctor.BootCorrection(43.559, 138_435.1)
+        average = (
+            "2300100190 Hz against CLOCK_MONOTONIC_RAW corrected by the average "
+            "correction since boot, +43.559 ppm over 38.5 h"
+        )
+        context = ci_context("mshv")
+        context.facts["native_tsc_hz"] = "2300000507"
+        wandering = doctor.ChronyFrequency("PHC0", 189.3, 1)
+        result = check(context, slewed, chrony=wandering, boot=boot)
+        self.assertTrue(result.passed, result.detail)
+        self.assertIn("189.115 ppm from the backend's 2300000507 Hz", result.detail)
+        self.assertIn(
+            f"; {average}, 43.340 ppm from the backend's rate (evidence)",
+            result.detail,
+        )
+        self.assertEqual(context.facts["boot_correction"], "+43.559 ppm over 38.5 h")
+        # Without H3, it has no rate to compare.
+        result = check(ci_context("mshv"), slewed, chrony=wandering, boot=boot)
+        self.assertIn(f"; {average} (evidence)", result.detail)
+        # chronyd's estimate gates the backend's rate, whatever the window
+        # reads, and its skew bounds the estimate: the rate passes only when
+        # every rate within the skew lies within the limit.
+        steady = records([2300000000.0] * 2, interval_s=1.0)
+        for estimate, declared, passed, message in (
+            (
+                doctor.ChronyFrequency("PHC0", 80, 10),
+                "2300000507",
+                True,
+                "79.786 ppm from the",
+            ),
+            # #1008: the 100 ppm of the time ABI v1 bounded the TSC's error
+            # alone, which a measurement can't tell from the reference's
+            # wander; azure-mshv-1 failed at +127.9 ppm, 117.3 to 138.6 ppm
+            # within chronyd's skew.
+            (
+                doctor.ChronyFrequency("PHC0", 150, 1),
+                "2300000507",
+                True,
+                "149.802 ppm from the",
+            ),
+            (
+                doctor.ChronyFrequency("PHC0", 240, 15),
+                "2300000507",
+                False,
+                "the measurement is inconclusive: the backend rate is 239.837 ppm "
+                "from the measured rate, 224.830 to 254.845 ppm within chronyd's "
+                "skew of 15.000 ppm, which straddles the limit of 250 ppm",
+            ),
+            (
+                doctor.ChronyFrequency("PHC0", 300, 1),
+                "2300000507",
+                False,
+                "the backend rate is 299.870 ppm from the measured rate, 298.869 "
+                "to 300.870 ppm within chronyd's skew of 1.000 ppm (limit 250 ppm)",
+            ),
+            # The correction isn't linear in the frequency: the estimate's
+            # upper bound, 250 ppm from the declared rate, corrects the rate
+            # by 250.063 ppm, and a range that includes the declared rate
+            # starts at zero.
+            (
+                doctor.ChronyFrequency("PHC0", 0, 250),
+                "2300000000",
+                False,
+                "the measurement is inconclusive: the backend rate is 0.000 ppm "
+                "from the measured rate, 0.000 to 250.063 ppm within chronyd's "
+                "skew of 250.000 ppm, which straddles the limit of 250 ppm",
+            ),
+        ):
+            with self.subTest(estimate=estimate):
+                context = ci_context("mshv")
+                context.facts["native_tsc_hz"] = declared
+                clock = FakeClock()
+                result = check(context, steady, chrony=estimate, clock=clock)
+                self.assertEqual(result.passed, passed, result.detail)
+                self.assertIn(message, result.detail)
+                # Only a deviation that passes above 100 ppm warns.
+                deviation = float(context.facts["rate_deviation_ppm"])
+                self.assertEqual(bool(result.warning), passed and deviation > 100)
+                # A range that straddles the limit stays inconclusive when
+                # chronyd's estimate doesn't move for the 60 s of re-reads.
+                straddles = "straddles" in message
+                self.assertEqual(clock.sleeps, [2.0] * 30 if straddles else [])
+                self.assertEqual(
+                    "no re-read of chronyd's estimate in 60 s was conclusive"
+                    in result.detail,
+                    straddles,
+                )
+        # #1008: a range that straddles the limit makes H4 re-read chronyd's
+        # estimate every 2 s, for up to 60 s, and use the first conclusive
+        # one. On azure-mshv-1, chronyd's estimate read +189.3 ppm with a skew
+        # of 130.6 ppm, and +117.1 ppm with a skew of 55.1 ppm 50 s later.
+        straddling = doctor.ChronyFrequency("PHC0", 189.3, 130.6)
+        for readings, passed, measured, message in (
+            (
+                [
+                    straddling,
+                    straddling,
+                    "chronyc tracking exited 1: 506 Cannot talk to daemon",
+                    doctor.ChronyFrequency("PHC0", 117.1, 55.1),
+                ],
+                True,
+                "2300269362",
+                "116.893 ppm from the backend's 2300000507 Hz; chronyd's first "
+                "estimate, +189.300 ppm (skew 130.600 ppm), straddled the limit, "
+                "so H4 re-read it for 6 s (evidence)",
+            ),
+            # The first conclusive estimate decides, even when it fails.
+            (
+                [straddling, doctor.ChronyFrequency("PHC0", 300, 1)],
+                False,
+                "2300690207",
+                "the backend rate is 299.870 ppm from the measured rate, 298.869 "
+                "to 300.870 ppm within chronyd's skew of 1.000 ppm (limit 250 ppm)",
+            ),
+        ):
+            with self.subTest(readings=readings):
+                context = ci_context("mshv")
+                context.facts["native_tsc_hz"] = "2300000507"
+                clock = FakeClock()
+                result = check(context, steady, chrony=readings, clock=clock)
+                self.assertEqual(result.passed, passed, result.detail)
+                self.assertIn(message, result.detail)
+                self.assertEqual(clock.sleeps, [2.0] * (len(readings) - 1))
+                # The settled +117.1 ppm passes with a warning.
+                self.assertEqual(bool(result.warning), passed)
+                # Only chronyd's estimate changes, so H4 corrects the same
+                # samples by the estimate that it uses.
+                self.assertEqual(context.facts["measured_tsc_hz"], measured)
+                used = cast(doctor.ChronyFrequency, readings[-1])
+                self.assertEqual(
+                    context.facts["rate_reference"],
+                    f"chronyd {used.ppm:+.3f} ppm (skew {used.skew_ppm:.3f} ppm)",
+                )
+        # Without the backend's rate, H4 has no range to re-read for.
+        clock = FakeClock()
+        result = check(ci_context("mshv"), steady, chrony=straddling, clock=clock)
+        self.assertTrue(result.passed, result.detail)
+        self.assertEqual(clock.sleeps, [])
+        # The deviation keeps three decimals, so a failure never reads as the
+        # limit itself: #768's second failure was 100.027 ppm, at the 100 ppm
+        # limit of the time.
+        context = ci_context("mshv")
+        context.facts["native_tsc_hz"] = "2300000507"
+        result = check(context, records([2300575569.0] * 2, interval_s=1.0))
+        self.assertFalse(result.passed)
+        self.assertIn(
+            "the backend rate is 250.027 ppm from the measured rate (limit 250 ppm)",
+            result.detail,
+        )
+        self.assertEqual(context.facts["rate_deviation_ppm"], "250.027")
+        self.assertEqual(result.warning, "")
+        # #1008: above the time ABI v1's 100 ppm, H4 passes with a warning
+        # that leads its detail and says how much of the guest's budget the
+        # host's correction uses; 100 ppm itself doesn't warn.
+        for rate, warning in (
+            (
+                2300230569.0,
+                "the backend rate is 100.027 ppm from the measured rate, more than "
+                "100 ppm: the host's clock correction uses 40% of the guest's "
+                "250 ppm budget, and one run can't tell the TSC's error from the "
+                "reference clock's wander",
+            ),
+            (2300230507.0, ""),
+        ):
+            with self.subTest(rate=rate):
+                context = ci_context("mshv")
+                context.facts["native_tsc_hz"] = "2300000507"
+                result = check(context, records([rate] * 2, interval_s=1.0))
+                self.assertTrue(result.passed, result.detail)
+                self.assertEqual(result.warning, warning)
+                self.assertEqual(
+                    result.detail.startswith(f"warning: {warning}; tsc_hz="),
+                    bool(warning),
+                )
+
+    def test_chrony_frequency_reads_a_synchronized_tracking_report(self):
+        report = (
+            "50484330,PHC0,1,1792707652.172549767,-0.000001016,-0.000001624,"
+            "0.000031799,38.638,-0.024,4.116,0.000000001,0.000059705,8.0,{leap}\n"
+        )
+        chronyc = "/usr/bin/chronyc"
+        with (
+            patch.object(doctor.shutil, "which", return_value=chronyc),
+            patch.object(
+                doctor.subprocess,
+                "run",
+                return_value=completed(report.format(leap="Normal")),
+            ) as run,
+        ):
+            self.assertEqual(
+                doctor.chrony_frequency(),
+                doctor.ChronyFrequency("PHC0", 38.638, 4.116),
+            )
+        self.assertEqual(run.call_args.args[0], [chronyc, "-c", "-n", "tracking"])
+        self.assertEqual(
+            run.call_args.kwargs["timeout"], doctor.CHRONYC_TIMEOUT_SECONDS
+        )
+        unrecognized = "chronyc tracking printed an unrecognized report"
+        for result_value, reason in (
+            (
+                completed(report.format(leap="Not synchronised")),
+                "chronyd is not synchronized",
+            ),
+            (
+                completed("", 1, "506 Cannot talk to daemon\n"),
+                "chronyc tracking exited 1: 506 Cannot talk to daemon",
+            ),
+            (completed("Reference ID : 50484330 (PHC0)\n"), unrecognized),
+            (
+                completed(report.format(leap="Normal").replace("38.638", "nan")),
+                unrecognized,
+            ),
+            (completed(report.format(leap="Normal,extra")), unrecognized),
+            # chronyd's skew is an error bound, never negative.
+            (
+                completed(report.format(leap="Normal").replace("4.116", "-4.116")),
+                unrecognized,
+            ),
+            (subprocess.TimeoutExpired(["chronyc"], 5), "chronyc tracking failed"),
+            (
+                FileNotFoundError(2, "No such file or directory"),
+                "chronyc tracking failed",
+            ),
+        ):
+            with self.subTest(reason=reason, result=result_value):
+                run_patch = (
+                    patch.object(doctor.subprocess, "run", side_effect=result_value)
+                    if isinstance(result_value, BaseException)
+                    else patch.object(
+                        doctor.subprocess, "run", return_value=result_value
+                    )
+                )
+                with (
+                    patch.object(doctor.shutil, "which", return_value=chronyc),
+                    run_patch,
+                ):
+                    frequency = doctor.chrony_frequency()
+                self.assertIsInstance(frequency, str)
+                self.assertIn(reason, cast(str, frequency))
+        with patch.object(doctor.shutil, "which", return_value=None):
+            self.assertEqual(doctor.chrony_frequency(), "chronyc is not installed")
+
+    def test_host_clock_discipline_maps_the_host_state_as_openvmm_does(self):
+        def linux(**changes: int) -> doctor.HostClockDiscipline:
+            fields = {
+                "status": 0x2001,
+                "freq": -552_308,
+                "tick": 10_000,
+                "maxerror": 1564,
+            }
+            fields.update(changes)
+            timex = types.SimpleNamespace(**fields)
+            with (
+                patch.object(doctor, "_adjtimex", return_value=(0, timex)),
+                patch.object(doctor, "host_is_windows", return_value=False),
+            ):
+                return doctor.host_clock_discipline()
+
+        self.assertEqual(
+            linux(),
+            doctor.HostClockDiscipline(
+                "synchronized",
+                -552_308 / 65_536,
+                1564,
+                "adjtimex status=0x2001 freq=-552308 tick=10000 maxerror=1564",
+            ),
+        )
+        # A tick of 10,001 us adds 100 ppm to the published correction.
+        self.assertAlmostEqual(linux(freq=0, tick=10_001).correction_ppm, 100.0)
+        self.assertEqual(linux(status=0x2041).status, "free-running")
+        self.assertEqual(linux(status=0x3001).status, "unreliable")
+        self.assertEqual(linux(status=0x1041).status, "unreliable")
+        self.assertIsNone(linux(maxerror=-1).max_error_us)
+        with (
+            patch.object(
+                doctor, "_adjtimex", side_effect=doctor.ScriptError("no adjtimex")
+            ),
+            patch.object(doctor, "host_is_windows", return_value=False),
+        ):
+            unknown = doctor.host_clock_discipline()
+        self.assertEqual((unknown.status, unknown.correction_ppm), ("unknown", 0.0))
+        self.assertIn("no adjtimex", unknown.detail)
+
+        adjustment_ppm = doctor.windows_adjustment_ppm
+        self.assertEqual(adjustment_ppm(10_000_000, 10_000_000), 0.0)
+        self.assertAlmostEqual(adjustment_ppm(10_000_000, 10_000_100), 10.0)
+        self.assertAlmostEqual(adjustment_ppm(10_000_000, 9_999_900), -10.0)
+        # A larger precise adjustment slows host UTC, as measured on the
+        # Windows runners that motivated the OpenVMM correction.
+        self.assertAlmostEqual(adjustment_ppm(10_000_501, 10_000_000), -50.0975, 4)
+        self.assertAlmostEqual(adjustment_ppm(10_000_172, 10_000_000), -17.1997, 4)
+
+    def test_windows_clock_discipline_maps_the_precise_adjustment(self):
+        class PreciseAdjustment:
+            argtypes: object = None
+            restype: object = None
+
+            def __init__(
+                self, read: int, adjustment: int, increment: int, disabled: int
+            ) -> None:
+                self.read = read
+                self.adjustment = adjustment
+                self.increment = increment
+                self.disabled = disabled
+
+            def __call__(
+                self, adjustment: object, increment: object, disabled: object
+            ) -> int:
+                adjustment._obj.value = self.adjustment  # type: ignore[attr-defined]
+                increment._obj.value = self.increment  # type: ignore[attr-defined]
+                disabled._obj.value = self.disabled  # type: ignore[attr-defined]
+                return self.read
+
+        def windows(
+            read: int, adjustment: int, increment: int, disabled: int
+        ) -> doctor.HostClockDiscipline:
+            precise = PreciseAdjustment(read, adjustment, increment, disabled)
+            library = types.SimpleNamespace(GetSystemTimeAdjustmentPrecise=precise)
+            with (
+                patch.object(doctor.sys, "platform", "win32"),
+                patch.object(
+                    doctor.ctypes, "WinDLL", return_value=library, create=True
+                ),
+                patch.object(doctor, "host_is_windows", return_value=True),
+            ):
+                return doctor.host_clock_discipline()
+
+        for reading in (
+            windows(0, 10_000_000, 10_000_000, 0),
+            windows(1, 10_000_000, 0, 0),
+            windows(1, 0, 10_000_000, 0),
+        ):
+            self.assertEqual((reading.status, reading.correction_ppm), ("unknown", 0.0))
+        free = windows(1, 10_000_000, 10_000_000, 1)
+        self.assertEqual((free.status, free.correction_ppm), ("free-running", 0.0))
+        synchronized = windows(1, 10_000_172, 10_000_000, 0)
+        self.assertEqual(synchronized.status, "synchronized")
+        self.assertAlmostEqual(synchronized.correction_ppm, -17.1997, 4)
+        with (
+            patch.object(doctor.sys, "platform", "win32"),
+            patch.object(
+                doctor.ctypes,
+                "WinDLL",
+                side_effect=OSError("no precise adjustment"),
+                create=True,
+            ),
+            patch.object(doctor, "host_is_windows", return_value=True),
+        ):
+            unknown = doctor.host_clock_discipline()
+        self.assertEqual(unknown.status, "unknown")
+        self.assertIn("no precise adjustment", unknown.detail)
+
+    def test_kernel_frequency_reads_a_synchronized_kernel_pll(self):
+        # adjtimex's state and the status, freq, and tick of its struct timex.
+        def kernel(state: int, status: int, freq: int, tick: int = 10_000):
+            timex = types.SimpleNamespace(status=status, freq=freq, tick=tick)
+            return patch.object(doctor, "_adjtimex", return_value=(state, timex))
+
+        # systemd-timesyncd sets STA_PLL and STA_NANO. The frequency is in ppm
+        # scaled by 2^16, and each microsecond of tick above 10,000 adds
+        # 100 ppm, as chronyd's ticks of 9,999 take 100 ppm away.
+        for tick, ppm in ((10_000, -44.25), (10_001, 55.75), (9_999, -144.25)):
+            with self.subTest(tick=tick), kernel(0, 0x2001, -2_899_968, tick):
+                self.assertEqual(doctor.kernel_frequency(), doctor.KernelFrequency(ppm))
+        for state, status, reason in (
+            # chronyd keeps the PLL off, and slews through the frequency.
+            (0, 0x0000, "the kernel PLL is off (adjtimex status=0x0000)"),
+            (
+                5,
+                0x2041,
+                "the kernel clock is not synchronized (adjtimex state=5 status=0x2041)",
+            ),
+            (
+                5,
+                0x2001,
+                "the kernel clock is not synchronized (adjtimex state=5 status=0x2001)",
+            ),
+            (
+                0,
+                0x0041,
+                "the kernel clock is not synchronized (adjtimex state=0 status=0x0041)",
+            ),
+        ):
+            with self.subTest(state=state, status=status):
+                with kernel(state, status, -2_899_968):
+                    self.assertEqual(doctor.kernel_frequency(), reason)
+        with patch.object(doctor.ctypes, "CDLL", side_effect=OSError("no libc")):
+            self.assertEqual(
+                doctor.kernel_frequency(), "adjtimex is unavailable: no libc"
+            )
+
+    def test_boot_correction_averages_the_clocks_since_boot(self):
+        if sys.platform == "win32":
+            # Windows has no CLOCK_MONOTONIC_RAW, and no daemon steers
+            # QueryPerformanceCounter.
+            self.assertIsNone(doctor.boot_correction())
+            return
+        # azure-mshv-1, 38.5 h after boot: CLOCK_MONOTONIC trailed
+        # CLOCK_MONOTONIC_RAW by 6.03 s.
+        clocks = {
+            time.CLOCK_MONOTONIC_RAW: 138_435_100_000_000,
+            time.CLOCK_MONOTONIC: 138_429_069_887_000,
+        }
+        with patch.object(
+            doctor.time, "clock_gettime_ns", side_effect=clocks.__getitem__
+        ):
+            correction = doctor.boot_correction()
+        assert correction is not None
+        self.assertAlmostEqual(correction.ppm, 43.559, places=3)
+        self.assertEqual(correction.seconds, 138_435.1)
+        # This host's clocks give a finite average over its uptime.
+        correction = doctor.boot_correction()
+        assert correction is not None
+        self.assertTrue(math.isfinite(correction.ppm))
+        self.assertGreater(correction.seconds, 0)
 
     def test_rate_check_continues_when_the_clocksource_is_unreadable(self):
         # #507: the host clocksource is evidence only, so an unreadable
@@ -2716,6 +3329,19 @@ class DoctorTests(unittest.TestCase):
                     ) as run,
                     patch.object(doctor, "host_clocksource", side_effect=error),
                     patch.object(doctor, "host_is_windows", return_value=False),
+                    patch.object(
+                        doctor,
+                        "chrony_frequency",
+                        return_value="chronyc is not installed",
+                    ),
+                    patch.object(doctor, "kernel_frequency", return_value=PLL_OFF),
+                    patch.object(
+                        doctor,
+                        "host_clock_discipline",
+                        return_value=doctor.HostClockDiscipline(
+                            "synchronized", 0.0, None, "evidence"
+                        ),
+                    ),
                 ):
                     result = doctor.check_rate(context)
                 self.assertTrue(run.called)
@@ -2999,6 +3625,42 @@ class DoctorTests(unittest.TestCase):
             'check=H2 status=fail detail="float division by zero"', stdout.getvalue()
         )
         self.assertIn("check=H5 status=pass", stdout.getvalue())
+
+    def test_warnings_reach_the_line_the_summary_and_ci_annotations(self):
+        warning = "the host's clock correction uses 60% of the guest's 250 ppm budget"
+
+        def warned(context: doctor.DoctorContext) -> doctor.CheckResult:
+            del context
+            return doctor.CheckResult(
+                "H4", True, f"warning: {warning}; tsc_hz=2300000000", warning
+            )
+
+        context = doctor_context(self.root, "mshv")
+        results: list[doctor.CheckResult] = []
+        for actions, annotated in (("true", True), ("", False)):
+            with self.subTest(actions=actions):
+                stdout = io.StringIO()
+                with (
+                    patch.dict(doctor.CHECKS, {"H4": warned}),
+                    patch.dict(doctor.os.environ, {"GITHUB_ACTIONS": actions}),
+                    contextlib.redirect_stdout(stdout),
+                ):
+                    results = doctor.run_checks(context, ("H4",))
+                lines = stdout.getvalue().splitlines()
+                # The check passes, and its line states the warning.
+                self.assertEqual(lines[0], results[0].line())
+                self.assertIn('status=pass detail="warning: ', lines[0])
+                # In GitHub Actions, an annotation repeats it, escaped.
+                annotation = (
+                    "::warning title=Time ABI host qualification (mshv)::H4 host TSC "
+                    "rate and clock correction: the host's clock correction uses "
+                    "60%25 of the "
+                    "guest's 250 ppm budget"
+                )
+                self.assertEqual(lines[1:], [annotation] if annotated else [])
+        summary = doctor.summary_markdown("mshv", results, {})
+        self.assertIn("(mshv): passed", summary)
+        self.assertIn(f"\n\n**H4 warning:** {warning}\n", summary)
 
     def test_run_selects_the_cpu_fingerprint_or_runs_without_openvmm(self):
         seen: list[Path | None] = []

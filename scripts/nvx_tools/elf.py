@@ -4,7 +4,8 @@ The guest binaries run in initramfs images without a dynamic loader, so each
 must be a 64-bit little-endian ELF executable without a ``PT_INTERP`` program
 header and without ``DT_NEEDED`` entries. A static position-independent
 executable has a ``PT_DYNAMIC`` segment for its own relocations, which is
-allowed.
+allowed. Each must also keep its stack non-executable, which a
+``PT_GNU_STACK`` program header with ``PF_X`` would override.
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ _ELFDATA2LSB = 1
 _EXECUTABLE_TYPES = {2: "EXEC", 3: "DYN"}
 _PT_DYNAMIC = 2
 _PT_INTERP = 3
+_PT_GNU_STACK = 0x6474E551
+_PF_X = 0x1
 _PN_XNUM = 0xFFFF
 _DT_NULL = 0
 _DT_NEEDED = 1
@@ -40,6 +43,7 @@ class ElfExecutable:
     interpreter: str | None
     needed: int
     dynamic: bool
+    executable_stack: bool
 
     @property
     def static(self) -> bool:
@@ -55,7 +59,8 @@ class ElfExecutable:
             if self.needed:
                 details.append(f"{self.needed} needed libraries")
             linkage = "dynamic: " + ", ".join(details)
-        return f"{self.path}: ELF {self.elf_type}, {self.size} bytes, {linkage}"
+        stack = ", executable stack" if self.executable_stack else ""
+        return f"{self.path}: ELF {self.elf_type}, {self.size} bytes, {linkage}{stack}"
 
 
 def read_elf_executable(path: Path) -> ElfExecutable:
@@ -87,9 +92,12 @@ def _parse(path: Path, data: bytes) -> ElfExecutable:
     interpreter = None
     needed = 0
     dynamic = False
+    executable_stack = False
     for index in range(program_count):
-        segment_type, _, offset, _, _, file_size, _, _ = _PROGRAM_HEADER.unpack_from(
-            data, program_offset + index * program_entry_size
+        segment_type, flags, offset, _, _, file_size, _, _ = (
+            _PROGRAM_HEADER.unpack_from(
+                data, program_offset + index * program_entry_size
+            )
         )
         segment = data[offset : offset + file_size]
         if len(segment) != file_size:
@@ -105,6 +113,8 @@ def _parse(path: Path, data: bytes) -> ElfExecutable:
                     break
                 if tag == _DT_NEEDED:
                     needed += 1
+        elif segment_type == _PT_GNU_STACK:
+            executable_stack = bool(flags & _PF_X)
     return ElfExecutable(
         path=path,
         size=len(data),
@@ -112,11 +122,13 @@ def _parse(path: Path, data: bytes) -> ElfExecutable:
         interpreter=interpreter,
         needed=needed,
         dynamic=dynamic,
+        executable_stack=executable_stack,
     )
 
 
 def check_static_executables(paths: Sequence[Path]) -> list[ElfExecutable]:
-    """Describe each executable, and fail unless every one is static."""
+    """Describe each executable, and fail unless every one is static with a
+    non-executable stack."""
     executables = [read_elf_executable(path) for path in paths]
     for executable in executables:
         print(executable.describe())
@@ -125,4 +137,13 @@ def check_static_executables(paths: Sequence[Path]) -> list[ElfExecutable]:
     ]
     if dynamic:
         raise ScriptError("not static executables: " + ", ".join(dynamic))
+    executable_stacks = [
+        str(executable.path)
+        for executable in executables
+        if executable.executable_stack
+    ]
+    if executable_stacks:
+        raise ScriptError(
+            "executables with an executable stack: " + ", ".join(executable_stacks)
+        )
     return executables

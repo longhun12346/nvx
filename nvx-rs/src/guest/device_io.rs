@@ -1,23 +1,38 @@
-//! `nvx-device-io`: the benchmark helper that measures file and UDP round-trip I/O.
+//! `nvx-device-io`: the benchmark helper that measures file and UDP round-trip I/O, and that
+//! dirties a file's shared mapping for the microVM scenarios.
 //!
 //! - `file PATH read|write DURATION SIZE direct|buffered create|existing` reads or writes
 //!   page-aligned 4096-byte blocks of PATH, at deterministic pseudo-random offsets within its
 //!   first SIZE bytes, until DURATION milliseconds have passed.
 //! - `network IPV4 PORT DURATION` sends 64-byte UDP datagrams to an echo server until DURATION
 //!   milliseconds have passed, and counts those that come back within 100 ms.
+//! - `map PATH TEXT` maps the first bytes of the existing regular file PATH shared and
+//!   read-write, closes the file, and writes the nonempty TEXT at its start through the mapping
+//!   alone, so that the kernel holds the written pages dirty until it writes them back. It then
+//!   holds the mapping until standard input ends, and unmaps it.
 //!
 //! Each mode prints one JSON line with its operation count, bytes per operation, and elapsed
-//! monotonic nanoseconds. The program exits with 0, 2 for a usage error, 3 when it cannot open,
-//! connect, size, or time, 4 when a transfer or send is incomplete, or 255 when it cannot print
-//! the result. It prints nothing else.
+//! monotonic nanoseconds; `map` prints its line once its write is done, before it holds the
+//! mapping. The program exits with 0, 2 for a usage error, 3 when it cannot open, connect, size,
+//! map, or time, 4 when a transfer or send is incomplete, a file is shorter than TEXT, or reading
+//! standard input or unmapping fails, or 255 when it cannot print the result. It prints nothing
+//! else on standard output.
+//!
+//! A file benchmark also reports its progress on standard error, so that the console of a
+//! benchmark that hangs shows where: `nvx-device-io: opened` once it has opened, and when
+//! creating, sized its file, `nvx-device-io: transferred N blocks` once its timed loop ends, and,
+//! when writing, `nvx-device-io: flushed` or `nvx-device-io: flush failed` once its flush returns.
+//! A failure to write a progress line is ignored, and a standard error whose reader is gone raises
+//! no `SIGPIPE`, so that only standard output's failures end the program.
 
 use std::ffi::{CStr, CString};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::num::NonZeroUsize;
 use std::process::ExitCode;
 
-use super::status::{CommandError, ExitStatus};
-use super::sys::{self, Mode, OpenFlags};
+use super::status::{CommandError, run_main};
+use super::sys::{self, Errno, MemoryMapping, Mode, OpenFlags};
 
 /// Size and required alignment of each file transfer.
 const BLOCK_SIZE: usize = 4096;
@@ -62,12 +77,22 @@ struct NetworkBenchmark {
     duration_ms: u64,
 }
 
-/// Benchmark that the command line selects.
+/// Parsed `map PATH TEXT` write through a shared mapping.
+struct MappedWrite<'a> {
+    /// Path of the file.
+    path: &'a CStr,
+    /// Nonempty bytes to write at the start of the file.
+    text: &'a [u8],
+}
+
+/// Benchmark, or mapped write, that the command line selects.
 enum Benchmark<'a> {
     /// File benchmark.
     File(FileBenchmark<'a>),
     /// UDP echo benchmark.
     Network(NetworkBenchmark),
+    /// Write through a shared mapping, which the program holds until its input ends.
+    Map(MappedWrite<'a>),
 }
 
 /// Operations that a timed loop completed, and the time that it took.
@@ -80,16 +105,52 @@ struct Measurement {
 
 /// Runs `nvx-device-io` with the process's arguments; see the module documentation.
 pub fn main() -> ExitCode {
-    sys::restore_sigpipe();
-    ExitStatus::from(run(&sys::args(), &mut sys::DirectStdout)).into()
+    run_main(|args| {
+        run(
+            args,
+            &mut sys::DirectStdout,
+            &mut sys::write_standard_error_without_sigpipe,
+            &mut sys::discard_standard_input,
+        )
+    })
 }
 
-/// Parses and runs one benchmark that prints its result to `out`.
-fn run(args: &[CString], out: &mut dyn Write) -> Result<(), CommandError> {
-    match parse(args).ok_or(CommandError::Usage)? {
-        Benchmark::File(benchmark) => run_file(&benchmark, out),
-        Benchmark::Network(benchmark) => run_network(&benchmark, out),
-    }
+/// Parses and runs one benchmark, and prints its result to `out`. A file benchmark passes each
+/// progress line to `progress`. A mapped write calls `hold` after it prints, and holds the mapping
+/// until `hold` returns, which `main` makes the end of standard input.
+fn run(
+    args: &[CString],
+    out: &mut dyn Write,
+    progress: &mut dyn FnMut(&[u8]),
+    hold: &mut dyn FnMut() -> Result<(), Errno>,
+) -> Result<(), CommandError> {
+    let (device, operation, bytes_per_operation, measurement) =
+        match parse(args).ok_or(CommandError::Usage)? {
+            Benchmark::File(benchmark) => {
+                let operation = if benchmark.writing { "write" } else { "read" };
+                (
+                    "file",
+                    operation,
+                    BLOCK_SIZE,
+                    measure_file(&benchmark, progress)?,
+                )
+            }
+            Benchmark::Network(benchmark) => (
+                "network",
+                "roundtrip",
+                PAYLOAD_SIZE,
+                measure_network(&benchmark)?,
+            ),
+            Benchmark::Map(write) => return write_mapped(&write, out, hold),
+        };
+    let line = result_line(
+        device,
+        operation,
+        measurement.operations,
+        bytes_per_operation as u64,
+        measurement.elapsed_ns,
+    );
+    out.write_all(&line).map_err(|_| CommandError::Output)
 }
 
 /// Parses a complete command line, returning `None` for the usage error.
@@ -138,6 +199,13 @@ fn parse(args: &[CString]) -> Option<Benchmark<'_>> {
             peer: SocketAddrV4::new(address, port as u16),
             duration_ms,
         }));
+    }
+    if mode == b"map" {
+        let [_, _, path, text] = args else {
+            return None;
+        };
+        let text = text.as_bytes();
+        return (!text.is_empty()).then_some(Benchmark::Map(MappedWrite { path, text }));
     }
     None
 }
@@ -241,22 +309,15 @@ fn start() -> Result<u64, CommandError> {
     }
 }
 
-/// Runs a file benchmark and prints its result.
-fn run_file(benchmark: &FileBenchmark<'_>, out: &mut dyn Write) -> Result<(), CommandError> {
-    let Measurement {
-        operations,
-        elapsed_ns,
-    } = measure_file(benchmark)?;
-    let operation = if benchmark.writing { "write" } else { "read" };
-    let line = result_line("file", operation, operations, BLOCK_SIZE as u64, elapsed_ns);
-    out.write_all(&line).map_err(|_| CommandError::Output)
-}
-
-/// Transfers blocks of the benchmark's file until its duration has passed.
+/// Transfers blocks of the benchmark's file until its duration has passed, and passes its progress
+/// lines to `progress`.
 ///
 /// The file closes when this returns, before the caller prints the result, and a close error is
 /// ignored, as in the C program.
-fn measure_file(benchmark: &FileBenchmark<'_>) -> Result<Measurement, CommandError> {
+fn measure_file(
+    benchmark: &FileBenchmark<'_>,
+    progress: &mut dyn FnMut(&[u8]),
+) -> Result<Measurement, CommandError> {
     let mut flags = if benchmark.writing {
         OpenFlags::O_RDWR
     } else {
@@ -274,6 +335,7 @@ fn measure_file(benchmark: &FileBenchmark<'_>) -> Result<Measurement, CommandErr
         file.truncate(benchmark.size_bytes)
             .map_err(|_| CommandError::Setup)?;
     }
+    progress(b"nvx-device-io: opened\n");
     let mut block = Block([0; BLOCK_SIZE]);
     fill_pattern(&mut block.0);
     let mut offsets = Offsets::new(benchmark.size_bytes / BLOCK_SIZE as u64);
@@ -297,30 +359,20 @@ fn measure_file(benchmark: &FileBenchmark<'_>) -> Result<Measurement, CommandErr
         }
     }
     ended = now();
+    progress(format!("nvx-device-io: transferred {operations} blocks\n").as_bytes());
     if benchmark.writing {
-        // The C program ignored the result of this flush, which starts after the timing ends.
-        let _ = file.sync();
+        // The flush starts after the timing ends. As in the C program, its failure fails nothing,
+        // but the progress line reports it.
+        let flushed: &[u8] = match file.sync() {
+            Ok(_) => b"nvx-device-io: flushed\n",
+            Err(_) => b"nvx-device-io: flush failed\n",
+        };
+        progress(flushed);
     }
     Ok(Measurement {
         operations,
         elapsed_ns: ended.wrapping_sub(started),
     })
-}
-
-/// Runs a UDP echo benchmark and prints its result.
-fn run_network(benchmark: &NetworkBenchmark, out: &mut dyn Write) -> Result<(), CommandError> {
-    let Measurement {
-        operations,
-        elapsed_ns,
-    } = measure_network(benchmark)?;
-    let line = result_line(
-        "network",
-        "roundtrip",
-        operations,
-        PAYLOAD_SIZE as u64,
-        elapsed_ns,
-    );
-    out.write_all(&line).map_err(|_| CommandError::Output)
 }
 
 /// Sends payloads to the benchmark's echo server, and counts their echoes, until its duration has
@@ -355,6 +407,50 @@ fn measure_network(benchmark: &NetworkBenchmark) -> Result<Measurement, CommandE
     })
 }
 
+/// Writes the text at the start of the file through a shared mapping, prints the result line,
+/// and holds the mapping until `hold` returns, then unmaps it.
+///
+/// Only the mapping holds the file while the write dirties its pages: the kernel writes a FUSE
+/// file's dirty pages back when a descriptor of it closes, as it does when its mapping goes, so
+/// the descriptor closes before the write. A failed print or hold drops the mapping.
+fn write_mapped(
+    write: &MappedWrite<'_>,
+    out: &mut dyn Write,
+    hold: &mut dyn FnMut() -> Result<(), Errno>,
+) -> Result<(), CommandError> {
+    let length = NonZeroUsize::new(write.text.len()).ok_or(CommandError::Usage)?;
+    let mut mapping = map_file(write.path, length)?;
+    let started = start()?;
+    if !mapping.write_bytes(0, write.text) {
+        return Err(CommandError::Transfer);
+    }
+    let elapsed_ns = now().wrapping_sub(started);
+    let line = result_line("file", "map", 1, length.get() as u64, elapsed_ns);
+    out.write_all(&line).map_err(|_| CommandError::Output)?;
+    hold().map_err(|_| CommandError::Transfer)?;
+    mapping.unmap().map_err(|_| CommandError::Transfer)
+}
+
+/// Maps the first `length` bytes of the regular file at `path` shared and read-write. The file's
+/// descriptor closes when this returns, and the mapping keeps the file open.
+fn map_file(path: &CStr, length: NonZeroUsize) -> Result<MemoryMapping, CommandError> {
+    let file = sys::open(
+        path,
+        OpenFlags::O_RDWR | OpenFlags::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| CommandError::Setup)?;
+    let (regular, size) = sys::file_size(&file).map_err(|_| CommandError::Setup)?;
+    if !regular {
+        return Err(CommandError::Setup);
+    }
+    // Touching a mapped page past the end of the file would raise SIGBUS.
+    if size < length.get() as u64 {
+        return Err(CommandError::Transfer);
+    }
+    MemoryMapping::shared_read_write(&file, length, 0).map_err(|_| CommandError::Setup)
+}
+
 /// Returns the newline-terminated JSON result, truncated to the C program's 384-byte buffer.
 fn result_line(
     device: &str,
@@ -377,16 +473,31 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::guest::status::{ExitStatus, command_line};
     use crate::guest::sys::tests::Failing;
 
+    /// Returns the command line of `nvx-device-io` with `arguments`.
     fn args(arguments: &[&str]) -> Vec<CString> {
-        let mut args = vec![CString::new("nvx-device-io").unwrap()];
-        args.extend(
-            arguments
-                .iter()
-                .map(|argument| CString::new(*argument).unwrap()),
-        );
-        args
+        command_line("nvx-device-io", arguments)
+    }
+
+    /// Stands for the input that ends a mapped write's hold, which a benchmark never waits for.
+    fn never_holds() -> Result<(), Errno> {
+        panic!("only a mapped write holds its mapping")
+    }
+
+    /// Stands for the progress of a file benchmark, which a mapped write never reports.
+    fn no_progress(line: &[u8]) {
+        panic!("only a file benchmark reports progress: {line:?}")
+    }
+
+    /// Returns the progress lines of a file benchmark that `report` received.
+    fn progress_lines(report: &[u8]) -> Vec<String> {
+        String::from_utf8(report.to_vec())
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     #[test]
@@ -499,6 +610,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_mapped_writes() {
+        let map = args(&["map", "/f", "NVX-TEXT"]);
+        let Some(Benchmark::Map(parsed)) = parse(&map) else {
+            panic!("not a mapped write");
+        };
+        assert_eq!((parsed.path, parsed.text), (c"/f", &b"NVX-TEXT"[..]));
+        assert!(parse(&args(&["map", "/f", ""])).is_none());
+        assert!(parse(&args(&["map", "/f"])).is_none());
+        assert!(parse(&args(&["map", "/f", "NVX-TEXT", "extra"])).is_none());
+        assert!(parse(&args(&["Map", "/f", "NVX-TEXT"])).is_none());
+    }
+
+    #[test]
     fn offsets_follow_the_c_generator() {
         let mut offsets = Offsets::new(256);
         let first: Vec<u64> = (0..4).map(|_| offsets.next_offset()).collect();
@@ -543,8 +667,14 @@ mod tests {
         let file = directory.path().join("disk");
         let path = file.to_str().unwrap();
         let mut out = Vec::new();
+        let mut report = Vec::new();
         let write = ["file", path, "write", "1", "8192", "buffered", "create"];
-        let status = ExitStatus::from(run(&args(&write), &mut out));
+        let status = ExitStatus::from(run(
+            &args(&write),
+            &mut out,
+            &mut |line| report.extend_from_slice(line),
+            &mut never_holds,
+        ));
         assert_eq!(status, ExitStatus::Success);
         let line = String::from_utf8(out).unwrap();
         assert!(
@@ -556,23 +686,144 @@ mod tests {
             "{line}"
         );
         assert_eq!(fs::metadata(&file).unwrap().len(), 8192);
+        let operations = line
+            .split_once("\"operations\":")
+            .and_then(|(_, rest)| rest.split_once(','))
+            .map(|(count, _)| count)
+            .unwrap();
+        assert_eq!(
+            progress_lines(&report),
+            [
+                "nvx-device-io: opened".to_owned(),
+                format!("nvx-device-io: transferred {operations} blocks"),
+                "nvx-device-io: flushed".to_owned(),
+            ]
+        );
 
+        // A read reports no flush, and a failed print still reports the progress before it.
         let read = ["file", path, "read", "1", "8192", "buffered", "existing"];
-        let status = ExitStatus::from(run(&args(&read), &mut Failing(sys::Errno::ENOSPC)));
+        let mut report = Vec::new();
+        let status = ExitStatus::from(run(
+            &args(&read),
+            &mut Failing(sys::Errno::ENOSPC),
+            &mut |line| report.extend_from_slice(line),
+            &mut never_holds,
+        ));
         assert_eq!(status, ExitStatus::OutputFailure);
+        let lines = progress_lines(&report);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], "nvx-device-io: opened");
+        assert!(
+            lines[1].starts_with("nvx-device-io: transferred ") && lines[1].ends_with(" blocks"),
+            "{lines:?}"
+        );
 
+        // A file that cannot open reports no progress.
         let missing = directory.path().join("missing");
         let mut arguments = read;
         arguments[1] = missing.to_str().unwrap();
-        let status = ExitStatus::from(run(&args(&arguments), &mut Vec::new()));
-        assert_eq!(status, ExitStatus::SetupFailure);
+        let mut report = Vec::new();
+        let status = ExitStatus::from(run(
+            &args(&arguments),
+            &mut Vec::new(),
+            &mut |line| report.extend_from_slice(line),
+            &mut never_holds,
+        ));
+        assert_eq!((status, report), (ExitStatus::SetupFailure, Vec::new()));
 
-        // An empty file cannot transfer a block.
+        // An empty file opens but cannot transfer a block.
         fs::write(&missing, b"").unwrap();
         arguments[4] = "4096";
         let mut out = Vec::new();
-        let status = ExitStatus::from(run(&args(&arguments), &mut out));
+        let mut report = Vec::new();
+        let status = ExitStatus::from(run(
+            &args(&arguments),
+            &mut out,
+            &mut |line| report.extend_from_slice(line),
+            &mut never_holds,
+        ));
         assert_eq!(status, ExitStatus::TransferFailure);
         assert!(out.is_empty());
+        assert_eq!(progress_lines(&report), ["nvx-device-io: opened"]);
+    }
+
+    #[test]
+    fn writes_through_a_held_mapping_and_reports_each_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("mapped");
+        fs::write(&file, vec![b'.'; 2 * BLOCK_SIZE]).unwrap();
+        let path = file.to_str().unwrap();
+        let mut out = Vec::new();
+        let mut held = false;
+        let status = ExitStatus::from(run(
+            &args(&["map", path, "NVX-MAPPED"]),
+            &mut out,
+            &mut no_progress,
+            &mut || {
+                // The page cache already holds the write while the mapping is held.
+                assert!(fs::read(&file).unwrap().starts_with(b"NVX-MAPPED."));
+                held = true;
+                Ok(())
+            },
+        ));
+        assert_eq!(status, ExitStatus::Success);
+        assert!(held);
+        let line = String::from_utf8(out).unwrap();
+        assert!(
+            line.starts_with(
+                "{\"device\":\"file\",\"operation\":\"map\",\"operations\":1,\
+                 \"bytes_per_operation\":10,\"elapsed_ns\":"
+            ) && line.ends_with("}\n"),
+            "{line}"
+        );
+        let contents = fs::read(&file).unwrap();
+        assert_eq!(contents.len(), 2 * BLOCK_SIZE);
+        assert!(contents.starts_with(b"NVX-MAPPED."));
+
+        // A mapped write that cannot print its result never holds the mapping, and one whose
+        // hold fails reports an incomplete transfer.
+        let status = ExitStatus::from(run(
+            &args(&["map", path, "NVX"]),
+            &mut Failing(Errno::ENOSPC),
+            &mut no_progress,
+            &mut never_holds,
+        ));
+        assert_eq!(status, ExitStatus::OutputFailure);
+        let status = ExitStatus::from(run(
+            &args(&["map", path, "NVX"]),
+            &mut Vec::new(),
+            &mut no_progress,
+            &mut || Err(Errno::EIO),
+        ));
+        assert_eq!(status, ExitStatus::TransferFailure);
+
+        // A missing file and a directory cannot map, and a file shorter than the text cannot
+        // take it.
+        for (target, expected) in [
+            (directory.path().join("missing"), ExitStatus::SetupFailure),
+            (directory.path().to_path_buf(), ExitStatus::SetupFailure),
+        ] {
+            let arguments = ["map", target.to_str().unwrap(), "NVX"];
+            let mut out = Vec::new();
+            let status = ExitStatus::from(run(
+                &args(&arguments),
+                &mut out,
+                &mut no_progress,
+                &mut never_holds,
+            ));
+            assert_eq!((status, out), (expected, Vec::new()), "{target:?}");
+        }
+        let short = directory.path().join("short");
+        fs::write(&short, b"NVX").unwrap();
+        let arguments = ["map", short.to_str().unwrap(), "NVX-MAPPED"];
+        let mut out = Vec::new();
+        let status = ExitStatus::from(run(
+            &args(&arguments),
+            &mut out,
+            &mut no_progress,
+            &mut never_holds,
+        ));
+        assert_eq!((status, out), (ExitStatus::TransferFailure, Vec::new()));
+        assert_eq!(fs::read(&short).unwrap(), b"NVX");
     }
 }

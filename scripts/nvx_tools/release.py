@@ -5,23 +5,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
 import zipfile
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import cast
 
+from . import nvx_rs
 from .archive import create_reproducible_release_archive, create_reproducible_tar_gz
 from .azurelinux import input_sha256 as azurelinux_input_sha256
 from .azurelinux import package_lock_sha256 as azurelinux_package_lock_sha256
@@ -36,6 +32,7 @@ from .build_constants import (
     AlpineBuildConstants,
     AzureLinuxBuildConstants,
     BuildConstants,
+    GuestRustBuildConstants,
     InitramfsBuildConstants,
     KernelBuildConstants,
     OpenVMMBuildConstants,
@@ -48,9 +45,6 @@ from .common import (
     ScriptError,
     VerifiedChecksumInventory,
     artifact_path,
-    credential_safe_opener,
-    download,
-    git_output,
     openvmm_binary_path,
     openvmm_git_state,
     require_file,
@@ -58,27 +52,39 @@ from .common import (
     verify_sha256_sums,
     write_sha256_sums,
 )
-from .development_release import development_release_tag
+from .guest_binaries import (
+    guest_binary_source_files,
+    pinned_guest_rust_toolchain,
+)
 from .ubuntu import converter_input_sha256, customization_files, package_lock_sha256
 
 GITHUB_API_VERSION = "2022-11-28"
-# HEAD often has no release, as with CI's [skip ci] baseline commits. Each
-# commit searched costs one GitHub API request.
-_RELEASE_SEARCH_COMMITS = 20
-
-
-@dataclass(frozen=True)
-class _ReleaseAsset:
-    tag: str
-    name: str
-    url: str
-    size: int
-
-
-class _GitHubReleaseQueryError(ScriptError):
-    def __init__(self, status: int, message: str) -> None:
-        self.status = status
-        super().__init__(message)
+# The guest artifact components that a package ships, as the `components`
+# input of the build-guest-artifacts action names them, and the files of each
+# in build/. No package ships the CI debug kernel, so it is none.
+GUEST_ARTIFACT_COMPONENTS: Mapping[str, tuple[str, ...]] = {
+    "kernel": (
+        KernelBuildConstants.BINARY_NAME,
+        KernelBuildConstants.CONFIG_NAME,
+        KernelBuildConstants.PROVENANCE_NAME,
+    ),
+    "alpine": (
+        AlpineBuildConstants.INITRAMFS_NAME,
+        AlpineBuildConstants.PACKAGE_MANIFEST_NAME,
+        InitramfsBuildConstants.PROVENANCE_NAME,
+    ),
+    "ubuntu": (
+        UbuntuBuildConstants.INITRAMFS_NAME,
+        UbuntuBuildConstants.PACKAGE_MANIFEST_NAME,
+        UbuntuBuildConstants.DISTRO_NAME,
+        UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
+        UbuntuBuildConstants.SCRATCH_TEMPLATE_NAME,
+    ),
+    "azurelinux": (
+        AzureLinuxBuildConstants.INITRAMFS_NAME,
+        AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME,
+    ),
+}
 
 
 class _ReleaseRestoreError(ScriptError):
@@ -112,201 +118,6 @@ def create_release_archive(source: Path, destination: Path) -> None:
         staging.unlink(missing_ok=True)
         shutil.rmtree(snapshot_parent, ignore_errors=True)
     print(f">> archived {source} as {destination}")
-
-
-def _github_headers(token: str | None, accept: str) -> dict[str, str]:
-    headers = {
-        "Accept": accept,
-        "X-GitHub-Api-Version": GITHUB_API_VERSION,
-        "User-Agent": "nvx-release-downloader",
-    }
-    if token is not None:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
-def _github_error_message(error: urllib.error.HTTPError) -> str:
-    try:
-        payload = error.read().decode("utf-8", "replace").strip()
-    except (AttributeError, OSError, ValueError):
-        return ""
-    if not payload:
-        return ""
-    try:
-        document: object = json.loads(payload)
-    except json.JSONDecodeError:
-        return " ".join(payload.split())[:200]
-    if isinstance(document, dict):
-        message = cast(dict[str, object], document).get("message")
-        if isinstance(message, str):
-            return message
-    return ""
-
-
-def _github_error_hint(error: urllib.error.HTTPError, token: str | None) -> str:
-    if token is None and error.code in (401, 403, 404):
-        return "set GH_TOKEN to a token that can read the repository"
-    if error.code == 401:
-        return "the configured GitHub token was rejected; refresh or replace it"
-    if error.code == 403:
-        if error.headers.get("x-ratelimit-remaining") == "0":
-            return "the GitHub API rate limit is exhausted; retry later"
-        return (
-            "the configured GitHub token lacks access; grant it read access to "
-            "the repository contents and authorize it for organization single sign-on"
-        )
-    if error.code == 404:
-        return (
-            "verify --repository and that the configured GitHub token can read "
-            "that repository"
-        )
-    return ""
-
-
-def _github_json(
-    url: str,
-    token: str | None,
-    *,
-    missing_ok: bool = False,
-) -> object | None:
-    request = urllib.request.Request(
-        url,
-        headers=_github_headers(token, "application/vnd.github+json"),
-    )
-    try:
-        with credential_safe_opener().open(request) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as error:
-        if missing_ok and error.code == 404:
-            return None
-        message = _github_error_message(error)
-        hint = _github_error_hint(error, token)
-        detail = f": {message.rstrip('.')}" if message else ""
-        advice = f"; {hint}" if hint else ""
-        raise _GitHubReleaseQueryError(
-            error.code,
-            f"GitHub release query failed with HTTP {error.code}{detail}{advice}",
-        ) from error
-    except (OSError, urllib.error.URLError) as error:
-        raise ScriptError(f"GitHub release query failed: {error}") from error
-
-
-def _first_parent_commits(limit: int) -> list[str]:
-    try:
-        output = git_output(
-            "rev-list", "--first-parent", f"--max-count={limit}", "HEAD"
-        )
-    except subprocess.CalledProcessError as error:
-        detail = str(error.stderr or "").strip() or str(error)
-        raise ScriptError(
-            f"download needs a Git checkout to find its release: {detail}"
-        ) from error
-    except (OSError, subprocess.SubprocessError) as error:
-        raise ScriptError(
-            f"download needs a Git checkout to find its release: {error}"
-        ) from error
-    return output.split()
-
-
-def _version_at(commit: str) -> str | None:
-    try:
-        return git_output("show", f"{commit}:VERSION") or None
-    except subprocess.CalledProcessError:
-        return None
-    except (OSError, subprocess.SubprocessError) as error:
-        raise ScriptError(
-            f"download failed to read VERSION at {commit}: {error}"
-        ) from error
-
-
-def _checkout_release_asset(
-    repository: str,
-    platform: str,
-    token: str | None,
-) -> _ReleaseAsset:
-    repository_parts = repository.split("/")
-    if len(repository_parts) != 2 or not all(repository_parts):
-        raise ScriptError("GitHub repository must be OWNER/REPOSITORY")
-    encoded_repository = "/".join(
-        urllib.parse.quote(part, safe="") for part in repository_parts
-    )
-    repository_url = f"https://api.github.com/repos/{encoded_repository}"
-
-    extension = ".zip" if platform.startswith("windows-") else ".tar.gz"
-    asset_pattern = re.compile(rf"^nvx-.+-{re.escape(platform)}{re.escape(extension)}$")
-    commits = _first_parent_commits(_RELEASE_SEARCH_COMMITS)
-    for distance, commit in enumerate(commits):
-        version = _version_at(commit)
-        if version is None:
-            continue
-        tag = development_release_tag(version, commit)
-        release = _github_json(
-            f"{repository_url}/releases/tags/{urllib.parse.quote(tag, safe='')}",
-            token,
-            missing_ok=True,
-        )
-        if release is None:
-            continue
-        if not isinstance(release, dict):
-            raise ScriptError("GitHub release query returned an invalid response")
-        release_document = cast(dict[str, object], release)
-        if release_document.get("draft") is True:
-            continue
-        assets = release_document.get("assets")
-        if not isinstance(assets, list):
-            continue
-        for asset_value in cast(list[object], assets):
-            if not isinstance(asset_value, dict):
-                continue
-            asset = cast(dict[str, object], asset_value)
-            name = asset.get("name")
-            asset_url = asset.get("url")
-            size = asset.get("size")
-            if (
-                isinstance(name, str)
-                and asset_pattern.fullmatch(name) is not None
-                and isinstance(asset_url, str)
-                and isinstance(size, int)
-                and not isinstance(size, bool)
-            ):
-                if distance:
-                    plural = "s" if distance > 1 else ""
-                    print(
-                        f">> no {platform} release for HEAD; using {tag}, "
-                        f"{distance} first-parent commit{plural} earlier"
-                    )
-                return _ReleaseAsset(tag, name, asset_url, size)
-    # GitHub also answers 404 for a repository that the caller cannot read, so
-    # query it to report that case with its usual hint.
-    _github_json(repository_url, token)
-    raise ScriptError(
-        f"no {repository} release with an NVX package for {platform} was built "
-        f"from HEAD or its first-parent ancestors ({len(commits)} commits "
-        "searched); check out a released commit or build the artifacts"
-    )
-
-
-def _checkout_release_asset_with_fallback(
-    repository: str,
-    platform: str,
-    token: str | None,
-) -> tuple[_ReleaseAsset, str | None]:
-    if token is None:
-        return _checkout_release_asset(repository, platform, None), None
-
-    try:
-        return _checkout_release_asset(repository, platform, token), token
-    except _GitHubReleaseQueryError as authenticated_error:
-        if authenticated_error.status not in (401, 403):
-            raise
-        print(
-            f">> {authenticated_error}; retrying without credentials",
-            file=sys.stderr,
-        )
-        try:
-            return _checkout_release_asset(repository, platform, None), None
-        except _GitHubReleaseQueryError as public_error:
-            raise authenticated_error from public_error
 
 
 def _same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
@@ -495,6 +306,29 @@ def _release_archive_layout(
     raise ScriptError(f"unsupported release archive: {archive_path.name}")
 
 
+def release_package_executables(platform: str) -> tuple[str, ...]:
+    """Return the paths of the executables that every package of the release
+    platform `platform`, such as linux-kvm, ships: OpenVMM and nvx-rs."""
+    suffix = ".exe" if platform.startswith("windows-") else ""
+    return tuple(
+        f"bin/{name}{suffix}"
+        for name in (OpenVMMBuildConstants.BINARY_NAME, nvx_rs.BINARY_NAME)
+    )
+
+
+def require_release_package_executables(archive_path: Path, platform: str) -> None:
+    """Fail unless the release archive at `archive_path` ships the executables
+    of `platform`, which its member list shows without extracting it."""
+    root, layout = _release_archive_layout(archive_path)
+    missing = [
+        path
+        for path in release_package_executables(platform)
+        if layout.get(f"{root}/{path}") is not False
+    ]
+    if missing:
+        raise ScriptError(f"{archive_path.name} does not ship {', '.join(missing)}")
+
+
 def _extract_release_archive(archive_path: Path, destination: Path) -> None:
     _release_archive_layout(archive_path)
     try:
@@ -593,125 +427,6 @@ def _verify_release_archive(
             )
     finally:
         shutil.rmtree(extraction, ignore_errors=True)
-
-
-def _replace_runtime_file(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(f"{destination.name}.part")
-    temporary.unlink(missing_ok=True)
-    try:
-        shutil.copy2(source, temporary)
-        temporary.replace(destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _packaged_guest_artifact_names(package_root: Path) -> list[str]:
-    source_manifest = package_root / "SOURCE-MANIFEST.json"
-    if not source_manifest.exists():
-        return list(ReleaseBuildConstants.GUEST_ARTIFACT_NAMES)
-    manifest = _read_json_object(source_manifest, "packaged source manifest")
-    names: list[str] = []
-    if isinstance(manifest.get("linux"), dict):
-        names.extend(
-            (
-                KernelBuildConstants.BINARY_NAME,
-                KernelBuildConstants.CONFIG_NAME,
-            )
-        )
-    if isinstance(manifest.get("alpine"), dict):
-        names.extend(
-            (
-                AlpineBuildConstants.INITRAMFS_NAME,
-                AlpineBuildConstants.PACKAGE_MANIFEST_NAME,
-            )
-        )
-    if isinstance(manifest.get("ubuntu"), dict):
-        names.extend(
-            (
-                UbuntuBuildConstants.INITRAMFS_NAME,
-                UbuntuBuildConstants.PACKAGE_MANIFEST_NAME,
-                UbuntuBuildConstants.STAGE_INITRAMFS_NAME,
-                UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME,
-                UbuntuBuildConstants.DISTRO_NAME,
-                UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
-            )
-        )
-    if isinstance(manifest.get("azurelinux"), dict):
-        names.extend(ReleaseBuildConstants.AZURELINUX_ARTIFACT_NAMES)
-    if not names:
-        raise ScriptError("packaged source manifest does not declare guest artifacts")
-    return names
-
-
-def _install_release_archive(archive_path: Path) -> None:
-    with tempfile.TemporaryDirectory(prefix="nvx-release-") as temporary:
-        extraction_root = Path(temporary)
-        _extract_release_archive(archive_path, extraction_root)
-        checksum_files = list(extraction_root.glob("*/SHA256SUMS"))
-        if len(checksum_files) != 1:
-            raise ScriptError(
-                "release archive must contain one package root with SHA256SUMS"
-            )
-        package_root = checksum_files[0].parent
-        verify_sha256_sums(package_root)
-
-        binary_destination = openvmm_binary_path()
-        binary_source = require_file(
-            package_root / "bin" / binary_destination.name,
-            "packaged OpenVMM binary",
-        )
-        guest_sources = {
-            name: require_file(
-                package_root / "guest" / name,
-                f"packaged guest artifact {name}",
-            )
-            for name in _packaged_guest_artifact_names(package_root)
-        }
-        provenance_sources = {
-            name: require_file(
-                package_root / "provenance" / name,
-                f"packaged provenance artifact {name}",
-            )
-            for name in (
-                OpenVMMBuildConstants.PROVENANCE_NAME,
-                KernelBuildConstants.PROVENANCE_NAME,
-                InitramfsBuildConstants.PROVENANCE_NAME,
-            )
-        }
-        _replace_runtime_file(binary_source, binary_destination)
-        for name, source in guest_sources.items():
-            _replace_runtime_file(source, artifact_path(name))
-        for name in ReleaseBuildConstants.GUEST_ARTIFACT_NAMES:
-            if name not in guest_sources:
-                artifact_path(name).unlink(missing_ok=True)
-        for name, source in provenance_sources.items():
-            _replace_runtime_file(source, artifact_path(name))
-
-
-def download_checkout_release(repository: str, platform: str) -> None:
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    asset, download_token = _checkout_release_asset_with_fallback(
-        repository,
-        platform,
-        token,
-    )
-    print(f">> downloading {asset.name} from {asset.tag}")
-    with tempfile.TemporaryDirectory(prefix="nvx-download-") as temporary:
-        archive_path = Path(temporary) / asset.name
-        download(
-            asset.url,
-            archive_path,
-            headers=_github_headers(download_token, "application/octet-stream"),
-            opener=credential_safe_opener(),
-        )
-        actual_size = archive_path.stat().st_size
-        if actual_size != asset.size:
-            raise ScriptError(
-                f"downloaded {asset.name} is {actual_size} bytes, expected {asset.size}"
-            )
-        _install_release_archive(archive_path)
-    print(f">> installed {asset.tag} for {platform}")
 
 
 def _copy_release_file(source: Path, destination: Path) -> None:
@@ -935,9 +650,8 @@ def _validate_linux_source_archive(path: Path) -> None:
                 raise ScriptError(f"{path} has stale contents for {suffix}")
 
 
-def _validate_azurelinux_manifest(manifest_path: Path) -> None:
+def _validate_azurelinux_manifest(manifest_path: Path, initramfs: Path) -> None:
     manifest = _read_json_object(manifest_path, "Azure Linux initramfs manifest")
-    initramfs = artifact_path(AzureLinuxBuildConstants.INITRAMFS_NAME)
     if (
         manifest.get("format") != AzureLinuxBuildConstants.PACKAGE_MANIFEST_VERSION
         or manifest.get("guest") != AzureLinuxBuildConstants.GUEST_NAME
@@ -976,46 +690,64 @@ def _guest_release_inputs(
         azurelinux_manifests.append(
             artifact_path(AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME)
         )
-        _validate_azurelinux_manifest(azurelinux_manifests[0])
+        _validate_azurelinux_manifest(
+            azurelinux_manifests[0],
+            artifact_path(AzureLinuxBuildConstants.INITRAMFS_NAME),
+        )
     expected_input_sha256 = converter_input_sha256(customization_files())
     for artifact_name, manifest in zip(
         (UbuntuBuildConstants.INITRAMFS_NAME, UbuntuBuildConstants.DISTRO_NAME),
         ubuntu_manifests,
         strict=True,
     ):
-        artifact = artifact_path(artifact_name)
-        document = _read_json_object(manifest, f"{artifact_name} manifest")
-        if (
-            document.get("format") != UbuntuBuildConstants.PACKAGE_MANIFEST_VERSION
-            or document.get("guest") != UbuntuBuildConstants.GUEST_NAME
-            or document.get("artifact") != artifact.name
-            or document.get("artifact_sha256") != sha256_file(artifact)
-            or document.get("input_sha256") != expected_input_sha256
-        ):
-            raise ScriptError(
-                f"Ubuntu artifact manifest does not match {artifact_name}"
-            )
-    stage = artifact_path(UbuntuBuildConstants.STAGE_INITRAMFS_NAME)
-    stage_document = _read_json_object(
-        artifact_path(UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME),
-        "Ubuntu EROFS stage manifest",
-    )
-    stage_init = (
-        BuildConstants.REPO_ROOT / BuildConstants.COMMON_GUEST_DIRECTORY
-        / "nvx-erofs-stage-init"
-    )
-    if (
-        stage_document.get("format") != UbuntuBuildConstants.PACKAGE_MANIFEST_VERSION
-        or stage_document.get("guest") != UbuntuBuildConstants.GUEST_NAME
-        or stage_document.get("artifact") != stage.name
-        or stage_document.get("artifact_sha256") != sha256_file(stage)
-        or stage_document.get("source_artifact") != UbuntuBuildConstants.INITRAMFS_NAME
-        or stage_document.get("source_artifact_sha256")
-        != sha256_file(artifact_path(UbuntuBuildConstants.INITRAMFS_NAME))
-        or stage_document.get("stage_init_sha256") != sha256_file(stage_init)
-    ):
-        raise ScriptError("Ubuntu artifact manifest does not match EROFS stage inputs")
+        _validate_ubuntu_manifest(
+            artifact_path(artifact_name), manifest, expected_input_sha256
+        )
     return guest_names, alpine_manifests, ubuntu_manifests, azurelinux_manifests
+
+
+def _validate_ubuntu_manifest(
+    artifact: Path,
+    manifest: Path,
+    input_sha256: str,
+) -> None:
+    """Check that the Ubuntu manifest `manifest` describes `artifact` as built
+    from the inputs whose digest is `input_sha256`."""
+    document = _read_json_object(manifest, f"{artifact.name} manifest")
+    mismatches = _manifest_mismatches(
+        document,
+        {
+            "format": UbuntuBuildConstants.PACKAGE_MANIFEST_VERSION,
+            "guest": UbuntuBuildConstants.GUEST_NAME,
+            "artifact": artifact.name,
+            "artifact_sha256": sha256_file(artifact),
+            "input_sha256": input_sha256,
+        },
+    )
+    if mismatches:
+        raise ScriptError(
+            f"Ubuntu artifact manifest does not match {artifact.name}: "
+            f"{manifest.name} differs in {', '.join(mismatches)}"
+        )
+
+
+def _manifest_mismatches(
+    document: dict[str, object],
+    expected: dict[str, object],
+) -> list[str]:
+    """Describe each field of ``document`` that differs from ``expected``."""
+    mismatches: list[str] = []
+    for field, value in expected.items():
+        if field not in document:
+            recorded = "missing"
+        elif document[field] == value:
+            continue
+        else:
+            recorded = json.dumps(document[field])
+        mismatches.append(
+            f"{field} (manifest {recorded}, expected {json.dumps(value)})"
+        )
+    return mismatches
 
 
 def _read_json_object(path: Path, description: str) -> dict[str, object]:
@@ -1109,7 +841,64 @@ def _require_runtime_provenance_paths() -> tuple[Path, Path, Path]:
     )
 
 
+def _describes_checkout_nvx_rs(
+    provenance: dict[str, object], *, target: str | None
+) -> bool:
+    """Return whether the nvx-rs provenance `provenance` describes a build of
+    this checkout's nvx-rs sources with its features and Rust release, for
+    `target` if given, whatever executable it names."""
+    recorded_target = provenance.get("target")
+    return (
+        provenance.get("format") == nvx_rs.PROVENANCE_FORMAT
+        and provenance.get("source_sha256")
+        == nvx_rs.source_sha256(BuildConstants.REPO_ROOT)
+        and provenance.get("toolchain") == pinned_guest_rust_toolchain()
+        and provenance.get("features") == list(nvx_rs.FEATURES)
+        and isinstance(recorded_target, str)
+        and (target is None or recorded_target == target)
+    )
+
+
+def _validate_nvx_rs_provenance(
+    executable: Path,
+    provenance_path: Path,
+    *,
+    target: str | None,
+) -> dict[str, object]:
+    """Check that the nvx-rs provenance at `provenance_path` describes the
+    executable at `executable`, built with nvx-rs's features and this
+    checkout's Rust release from its nvx-rs sources, for `target` if given,
+    and return it."""
+    provenance = _read_json_object(provenance_path, "nvx-rs build provenance")
+    if not _describes_checkout_nvx_rs(provenance, target=target) or provenance.get(
+        "executable_sha256"
+    ) != sha256_file(executable):
+        build = "a build" if target is None else f"a {target} build"
+        raise ScriptError(
+            f"nvx-rs build provenance does not describe {executable} as {build} "
+            "from the current nvx-rs sources; build nvx-rs from them, and record "
+            "its provenance with `nvx.py record-nvx-rs-provenance`"
+        )
+    return provenance
+
+
+def _require_runtime_nvx_rs() -> tuple[Path, Path]:
+    """Return the nvx-rs that nvx.py runs without building it and its
+    provenance."""
+    executable = nvx_rs.find_binary() or require_file(
+        nvx_rs.binary_path(), "nvx-rs executable"
+    )
+    provenance = require_file(
+        artifact_path(nvx_rs.PROVENANCE_NAME), "nvx-rs build provenance"
+    )
+    return executable, provenance
+
+
 def validate_runtime_artifact_provenance() -> None:
+    """Check that OpenVMM, the kernel, the Alpine initramfs, and the nvx-rs
+    that nvx.py runs match their build provenance and this checkout's
+    sources, so that nothing stale runs, such as an nvx-rs left from before a
+    change of its sources, which nvx.py never rebuilds."""
     binary = require_file(openvmm_binary_path(), "OpenVMM release binary")
     kernel = require_file(
         artifact_path(KernelBuildConstants.BINARY_NAME),
@@ -1132,6 +921,7 @@ def validate_runtime_artifact_provenance() -> None:
         kernel_provenance_path,
         initramfs_provenance_path,
     ) = _require_runtime_provenance_paths()
+    nvx_rs_executable, nvx_rs_provenance_path = _require_runtime_nvx_rs()
     _validate_openvmm_provenance(binary, openvmm_provenance_path)
     _validate_kernel_provenance(kernel, kernel_config, kernel_provenance_path)
     _validate_initramfs_provenance(
@@ -1139,6 +929,69 @@ def validate_runtime_artifact_provenance() -> None:
         package_manifest,
         initramfs_provenance_path,
     )
+    _validate_nvx_rs_provenance(nvx_rs_executable, nvx_rs_provenance_path, target=None)
+
+
+def validate_guest_artifacts(directory: Path, components: Collection[str]) -> None:
+    """Check that the files of the guest artifact `components` in `directory`
+    match their provenance and manifests and were built from this checkout's
+    sources, as `package` checks those in build/. The sandbox scratch template
+    has neither, so it need only be there."""
+    unknown = sorted(set(components) - GUEST_ARTIFACT_COMPONENTS.keys())
+    if unknown:
+        raise ScriptError(f"unknown guest artifact component: {', '.join(unknown)}")
+    if not components:
+        raise ScriptError("no guest artifact component to validate")
+    for component in components:
+        for name in GUEST_ARTIFACT_COMPONENTS[component]:
+            require_file(directory / name, f"guest artifact {name}")
+    if "kernel" in components:
+        _validate_kernel_provenance(
+            directory / KernelBuildConstants.BINARY_NAME,
+            directory / KernelBuildConstants.CONFIG_NAME,
+            directory / KernelBuildConstants.PROVENANCE_NAME,
+        )
+    if "alpine" in components:
+        _validate_initramfs_provenance(
+            directory / AlpineBuildConstants.INITRAMFS_NAME,
+            directory / AlpineBuildConstants.PACKAGE_MANIFEST_NAME,
+            directory / InitramfsBuildConstants.PROVENANCE_NAME,
+        )
+    if "ubuntu" in components:
+        input_sha256 = converter_input_sha256(customization_files())
+        for artifact_name, manifest_name in (
+            (
+                UbuntuBuildConstants.INITRAMFS_NAME,
+                UbuntuBuildConstants.PACKAGE_MANIFEST_NAME,
+            ),
+            (
+                UbuntuBuildConstants.DISTRO_NAME,
+                UbuntuBuildConstants.DISTRO_MANIFEST_NAME,
+            ),
+        ):
+            _validate_ubuntu_manifest(
+                directory / artifact_name, directory / manifest_name, input_sha256
+            )
+    if "azurelinux" in components:
+        _validate_azurelinux_manifest(
+            directory / AzureLinuxBuildConstants.PACKAGE_MANIFEST_NAME,
+            directory / AzureLinuxBuildConstants.INITRAMFS_NAME,
+        )
+
+
+def _require_release_nvx_rs() -> tuple[Path, Path, dict[str, object]]:
+    """Return the nvx-rs that a package ships, its provenance path, and its
+    provenance, which must show a build for the release target of this
+    operating system: on Linux, the static musl executable that runs on every
+    host, which a build for the host's own target is not."""
+    executable = require_file(nvx_rs.binary_path(), "nvx-rs release executable")
+    provenance_path = require_file(
+        artifact_path(nvx_rs.PROVENANCE_NAME), "nvx-rs build provenance"
+    )
+    target = nvx_rs.release_target()
+    provenance = _validate_nvx_rs_provenance(executable, provenance_path, target=target)
+    nvx_rs.check_target(executable, target)
+    return executable, provenance_path, provenance
 
 
 def _packaged_source_manifest(
@@ -1147,6 +1000,8 @@ def _packaged_source_manifest(
     release_root: Path,
     openvmm_provenance: dict[str, object],
     binary_name: str,
+    nvx_rs_provenance: dict[str, object],
+    nvx_rs_name: str,
     *,
     include_azurelinux: bool,
 ) -> bytes:
@@ -1189,18 +1044,22 @@ def _packaged_source_manifest(
     ubuntu_section["initramfs_package_manifest_sha256"] = sha256_file(
         release_root / "guest" / UbuntuBuildConstants.PACKAGE_MANIFEST_NAME
     )
-    ubuntu_section["stage_initramfs_sha256"] = sha256_file(
-        release_root / "guest" / UbuntuBuildConstants.STAGE_INITRAMFS_NAME
-    )
-    ubuntu_section["stage_initramfs_manifest_sha256"] = sha256_file(
-        release_root / "guest" / UbuntuBuildConstants.STAGE_INITRAMFS_MANIFEST_NAME
-    )
     ubuntu_section["distro_layer_sha256"] = sha256_file(
         release_root / "guest" / UbuntuBuildConstants.DISTRO_NAME
     )
     ubuntu_section["distro_layer_manifest_sha256"] = sha256_file(
         release_root / "guest" / UbuntuBuildConstants.DISTRO_MANIFEST_NAME
     )
+    ubuntu_section["scratch_template_sha256"] = sha256_file(
+        release_root / "guest" / UbuntuBuildConstants.SCRATCH_TEMPLATE_NAME
+    )
+    root_manifest["nvx_rs"] = {
+        "executable_sha256": sha256_file(release_root / "bin" / nvx_rs_name),
+        **{
+            field: nvx_rs_provenance[field]
+            for field in ("source_sha256", "toolchain", "target", "features")
+        },
+    }
     if include_azurelinux:
         azurelinux_section = cast(dict[str, object], azurelinux)
         azurelinux_section["initramfs_sha256"] = sha256_file(
@@ -1259,6 +1118,7 @@ def _validate_source_manifest_metadata(
     alpine_value = manifest.get("alpine")
     ubuntu_value = manifest.get("ubuntu")
     azurelinux_value = manifest.get("azurelinux")
+    guest_rust_value = manifest.get("guest_rust")
     source_value = kernel_inputs.get("source")
     config_value = kernel_inputs.get("input_config")
     if not all(
@@ -1268,6 +1128,7 @@ def _validate_source_manifest_metadata(
             alpine_value,
             ubuntu_value,
             azurelinux_value,
+            guest_rust_value,
             source_value,
             config_value,
         )
@@ -1277,8 +1138,17 @@ def _validate_source_manifest_metadata(
     alpine = cast(dict[str, object], alpine_value)
     ubuntu = cast(dict[str, object], ubuntu_value)
     azurelinux = cast(dict[str, object], azurelinux_value)
+    guest_rust = cast(dict[str, object], guest_rust_value)
     source = cast(dict[str, object], source_value)
     input_config = cast(dict[str, object], config_value)
+    expected_guest_rust = {
+        "toolchain": pinned_guest_rust_toolchain(),
+        "target": GuestRustBuildConstants.TARGET,
+    }
+    if guest_rust != expected_guest_rust:
+        raise ScriptError(
+            "SOURCE-MANIFEST.json Rust guest toolchain does not match the build pin"
+        )
     source_patches = source.get("patches")
     if not isinstance(source_patches, list):
         raise ScriptError("kernel provenance source patches must be a list")
@@ -1323,7 +1193,11 @@ def _validate_source_manifest_metadata(
         "minirootfs_url": AlpineBuildConstants.MINIROOTFS_URL,
         "minirootfs_sha256": AlpineBuildConstants.MINIROOTFS_SHA256,
         "guest_sources": [
-            path.as_posix() for path in AlpineBuildConstants.GUEST_SOURCE_DIRECTORIES
+            *(
+                path.as_posix()
+                for path in AlpineBuildConstants.GUEST_SOURCE_DIRECTORIES
+            ),
+            *GuestRustBuildConstants.SOURCE_PATHS,
         ],
         "package_manifests": [
             (
@@ -1357,6 +1231,7 @@ def _validate_source_manifest_metadata(
                 for path in UbuntuBuildConstants.GUEST_SOURCE_DIRECTORIES
             ),
             UbuntuBuildConstants.PACKAGE_LOCK_RELATIVE_PATH.as_posix(),
+            *GuestRustBuildConstants.SOURCE_PATHS,
         ],
         "package_manifests": [
             (
@@ -1391,6 +1266,7 @@ def _validate_source_manifest_metadata(
                 for path in AzureLinuxBuildConstants.GUEST_SOURCE_DIRECTORIES
             ),
             AzureLinuxBuildConstants.PACKAGE_LOCK_RELATIVE_PATH.as_posix(),
+            *GuestRustBuildConstants.SOURCE_PATHS,
         ],
         "package_manifests": [
             (
@@ -1534,6 +1410,7 @@ def package_release(
     ).resolve()
     _validate_release_replacement(release_destination, force)
     binary = require_file(openvmm_binary_path(), "OpenVMM release binary")
+    nvx_rs_binary, nvx_rs_provenance_path, nvx_rs_provenance = _require_release_nvx_rs()
     kernel = require_file(
         artifact_path(KernelBuildConstants.BINARY_NAME),
         "required guest artifact vmlinux",
@@ -1592,6 +1469,7 @@ def package_release(
     preserve_staging = False
     try:
         _copy_release_file(binary, staging / "bin" / binary.name)
+        _copy_release_file(nvx_rs_binary, staging / "bin" / nvx_rs_binary.name)
         for name in guest_names:
             _copy_release_file(artifact_path(name), staging / "guest" / name)
         _copy_release_file(
@@ -1605,6 +1483,10 @@ def package_release(
         _copy_release_file(
             initramfs_provenance_path,
             staging / "provenance" / InitramfsBuildConstants.PROVENANCE_NAME,
+        )
+        _copy_release_file(
+            nvx_rs_provenance_path,
+            staging / "provenance" / nvx_rs.PROVENANCE_NAME,
         )
         for name in ("LICENSE", "README.md", "THIRD_PARTY_NOTICES.md"):
             _copy_release_file(BuildConstants.REPO_ROOT / name, staging / name)
@@ -1658,6 +1540,13 @@ def package_release(
             raise ScriptError(
                 "packaged OpenVMM executable does not match its build provenance"
             )
+        if (
+            sha256_file(staging / "bin" / nvx_rs_binary.name)
+            != nvx_rs_provenance["executable_sha256"]
+        ):
+            raise ScriptError(
+                "packaged nvx-rs executable does not match its build provenance"
+            )
         if sha256_file(packaged_kernel) != kernel_provenance["kernel_sha256"]:
             raise ScriptError("packaged kernel does not match its build provenance")
         if sha256_file(packaged_config) != kernel_provenance["config_sha256"]:
@@ -1696,6 +1585,14 @@ def package_release(
             != initramfs_provenance
         ):
             raise ScriptError("packaged initramfs provenance changed while staging")
+        if (
+            _read_json_object(
+                staging / "provenance" / nvx_rs.PROVENANCE_NAME,
+                "packaged nvx-rs build provenance",
+            )
+            != nvx_rs_provenance
+        ):
+            raise ScriptError("packaged nvx-rs provenance changed while staging")
         (staging / "SOURCE-MANIFEST.json").write_bytes(
             _packaged_source_manifest(
                 root_manifest,
@@ -1703,6 +1600,8 @@ def package_release(
                 staging,
                 openvmm_provenance,
                 binary.name,
+                nvx_rs_provenance,
+                nvx_rs_binary.name,
                 include_azurelinux=not include_source,
             )
         )
@@ -1727,6 +1626,8 @@ def verify_source_tree() -> None:
         manifest,
         kernel_provenance_inputs(),
     )
+    guest_binary_source_files()
+    pinned_guest_rust_toolchain()
     required = {
         BuildConstants.REPO_ROOT
         / "kernel"

@@ -19,6 +19,9 @@ pub const MAX_ARGUMENT_BYTES: usize = 4096;
 /// Largest working directory that hosts send: Linux's `PATH_MAX` without the terminating NUL, one
 /// byte below the agent's bound.
 pub const MAX_CWD_BYTES: usize = 4095;
+/// Largest working directory that the C guest decoder accepts. Unlike host paths, the guest's
+/// wire bound includes all 4096 non-NUL bytes because its terminating NUL is allocated separately.
+pub const MAX_GUEST_CWD_BYTES: usize = MAX_ARGUMENT_BYTES;
 /// Largest number of workload environment entries.
 pub const MAX_ENVIRONMENT: usize = 256;
 /// Largest workload timeout the guest agent accepts: any value of the exec request's 32-bit
@@ -29,45 +32,6 @@ pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Extension field of a payload that carries flags, a working directory, and an environment.
 pub const EXEC_EXTENDED: u16 = 1;
-/// Extension field of a payload that additionally carries the execution's resource limits.
-///
-/// A guest accepts it only when it advertises
-/// [`EXEC_LIMITS`](crate::protocol::GuestFeatures::EXEC_LIMITS); the limits are enforced on the
-/// execution's own cgroup, and an execution whose limit cannot be enforced is refused instead of
-/// running unlimited.
-pub const EXEC_EXTENDED_V2: u16 = 2;
-/// Largest per-execution memory limit, in MiB.
-pub const MAX_EXEC_MEMORY_MIB: u32 = 4096;
-/// Largest per-execution CPU limit, in hundredths of one core.
-pub const MAX_EXEC_CPU_PERCENT: u32 = 6400;
-/// Largest per-execution task limit.
-pub const MAX_EXEC_PIDS: u32 = 4096;
-
-/// Resource limits of one execution alone. Zero in a field means "no limit" there.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ExecLimits {
-    /// Memory the execution and its descendants may charge, in MiB.
-    pub mem_mb: u32,
-    /// CPU time budget as a percentage of one core; 100 is one core's worth of time.
-    pub cpu_percent: u32,
-    /// Largest number of tasks the execution and its descendants may hold.
-    pub pids_max: u32,
-}
-
-impl ExecLimits {
-    /// Whether the request asks for no limit at all, in which case the payload stays compatible
-    /// with guests that predate per-execution limits.
-    pub const fn is_unset(self) -> bool {
-        self.mem_mb == 0 && self.cpu_percent == 0 && self.pids_max == 0
-    }
-
-    /// Whether every field is inside the range the guest agent accepts.
-    pub const fn is_supported(self) -> bool {
-        self.mem_mb <= MAX_EXEC_MEMORY_MIB
-            && self.cpu_percent <= MAX_EXEC_CPU_PERCENT
-            && self.pids_max <= MAX_EXEC_PIDS
-    }
-}
 /// Flag of an extended payload that carries a working directory.
 pub const EXEC_CWD_PRESENT: u16 = 1 << 0;
 /// Flag of an extended payload that carries an explicit environment.
@@ -99,8 +63,6 @@ pub struct Workload<'a> {
     pub cwd: Option<&'a str>,
     /// The program's environment.
     pub environment: WorkloadEnvironment<'a>,
-    /// Resource limits of this execution alone; the default asks for none.
-    pub limits: ExecLimits,
 }
 
 /// Encodes the payload of an `EXEC` request.
@@ -146,36 +108,18 @@ pub fn encode_exec_payload(workload: &Workload<'_>) -> Result<Vec<u8>, ProtocolE
         flags |= EXEC_CWD_PRESENT;
     }
     let count = u16::try_from(argv.len()).unwrap_or(u16::MAX);
-    if !workload.limits.is_supported() {
-        return Err(violation(format!(
-            "exec limits must be at most {MAX_EXEC_MEMORY_MIB} MiB of memory, \
-             {MAX_EXEC_CPU_PERCENT} hundredths of a core, and {MAX_EXEC_PIDS} tasks"
-        )));
-    }
     let mut payload = Vec::new();
     payload.extend_from_slice(&workload.timeout_ms.to_le_bytes());
     payload.extend_from_slice(&count.to_le_bytes());
-    if flags == 0 && workload.limits.is_unset() {
+    if flags == 0 {
         payload.extend_from_slice(&0u16.to_le_bytes());
     } else {
         let environment_count = u16::try_from(environment.len()).unwrap_or(u16::MAX);
         let cwd_len = u32::try_from(cwd.map_or(0, <[u8]>::len)).unwrap_or(u32::MAX);
-        payload.extend_from_slice(
-            &(if workload.limits.is_unset() {
-                EXEC_EXTENDED
-            } else {
-                EXEC_EXTENDED_V2
-            })
-            .to_le_bytes(),
-        );
+        payload.extend_from_slice(&EXEC_EXTENDED.to_le_bytes());
         payload.extend_from_slice(&flags.to_le_bytes());
         payload.extend_from_slice(&environment_count.to_le_bytes());
         payload.extend_from_slice(&cwd_len.to_le_bytes());
-        if !workload.limits.is_unset() {
-            payload.extend_from_slice(&workload.limits.mem_mb.to_le_bytes());
-            payload.extend_from_slice(&workload.limits.cpu_percent.to_le_bytes());
-            payload.extend_from_slice(&workload.limits.pids_max.to_le_bytes());
-        }
     }
     for argument in argv {
         let bytes = argument.as_bytes();
@@ -233,20 +177,51 @@ pub struct ExecPayload {
     /// Whether the program starts from the default environment: true without explicit entries,
     /// and true when the entries layer over the default environment rather than replace it.
     pub inherit_default_env: bool,
-    /// Resource limits the request asked for; zero fields mean "no limit".
-    pub limits: ExecLimits,
 }
 
-/// Decodes the payload of an `EXEC` request.
+/// An `EXEC` payload as the guest agent reads it, without imposing UTF-8 on guest byte strings.
 ///
-/// It refuses what the guest agent refuses: a truncated payload, a number of arguments outside 1
-/// to [`MAX_ARGUMENTS`], an unknown extension or flag, a working-directory length without the
-/// working-directory flag or the reverse, environment entries without the environment flag, more
-/// than [`MAX_ENVIRONMENT`] entries, an empty argument, working directory, or entry, or one
-/// longer than [`MAX_ARGUMENT_BYTES`], text that is not UTF-8 or contains NUL characters, a
-/// relative program or working directory, an entry without a name, a name that repeats, and
-/// trailing bytes.
-pub fn decode_exec_payload(payload: &[u8]) -> Result<ExecPayload, ProtocolError> {
+/// Linux arguments, paths, and environment entries are byte strings. Keeping this form separate
+/// from [`ExecPayload`] preserves the host and fake-OpenVMM APIs, which intentionally use UTF-8,
+/// while accepting every non-NUL byte sequence that the C guest accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestExecPayload {
+    /// Timeout in milliseconds; zero disables it.
+    pub timeout_ms: u32,
+    /// The absolute program, followed by its arguments.
+    pub argv: Vec<Vec<u8>>,
+    /// Absolute guest directory to start the program in; `None` selects `/`.
+    pub cwd: Option<Vec<u8>>,
+    /// Explicit `KEY=VALUE` entries, or `None` for the default environment.
+    pub environment: Option<Vec<Vec<u8>>>,
+    /// Whether explicit entries layer over the default environment.
+    pub inherit_default_env: bool,
+}
+
+/// The fixed fields of an `EXEC` payload, which both decoders read and check alike.
+struct ExecHeader {
+    /// Timeout in milliseconds; zero disables it.
+    timeout_ms: u32,
+    /// Number of arguments, from 1 to [`MAX_ARGUMENTS`].
+    count: usize,
+    /// Flags of an extended payload; zero for a legacy one.
+    flags: u16,
+    /// Number of environment entries.
+    environment_count: usize,
+    /// Length of the working directory; zero without one.
+    cwd_len: usize,
+    /// Offset of the first argument.
+    offset: usize,
+}
+
+/// Decodes the fixed fields of an `EXEC` payload, whose working directory may be 1 to `max_cwd`
+/// bytes long.
+///
+/// It refuses a truncated header, a number of arguments outside 1 to [`MAX_ARGUMENTS`], an
+/// unknown extension or flag, a working-directory length without the working-directory flag or
+/// the reverse, environment entries without the environment flag, and more than
+/// [`MAX_ENVIRONMENT`] entries.
+fn decode_exec_header(payload: &[u8], max_cwd: usize) -> Result<ExecHeader, ProtocolError> {
     let truncated = || violation("the exec request is truncated");
     if payload.len() < 8 {
         return Err(truncated());
@@ -259,13 +234,9 @@ pub fn decode_exec_payload(payload: &[u8]) -> Result<ExecPayload, ProtocolError>
             "exec requires 1 to {MAX_ARGUMENTS} arguments"
         )));
     }
-    let (flags, environment_count, cwd_len, limits, mut offset) = match extension {
-        0 => (0, 0, 0, ExecLimits::default(), 8),
-        EXEC_EXTENDED | EXEC_EXTENDED_V2 => {
-            let header_len = if extension == EXEC_EXTENDED_V2 { 28 } else { 16 };
-            if payload.len() < header_len {
-                return Err(truncated());
-            }
+    let (flags, environment_count, cwd_len, offset) = match extension {
+        0 => (0, 0, 0, 8),
+        EXEC_EXTENDED if payload.len() >= 16 => {
             let flags = u16_at(payload, 8).ok_or_else(truncated)?;
             let environment_count = usize::from(u16_at(payload, 10).ok_or_else(truncated)?);
             let cwd_len = u32_at(payload, 12).ok_or_else(truncated)? as usize;
@@ -273,7 +244,7 @@ pub fn decode_exec_payload(payload: &[u8]) -> Result<ExecPayload, ProtocolError>
             let cwd_valid = if flags & EXEC_CWD_PRESENT == 0 {
                 cwd_len == 0
             } else {
-                (1..=MAX_ARGUMENT_BYTES).contains(&cwd_len)
+                (1..=max_cwd).contains(&cwd_len)
             };
             let environment_valid = flags & EXEC_ENVIRONMENT_PRESENT != 0
                 || (environment_count == 0 && flags & EXEC_INHERIT_DEFAULT_ENV == 0);
@@ -286,37 +257,71 @@ pub fn decode_exec_payload(payload: &[u8]) -> Result<ExecPayload, ProtocolError>
                     "the exec request has unknown flags or inconsistent fields",
                 ));
             }
-            let limits = if extension == EXEC_EXTENDED_V2 {
-                ExecLimits {
-                    mem_mb: u32_at(payload, 16).ok_or_else(truncated)?,
-                    cpu_percent: u32_at(payload, 20).ok_or_else(truncated)?,
-                    pids_max: u32_at(payload, 24).ok_or_else(truncated)?,
-                }
-            } else {
-                ExecLimits::default()
-            };
-            if !limits.is_supported() {
-                return Err(violation(
-                    "the exec request asks for a resource limit outside the supported range",
-                ));
-            }
-            (flags, environment_count, cwd_len, limits, header_len)
+            (flags, environment_count, cwd_len, 16)
         }
+        EXEC_EXTENDED => return Err(truncated()),
         _ => return Err(violation("the exec request has an unknown extension")),
     };
+    Ok(ExecHeader {
+        timeout_ms,
+        count,
+        flags,
+        environment_count,
+        cwd_len,
+        offset,
+    })
+}
+
+/// An `EXEC` payload as both decoders read it, with each string as one decoder holds it.
+struct DecodedExec<S> {
+    /// Timeout in milliseconds; zero disables it.
+    timeout_ms: u32,
+    /// Flags of an extended payload; zero for a legacy one.
+    flags: u16,
+    /// The absolute program, followed by its arguments.
+    argv: Vec<S>,
+    /// Absolute guest directory to start the program in; `None` selects `/`.
+    cwd: Option<S>,
+    /// The explicit `KEY=VALUE` entries, or `None` for the default environment.
+    environment: Option<Vec<S>>,
+}
+
+/// Decodes an `EXEC` payload, whose working directory may be 1 to `max_cwd` bytes long, as both
+/// decoders read it: it checks the payload's bytes, and converts each string to `S` as soon as it
+/// reads it.
+///
+/// It refuses what [`decode_exec_header`] refuses, an empty argument, working directory, or
+/// entry, or one longer than [`MAX_ARGUMENT_BYTES`], one that contains NUL characters or that `S`
+/// refuses, a relative program or working directory, an entry without a name, a name that
+/// repeats, and trailing bytes.
+fn decode_exec<S: ExecString>(
+    payload: &[u8],
+    max_cwd: usize,
+) -> Result<DecodedExec<S>, ProtocolError> {
+    let ExecHeader {
+        timeout_ms,
+        count,
+        flags,
+        environment_count,
+        cwd_len,
+        mut offset,
+    } = decode_exec_header(payload, max_cwd)?;
     let mut argv = Vec::with_capacity(count);
     for _ in 0..count {
-        argv.push(prefixed_text(payload, &mut offset, "arguments")?);
+        argv.push(prefixed_string::<S>(payload, &mut offset, "arguments")?);
     }
-    if !argv[0].starts_with('/') {
+    if argv.first().and_then(|program| program.as_ref().first()) != Some(&b'/') {
         return Err(violation("exec program must be an absolute guest path"));
     }
     let cwd = if flags & EXEC_CWD_PRESENT == 0 {
         None
     } else {
-        let cwd = text_at(payload, offset, cwd_len, "working directory")?;
-        offset += cwd_len;
-        if !cwd.starts_with('/') {
+        let what = "working directory";
+        let cwd = S::convert(bytes_at(payload, offset, cwd_len, what)?.to_vec(), what)?;
+        offset = offset
+            .checked_add(cwd_len)
+            .ok_or_else(|| violation("the exec request is truncated"))?;
+        if cwd.as_ref().first() != Some(&b'/') {
             return Err(violation(
                 "exec working directory must be an absolute guest path",
             ));
@@ -326,58 +331,177 @@ pub fn decode_exec_payload(payload: &[u8]) -> Result<ExecPayload, ProtocolError>
     let mut environment = Vec::with_capacity(environment_count);
     let mut names = BTreeSet::new();
     for _ in 0..environment_count {
-        let entry = prefixed_text(payload, &mut offset, "environment entries")?;
+        let entry = prefixed_string::<S>(payload, &mut offset, "environment entries")?;
         // Like the guest agent, refuse entries without a name and repeated names.
-        let Some((name, _)) = entry.split_once('=').filter(|(name, _)| !name.is_empty()) else {
-            return Err(violation(
-                "exec environment entries must be KEY=VALUE strings",
-            ));
+        let bytes = entry.as_ref();
+        let Some(name) = bytes
+            .iter()
+            .position(|&byte| byte == b'=')
+            .filter(|&at| at != 0)
+            .map(|at| &bytes[..at])
+        else {
+            return Err(S::unnamed_entry());
         };
-        if !names.insert(name.to_owned()) {
-            return Err(violation(format!(
-                "exec environment names must be unique, but {name:?} repeats"
-            )));
+        if !names.insert(name.to_vec()) {
+            return Err(S::repeated_name(name));
         }
         environment.push(entry);
     }
     if offset != payload.len() {
         return Err(violation("the exec request has trailing bytes"));
     }
+    Ok(DecodedExec {
+        timeout_ms,
+        flags,
+        argv,
+        cwd,
+        environment: (flags & EXEC_ENVIRONMENT_PRESENT != 0).then_some(environment),
+    })
+}
+
+/// Decodes the payload of an `EXEC` request.
+///
+/// It refuses what the guest agent refuses: a truncated payload, a number of arguments outside 1
+/// to [`MAX_ARGUMENTS`], an unknown extension or flag, a working-directory length without the
+/// working-directory flag or the reverse, environment entries without the environment flag, more
+/// than [`MAX_ENVIRONMENT`] entries, an empty argument, working directory, or entry, or one
+/// longer than [`MAX_ARGUMENT_BYTES`], text that is not UTF-8 or contains NUL characters, a
+/// relative program or working directory, an entry without a name, a name that repeats, and
+/// trailing bytes.
+pub fn decode_exec_payload(payload: &[u8]) -> Result<ExecPayload, ProtocolError> {
+    let DecodedExec {
+        timeout_ms,
+        flags,
+        argv,
+        cwd,
+        environment,
+    } = decode_exec::<String>(payload, MAX_ARGUMENT_BYTES)?;
     Ok(ExecPayload {
         timeout_ms,
         argv,
         cwd,
-        environment: (flags & EXEC_ENVIRONMENT_PRESENT != 0).then_some(environment),
+        environment,
         inherit_default_env: flags & EXEC_ENVIRONMENT_PRESENT == 0
             || flags & EXEC_INHERIT_DEFAULT_ENV != 0,
-        limits,
     })
 }
 
-/// Reads the text at `offset` that its `u32` length precedes, of 1 to [`MAX_ARGUMENT_BYTES`]
-/// bytes, and advances `offset` past it.
-fn prefixed_text(payload: &[u8], offset: &mut usize, what: &str) -> Result<String, ProtocolError> {
+/// Decodes an `EXEC` payload with exactly the C guest agent's byte-oriented acceptance rules.
+///
+/// It reads the payload as [`decode_exec_payload`] does, with the same checks in the same order,
+/// and accepts what that decoder accepts and the strings that are not UTF-8, which Linux permits.
+/// It bounds the working directory by [`MAX_GUEST_CWD_BYTES`], the C guest's bound, which equals
+/// the [`MAX_ARGUMENT_BYTES`] of the host's decoder. Its `inherit_default_env` follows
+/// [`EXEC_INHERIT_DEFAULT_ENV`] alone, so unlike the host's, it is false without explicit entries.
+/// The host-facing decoder remains text-oriented, so this guest decoder does not broaden host
+/// behavior.
+pub fn decode_guest_exec_payload(payload: &[u8]) -> Result<GuestExecPayload, ProtocolError> {
+    let DecodedExec {
+        timeout_ms,
+        flags,
+        argv,
+        cwd,
+        environment,
+    } = decode_exec::<Vec<u8>>(payload, MAX_GUEST_CWD_BYTES)?;
+    Ok(GuestExecPayload {
+        timeout_ms,
+        argv,
+        cwd,
+        environment,
+        inherit_default_env: flags & EXEC_INHERIT_DEFAULT_ENV != 0,
+    })
+}
+
+/// A string of an `EXEC` payload, such as an argument, the working directory, or an environment
+/// entry, as one decoder holds it. Each decoder's implementation holds what it does differently
+/// from the other: the host's reads UTF-8 text, the guest's reads Linux byte strings, and they
+/// word the refusals of an entry's name differently.
+trait ExecString: AsRef<[u8]> + Sized {
+    /// Converts the bytes of a string of the payload, which `what` names, as soon as they are
+    /// read.
+    fn convert(bytes: Vec<u8>, what: &str) -> Result<Self, ProtocolError>;
+
+    /// Returns the error of an environment entry without a name before its first `=`.
+    fn unnamed_entry() -> ProtocolError;
+
+    /// Returns the error of an environment entry whose name, `name`, an earlier entry has.
+    fn repeated_name(name: &[u8]) -> ProtocolError;
+}
+
+/// The host's decoder refuses bytes that are not UTF-8, and names a variable that repeats.
+impl ExecString for String {
+    fn convert(bytes: Vec<u8>, what: &str) -> Result<Self, ProtocolError> {
+        String::from_utf8(bytes).map_err(|_| violation(format!("exec {what} must be valid UTF-8")))
+    }
+
+    fn unnamed_entry() -> ProtocolError {
+        violation("exec environment entries must be KEY=VALUE strings")
+    }
+
+    fn repeated_name(name: &[u8]) -> ProtocolError {
+        // The name of a UTF-8 entry ends before an ASCII `=`, so it is UTF-8 too.
+        let name = String::from_utf8_lossy(name);
+        violation(format!(
+            "exec environment names must be unique, but {name:?} repeats"
+        ))
+    }
+}
+
+/// The guest's decoder keeps Linux byte strings as they are.
+impl ExecString for Vec<u8> {
+    fn convert(bytes: Vec<u8>, _what: &str) -> Result<Self, ProtocolError> {
+        Ok(bytes)
+    }
+
+    fn unnamed_entry() -> ProtocolError {
+        violation("exec environment entries must be KEY=VALUE byte strings")
+    }
+
+    fn repeated_name(_name: &[u8]) -> ProtocolError {
+        violation("exec environment names must be unique")
+    }
+}
+
+/// Reads the string at `offset` that its `u32` length precedes, of 1 to [`MAX_ARGUMENT_BYTES`]
+/// bytes, as `S`, and advances `offset` past it.
+fn prefixed_string<S: ExecString>(
+    payload: &[u8],
+    offset: &mut usize,
+    what: &str,
+) -> Result<S, ProtocolError> {
+    S::convert(prefixed_bytes(payload, offset, what)?, what)
+}
+
+/// Reads one little-endian length-prefixed byte string and advances `offset`.
+fn prefixed_bytes(
+    payload: &[u8],
+    offset: &mut usize,
+    what: &str,
+) -> Result<Vec<u8>, ProtocolError> {
     let length = u32_at(payload, *offset)
         .ok_or_else(|| violation("the exec request is truncated"))? as usize;
-    *offset += 4;
+    *offset = offset
+        .checked_add(4)
+        .ok_or_else(|| violation("the exec request is truncated"))?;
     if length == 0 || length > MAX_ARGUMENT_BYTES {
         return Err(violation(format!(
             "exec {what} must be 1 to {MAX_ARGUMENT_BYTES} bytes"
         )));
     }
-    let text = text_at(payload, *offset, length, what)?;
-    *offset += length;
-    Ok(text)
+    let bytes = bytes_at(payload, *offset, length, what)?.to_vec();
+    *offset = offset
+        .checked_add(length)
+        .ok_or_else(|| violation("the exec request is truncated"))?;
+    Ok(bytes)
 }
 
-/// Reads the `length` bytes at `offset` as text. Like the guest agent, refuses a NUL byte, which
-/// it rejects in every argument, working directory, and environment entry.
-fn text_at(
-    payload: &[u8],
+/// Returns one bounded non-NUL byte range without imposing UTF-8.
+fn bytes_at<'a>(
+    payload: &'a [u8],
     offset: usize,
     length: usize,
     what: &str,
-) -> Result<String, ProtocolError> {
+) -> Result<&'a [u8], ProtocolError> {
     let bytes = offset
         .checked_add(length)
         .and_then(|end| payload.get(offset..end))
@@ -387,6 +511,5 @@ fn text_at(
             "exec {what} must not contain NUL characters"
         )));
     }
-    String::from_utf8(bytes.to_vec())
-        .map_err(|_| violation(format!("exec {what} must be valid UTF-8")))
+    Ok(bytes)
 }

@@ -37,6 +37,7 @@ from .common import (
     require_tool,
     sha256_file,
 )
+from .guest_binaries import guest_binary_source_files
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _PACKAGE_NAME = re.compile(r"[a-z0-9][a-z0-9+.-]*")
@@ -809,7 +810,13 @@ def precompile_python(root: Path) -> None:
 
 
 def require_posix_permissions(work: Path) -> None:
-    """Reject filesystems that silently discard the rootfs permission bits."""
+    """Reject filesystems that silently discard the rootfs permission bits.
+
+    Windows has no POSIX modes at all and the Ubuntu build only runs on Linux (or WSL), so
+    the check applies where the build can run.
+    """
+    if sys.platform == "win32":
+        return
     with tempfile.TemporaryDirectory(prefix="nvx-mode-check-", dir=work) as temporary:
         probe = Path(temporary) / "probe"
         probe.write_bytes(b"")
@@ -1065,6 +1072,7 @@ def customization_files() -> tuple[Path, ...]:
             if path.is_file()
         ),
         UbuntuBuildConstants.PACKAGE_LOCK,
+        *guest_binary_source_files(),
     )
 
 
@@ -1082,9 +1090,20 @@ def converter_input_sha256(customization_files: Sequence[Path]) -> str:
         "customization_files": [
             {
                 "path": path.relative_to(BuildConstants.REPO_ROOT).as_posix(),
-                "sha256": sha256_file(path),
+                "sha256": normalized_sha256_file(path),
             }
-            for path in sorted(customization_files)
+            # In the order of POSIX paths, whose names compare with case, as
+            # on the Linux hosts that build the artifacts; Windows paths
+            # compare without it, which put nvx-rs/build.rs before
+            # nvx-rs/Cargo.toml and changed the digest.
+            for path in sorted(
+                customization_files,
+                key=lambda path: (
+                    PurePosixPath(
+                        path.relative_to(BuildConstants.REPO_ROOT).as_posix()
+                    ).parts
+                ),
+            )
         ],
     }
     encoded = json.dumps(

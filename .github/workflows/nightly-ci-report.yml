@@ -1,0 +1,52 @@
+name: Nightly CI report
+
+# GitHub notifies only one person when a scheduled run fails, so every
+# completed nightly CI run opens, updates, or closes one tracking issue
+# (doc/ci.md, "Nightly failure reports"). The trigger reacts to the run itself,
+# so it also reports a run whose jobs were cancelled or never started.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [dev]
+
+permissions: {}
+
+jobs:
+  report:
+    name: Report the nightly CI run
+    # Pushes to dev complete CI runs too; only scheduled runs are reported.
+    if: github.event.workflow_run.event == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # One report at a time. A newer reporter can replace one that waits for
+    # its turn, but every reporter reports the latest nightly result, so the
+    # replaced one's result is never lost.
+    concurrency:
+      group: nightly-ci-report
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      issues: write
+    steps:
+      # The default branch's code reports the run; nothing from the run runs.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Report the nightly CI run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: >-
+          python3 scripts/nvx.py report-nightly-ci
+          --repository "${GITHUB_REPOSITORY}"
+          --run-id "${RUN_ID}"
+          --run-attempt "${RUN_ATTEMPT}"
+          --assignee ppenna
+          --label bug
+          --summary "${GITHUB_STEP_SUMMARY}"

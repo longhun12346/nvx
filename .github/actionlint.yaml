@@ -1,6 +1,7 @@
 self-hosted-runner:
   labels:
     - benchmark
+    - general
     - kvm
     - mshv
     - specula

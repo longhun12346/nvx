@@ -16,13 +16,11 @@ on:
     paths:
       - .github/workflows/copilot-setup-steps.yml
       - .github/actions/build-guest-artifacts/action.yml
-      - .github/actions/check-aci-edge-sandboxes/action.yml
       - .github/actions/check-nvx-rs/action.yml
       - .github/actions/check-quality/action.yml
       - .gitmodules
       - SOURCE-MANIFEST.json
-      - aci_edge_sandboxes/Cargo.toml
-      - nvx-rs/Cargo.toml
+      - nvx-rs/**
       - openvmm
       - requirements-dev.txt
       - rust-toolchain.toml
@@ -106,9 +104,9 @@ jobs:
         run: |
           set -euo pipefail
           rust_toolchain=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
-          # The distinct minimum supported Rust versions of the crates, space-separated.
-          crate_msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' \
-            aci_edge_sandboxes/Cargo.toml nvx-rs/Cargo.toml | sort -u | xargs)
+          # The minimum supported Rust version of the nvx crate, with which
+          # check-nvx-rs also checks the runtime adapter.
+          crate_msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' nvx-rs/Cargo.toml)
           nextest=$(sed -n 's/^cargo_nextest\.version=//p' scripts/setup/tool-versions.conf)
           {
             echo "rust-toolchain=${rust_toolchain}"
@@ -118,8 +116,8 @@ jobs:
           test -n "${rust_toolchain}" && test -n "${crate_msrv}" && test -n "${nextest}"
 
       # The toolchain that rust-toolchain.toml pins builds OpenVMM with its
-      # guest, UEFI, and musl targets and runs the aci_edge_sandboxes and nvx-rs
-      # checks, which also need a macOS target and the crates' MSRVs. OpenVMM
+      # guest, UEFI, and musl targets and runs the nvx-rs checks, which also
+      # need a macOS target and the crate's MSRV. OpenVMM
       # keeps full debug info in release builds, so the session limits debug
       # info and disables incremental artifacts to save disk space and link time.
       - name: Install Rust toolchains
@@ -233,8 +231,8 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-            bc binutils bison build-essential ca-certificates cpio curl erofs-utils flex \
-            gzip libelf-dev libssl-dev rsync tar xz-utils zstd
+            bc binutils bison build-essential ca-certificates cpio curl e2fsprogs \
+            erofs-utils flex gzip libelf-dev libssl-dev rsync tar xz-utils zstd
           userns_policy=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
           if [[ -e "${userns_policy}" ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0

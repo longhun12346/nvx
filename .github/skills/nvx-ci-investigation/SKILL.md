@@ -36,6 +36,10 @@ cancels an older run when a newer head is synchronized.
 - If a cancelled run's head differs from the current pull-request head and a newer run
   exists, classify it as expected supersession. Report the replacement run and stop
   unless cancellation cleanup itself failed.
+- When the workflow at its head sets `queue: max` for pushes, a `dev` push run waits
+  behind earlier pushes instead of being replaced, so its cancellation is never a
+  supersession. Under earlier workflows, a newer `dev` push replaced the one waiting
+  run.
 - A run started while a pull request was Ready remains active after conversion to
   Draft because `converted_to_draft` is not a workflow trigger. Do not diagnose this
   as the draft guard being ignored.

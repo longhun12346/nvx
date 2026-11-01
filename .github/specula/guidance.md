@@ -1,6 +1,6 @@
 # NVX OpenVMM snapshot/restore verification scope
 
-Analyze the exact `nanvix/openvmm` revision pinned by the selected NVX release. The target is NVX's guest-requested MicroVM snapshot and restore path, especially the `nvx-snapshot` request, capture boundary, source termination, restore continuation, restore entropy, and reuse of one untiered snapshot by independent restore processes.
+Analyze the exact `microsoft/openvmm` revision pinned by the selected NVX release. The target is NVX's guest-requested MicroVM snapshot and restore path, especially the `nvx-snapshot` request, capture boundary, source termination, restore continuation, restore entropy, and reuse of one untiered snapshot by independent restore processes.
 
 Focus modeling and code analysis on the state machines and concurrency boundaries that can violate safety or liveness: request coalescing and acknowledgement, polling versus immediate I/O completion, capture publication ordering, source shutdown, snapshot artifact immutability, restore gates, private-memory reset, entropy injection, timer/clock continuity, and repeated restoration from the same source snapshot. These are minimum required coverage, not an exhaustive property list. Discover and verify additional code-derived safety, liveness, recovery, isolation, and consistency properties when implementation evidence shows they matter within the target scope.
 

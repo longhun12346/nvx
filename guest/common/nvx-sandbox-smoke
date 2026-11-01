@@ -86,9 +86,11 @@ check_namespaces() {
     [ "$init_uids" = "$workload_ids" ] ||
         fail "PID 1 of the workload PID namespace runs as $init_uids"
     expected_hostname=nvx-sandbox
-    read -r kernel_command_line </proc/cmdline
+    # Read the whole file: a caller's --cmdline keeps its newlines, so tokens
+    # may follow a line break.
+    kernel_command_line=$(cat /proc/cmdline)
     set -f
-    # Kernel command-line tokens are deliberately split on spaces.
+    # Kernel command-line tokens are deliberately split on whitespace.
     # shellcheck disable=SC2086
     for token in $kernel_command_line; do
         case "$token" in
@@ -145,11 +147,13 @@ require_mount() {
     mount_super=${mount_record##* }
 }
 
-# The workload sees its own overlay root over the image layers, with its
-# upper layer on scratch, and private proc, read-only sysfs, and device
-# mounts. Each container runtime mount appears once: a managed exec that
-# made its mounts in the agent's namespace would stack them on those of the
-# earlier execs. No mount propagates to or from another namespace.
+# The workload sees its own overlay root over the image layers, with the
+# overlay options that the init agent sets, and with its upper layer where the
+# kernel command line declares it: on scratch, or on a tmpfs for
+# nvx_overlay_upper=ramfs. It also sees private proc, read-only sysfs, and
+# device mounts. Each container runtime mount appears once: a managed exec
+# that made its mounts in the agent's namespace would stack them on those of
+# the earlier execs. No mount propagates to or from another namespace.
 check_mounts() {
     while read -r _ _ _ _ mount_point _ mount_rest; do
         case "$mount_rest" in
@@ -162,10 +166,29 @@ check_mounts() {
         *,lowerdir=/run/nvx/layers/*) ;;
         *) fail "the root overlay does not use the image layers: $mount_super" ;;
     esac
+    declared_upper=scratch
+    # Read the whole file: a caller's --cmdline keeps its newlines, so the
+    # root's tokens may follow a line break.
+    kernel_command_line=$(cat /proc/cmdline)
+    set -f
+    # Kernel command-line tokens are deliberately split on whitespace.
+    # shellcheck disable=SC2086
+    for token in $kernel_command_line; do
+        case "$token" in
+            nvx_overlay_upper=ramfs) declared_upper=tmpfs ;;
+        esac
+    done
+    set +f
     case ",$mount_super," in
-        *,upperdir=/run/nvx/scratch/upper,*) ;;
-        *) fail "the root overlay upper layer is not on scratch: $mount_super" ;;
+        *",upperdir=/run/nvx/$declared_upper/upper,"*) ;;
+        *) fail "the root overlay upper layer is not on $declared_upper: $mount_super" ;;
     esac
+    for overlay_option in metacopy=on xino=on; do
+        case ",$mount_super," in
+            *",$overlay_option,"*) ;;
+            *) fail "the root overlay is mounted without $overlay_option: $mount_super" ;;
+        esac
+    done
     require_mount /proc proc nosuid nodev noexec
     require_mount /sys sysfs ro nosuid nodev noexec
     require_mount /dev tmpfs nosuid
@@ -191,6 +214,60 @@ check_devices() {
         fail "the workload devpts instance is not private"
 }
 
+# Without capabilities, the workload cannot create a device node of its own
+# to reach a device that /dev leaves out.
+check_device_creation() {
+    command -v mknod >/dev/null || fail "mknod is unavailable"
+    if mknod /tmp/nvx-sandbox-device c 1 3 2>/dev/null; then
+        rm -f /tmp/nvx-sandbox-device
+        fail "the workload can create device nodes"
+    fi
+}
+
+# The workload sees the machine ID that the guest generated for this boot,
+# bound read-only over the image's, which it cannot replace.
+check_machine_id() {
+    read -r machine_id </etc/machine-id ||
+        fail "the workload cannot read its machine ID"
+    case "$machine_id" in
+        *[!0-9a-f]*) fail "the workload machine ID is $machine_id" ;;
+    esac
+    [ "${#machine_id}" -eq 32 ] || fail "the workload machine ID is $machine_id"
+    require_mount /etc/machine-id tmpfs ro nosuid nodev
+    if (: >/etc/machine-id) 2>/dev/null; then
+        fail "the workload can replace its machine ID"
+    fi
+}
+
+# The workload can neither use the processor's I/O ports, whose read ends
+# the reader with SIGSEGV without the permission, nor obtain the permission.
+check_ports() {
+    port_status=0
+    # The shell reports the signal on standard error, so silence it.
+    { /sbin/nvx-time test port-probe snapshot; } 2>/dev/null || port_status=$?
+    [ "$port_status" -eq 139 ] ||
+        fail "a port read without the permission ended with status $port_status"
+    port_status=0
+    /sbin/nvx-time test port-probe snapshot grant 2>/dev/null || port_status=$?
+    [ "$port_status" -eq 1 ] ||
+        fail "a request for the port permission ended with status $port_status"
+}
+
+# A managed execution enters its root through the agent's entry, which also
+# makes every mount but /dev and its devpts nodev.
+check_entry() {
+    while read -r _ _ _ _ mount_point mount_options _; do
+        case "$mount_point" in
+            /dev | /dev/pts) continue ;;
+        esac
+        case ",$mount_options," in
+            *,nodev,*) ;;
+            *) fail "$mount_point is mounted $mount_options, without nodev" ;;
+        esac
+    done </proc/self/mountinfo
+    echo "NVX-UBUNTU-SANDBOX-ENTRY-OK"
+}
+
 check_cgroup() {
     workload_cgroup=
     while IFS= read -r cgroup_line; do
@@ -203,7 +280,7 @@ check_cgroup() {
 }
 
 # The workload cannot modify the image's files, and its writes land in the
-# scratch-backed overlay.
+# overlay, on its upper.
 check_image() {
     grep -qx 'ID=ubuntu' /etc/os-release || fail "the image is not Ubuntu"
     for image_file in /etc/passwd /usr/bin/env; do
@@ -214,11 +291,11 @@ check_image() {
     if (: >/usr/nvx-sandbox-image-write) 2>/dev/null; then
         fail "the workload can create files in image directory /usr"
     fi
-    printf 'scratch-backed-write\n' >/tmp/nvx-ubuntu-sandbox-smoke
-    [ "$(cat /tmp/nvx-ubuntu-sandbox-smoke)" = scratch-backed-write ] ||
-        fail "the scratch-backed write did not persist"
+    printf 'upper-write\n' >/tmp/nvx-ubuntu-sandbox-smoke
+    [ "$(cat /tmp/nvx-ubuntu-sandbox-smoke)" = upper-write ] ||
+        fail "the write to the upper did not persist"
     [ "$(stat -f -c %T /tmp/nvx-ubuntu-sandbox-smoke)" = overlayfs ] ||
-        fail "the scratch-backed write did not land in the overlay"
+        fail "the write to the upper did not land in the overlay"
 }
 
 # Starts sleepers until a fork fails or $2 have started, then stops and reaps
@@ -258,10 +335,12 @@ check_limits() {
     [ "$memory_status" -eq 137 ] ||
         fail "memory.max did not kill an allocation of $((memory_max * 2)) bytes: status $memory_status"
     # `--pids-max N` admits N workload processes: the CLI sets the container
-    # cgroup's pids.max to N + 1 for the launcher's `unshare` parent, which
-    # waits outside the workload's PID namespace. The probe and the subshell
-    # are two of the N, so the subshell can start $2 - 2 sleepers. The bound
-    # stops a subshell whose forks the controller does not refuse.
+    # cgroup's pids.max to N + 1 for the one-shot launcher's `unshare` parent,
+    # which waits outside the workload's PID namespace, and the init agent
+    # gives that process back for a managed sandbox, whose executions have no
+    # such parent. The probe and the subshell are two of the N, so the
+    # subshell can start $2 - 2 sleepers. The bound stops a subshell whose
+    # forks the controller does not refuse.
     sleepers_record=/tmp/nvx-ubuntu-sandbox-sleepers
     rm -f "$sleepers_record"
     (start_sleepers "$sleepers_record" "$((pids_max * 4))") 2>/dev/null || :
@@ -533,12 +612,16 @@ check_capabilities
 check_namespaces
 check_mounts
 check_devices
+check_device_creation
+check_machine_id
+check_ports
 check_cgroup
 check_image
 echo "NVX-UBUNTU-SANDBOX-PROFILE-OK uid=65534 gid=65534"
 # Each share is a TARGET MODE pair; a final TARGET alone is read-only. A MODE
 # of file-ro or file-rw checks a shared file.
-# `limits MEMORY_MAX PIDS_MAX` checks the workload's resource limits.
+# `limits MEMORY_MAX PIDS_MAX` checks the workload's resource limits, and
+# `entry` what a managed execution's entry adds.
 rw_share=
 ro_share=
 while [ "$#" -gt 0 ]; do
@@ -546,6 +629,11 @@ while [ "$#" -gt 0 ]; do
         [ "$#" -ge 3 ] || fail "limits requires MEMORY_MAX and PIDS_MAX"
         check_limits "$2" "$3"
         shift 3
+        continue
+    fi
+    if [ "$1" = entry ]; then
+        check_entry
+        shift
         continue
     fi
     share_mode=${2:-ro}

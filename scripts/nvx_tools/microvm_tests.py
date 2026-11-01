@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
 import queue
 import random
 import re
-import secrets
 import selectors
+import shlex
+import shutil
 import socket
 import struct
 import subprocess
@@ -19,13 +21,15 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISUID
 from typing import Any, cast
 
+from . import nvx_rs
+from .adversarial_oracles import terminate_process_tree
 from .benchmark import (
     CAPTURE_LOG_FILTER,
     RESTORE_MARKER,
@@ -38,7 +42,6 @@ from .benchmark import (
     parse_snapshot_profile_line,
     positive_float,
     positive_int,
-    record_adversarial_openvmm_pid,
     smp_probe_script,
     snapshot_restore_command,
     workload_boot_command,
@@ -61,12 +64,17 @@ from .common import (
     require_file,
     sha256_file,
 )
-from .control_session import ControlSession, ManagedExecRefused, capability_pipe
-from .egress_policy import CompiledEgressPolicy, compile_policy_file
 from .guests import GUEST_NAMES, GuestDescriptor, guest_descriptor
-from .managed_exec_tests import run_managed_exec_configuration
+from .managed_exec_tests import run_managed_exec_configuration, workload_artifact_paths
+from .microvm_durations import REPORT_NAME, DurationReport
+from .microvm_shards import configure_parser as configure_shards_parser
+from .microvm_shards import load_partition, shard_scenarios
+from .nvx_rs import EgressRules, compile_egress_policy
 from .openvmm_process import OpenvmmProcess, TcpConsole
 from .sandbox_lifecycle_tests import run_sandbox_lifecycle
+from .sandbox_proxy_tests import run_sandbox_proxy_only
+from .sandbox_ram_upper_tests import run_sandbox_ram_upper
+from .shard_plans import parse_shard
 from .time_abi import (
     ABI_VERSION,
     CHECK_CPU_BUDGET_US,
@@ -80,7 +88,6 @@ from .time_abi import (
     TimeAbiMonitor,
     check_cpu_budget_us,
     check_warp_probe,
-    describe_exit_status,
     parse_cpu_profile_fallback,
     parse_fields,
     parse_marker,
@@ -90,6 +97,7 @@ from .time_abi import (
 )
 
 MICROVM_TEST_SCENARIOS = (
+    "command-line-limit",
     "console-exit",
     "console-snapshot",
     "cpu-profile-fallback",
@@ -112,12 +120,19 @@ MICROVM_TEST_SCENARIOS = (
     "managed-lifecycle",
     "managed-exec-config",
     "network-snapshot",
+    "platform-aggregate-export",
+    "platform-filesystem",
+    "platform-network-policy",
+    "platform-restore-processors",
+    "platform-zero-fill",
     "private-network-ingress",
     "restore-downtime",
     "restore-memory",
     "restore-processors",
     "sandbox-blocks",
     "sandbox-lifecycle",
+    "sandbox-proxy-only",
+    "sandbox-ram-upper",
     "scratch-snapshot",
     "smp",
     "smp-snapshot",
@@ -125,6 +140,8 @@ MICROVM_TEST_SCENARIOS = (
     "snapshot-tiers",
     "structured-outcome",
     "time-abi-conformance",
+    "time-host-correction",
+    "untiered-network-policy",
     "virtio-net",
     "workload-identity",
 )
@@ -132,16 +149,31 @@ UBUNTU_UNSUPPORTED_SCENARIOS = frozenset(("console-snapshot",))
 SANDBOX_CONTROL_SCENARIOS = frozenset(
     (
         "managed-exec-config",
+        "platform-aggregate-export",
+        "platform-filesystem",
+        "platform-network-policy",
+        "platform-restore-processors",
+        "platform-zero-fill",
         "sandbox-blocks",
         "sandbox-lifecycle",
+        "sandbox-proxy-only",
+        "sandbox-ram-upper",
         "scratch-snapshot",
         "snapshot-tiers",
     )
 )
-# The public `nvx.py sandbox` scenarios need the Ubuntu scratch template that
-# the guest-artifact build produces and packages omit, so they run only when
-# named.
-PUBLIC_SANDBOX_SCENARIOS = frozenset(("managed-exec-config", "sandbox-lifecycle"))
+# The public `nvx-rs sandbox` scenarios, which also read the Ubuntu distro
+# layer and the sandbox scratch template that `nvx-rs download` installs. A
+# default run runs them, but CI runs them in its guest and sandbox jobs, which
+# take those Ubuntu artifacts, rather than in the shards of the default suite.
+PUBLIC_SANDBOX_SCENARIOS = frozenset(
+    (
+        "managed-exec-config",
+        "sandbox-lifecycle",
+        "sandbox-proxy-only",
+        "sandbox-ram-upper",
+    )
+)
 # The same-host restore cases also run on the CI debug kernel (doc/ci.md),
 # whose soft-lockup and hung-task detectors the guest's time ABI watcher
 # reports.
@@ -160,15 +192,38 @@ MICROVM_EXPLICIT_SCENARIOS = ("smp-lapic",)
 SMP_LAPIC_COUNTING_MARKER = b"NVX-SMP-LAPIC-COUNTING-OK"
 MICROVM_PROCESSOR_COUNTS = (1, 2, 4, 8)
 MICROVM_TEST_SCRIPTS_DIR = Path(__file__).with_name("microvm_test_scripts")
+# run_guest_script stores each script at GUEST_SCRIPT_PATH with a
+# here-document that GUEST_SCRIPT_DELIMITER ends, and the guest prints the
+# start line just before the script's first command.
+GUEST_SCRIPT_PATH = "/tmp/nvx-guest-script"
+GUEST_SCRIPT_DELIMITER = "NVX_GUEST_SCRIPT"
+GUEST_SCRIPT_START_MARKER = b"NVX-GUEST-SCRIPT-START"
 LIFECYCLE_COMPLETION_MARKER = b"NVX-LIFECYCLE-OK"
 SANDBOX_BLOCKS_COMPLETION_MARKER = b"NVX-SANDBOX-BLOCKS-OK"
 VIRTIO_NET_COMPLETION_MARKER = b"NVX-VIRTIO-NET-OK"
+# The x86 guest kernel's COMMAND_LINE_SIZE. OpenVMM requires the effective
+# kernel command line, with the tokens that it appends after the caller's, to
+# fit in it with its terminating NUL, and refuses a longer one before boot.
+KERNEL_COMMAND_LINE_SIZE = 2048
+COMMAND_LINE_LIMIT_NETWORK = "10.0.0.2/24"
+# The kernel takes a parameter whose name has a dot for a module's and passes
+# it to neither init nor its environment, so this token only takes up room.
+COMMAND_LINE_PADDING = "cmdline_limit.padding="
+COMMAND_LINE_PREFIX = b"NVX-COMMAND-LINE: "
+COMMAND_LINE_LIMIT_COMPLETION_MARKER = b"NVX-COMMAND-LINE-LIMIT-OK"
+COMMAND_LINE_LIMIT_ERROR = (
+    b"microVM kernel command line is 2048 bytes; "
+    b"the limit is 2047 bytes plus the terminating NUL"
+)
 DIRECTIONAL_NETWORK_ALLOW_MARKER = b"NVX-DIRECTIONAL-NETWORK-ALLOW-OK"
 DIRECTIONAL_NETWORK_DENY_MARKER = b"NVX-DIRECTIONAL-NETWORK-DENY-OK"
 DIRECTIONAL_NETWORK_INGRESS_READY_MARKER = b"NVX-DIRECTIONAL-INGRESS-READY"
 DIRECTIONAL_NETWORK_GUEST_IPV4 = "192.0.2.2"
 DIRECTIONAL_NETWORK_GATEWAY_IPV4 = "192.0.2.1"
 DIRECTIONAL_NETWORK_CIDR = f"{DIRECTIONAL_NETWORK_GUEST_IPV4}/24"
+# A /30 holds only the gateway and the guest, so it leaves no address at which
+# OpenVMM could present host peers, which explicit host-loopback access needs.
+HOST_LOOPBACK_NARROW_NETWORK_CIDR = f"{DIRECTIONAL_NETWORK_GUEST_IPV4}/30"
 DIRECTIONAL_NETWORK_INGRESS_PORT = 18080
 NETWORK_NEGATIVE_OBSERVATION_TIMEOUT_SECONDS = 0.25
 NETWORK_SERVER_JOIN_TIMEOUT_SECONDS = 1.0
@@ -210,6 +265,8 @@ HOST_LOOPBACK_TCP_ACK = b"NVX-HOST-LOOPBACK-TCP-ACK\n"
 HOST_LOOPBACK_TCP_REQUEST = b"NVX-HOST-LOOPBACK-INBOUND\n"
 HOST_LOOPBACK_UDP_REQUEST = b"NVX-HOST-LOOPBACK-UDP\n"
 HOST_LOOPBACK_UDP_REPLY = b"NVX-HOST-LOOPBACK-UDP-REPLY\n"
+HOST_LOOPBACK_UDP_ECHO_REQUEST = b"NVX-HOST-LOOPBACK-UDP-ECHO\n"
+HOST_LOOPBACK_UDP_ECHO_REPLY = b"NVX-HOST-LOOPBACK-UDP-ECHO-REPLY\n"
 HOST_LOOPBACK_PORT_BIND_ATTEMPTS = 16
 # IANA's dynamic port range, which is also Windows' default. The host-loopback
 # scenario draws the port of each TCP and UDP listener pair from it.
@@ -267,18 +324,158 @@ SCRATCH_FRESH_POST_MARKER = b"NVX-SCRATCH-FRESH-POST-OUT"
 SCRATCH_FRESH_VALUE_PREFIX = b"NVX-SCRATCH-FRESH-VALUE-"
 SCRATCH_FRESH_VALUE_SUFFIX = b"-END"
 WORKLOAD_IDENTITY_MARKER = b"NVX-WORKLOAD-IDENTITY-OK uid=65534 gid=65534"
-# A direct-mode guest refuses a working directory that the workload cannot
-# enter with the Linux error number, which does not depend on the host.
-MANAGED_REFUSED_CWDS = (
-    ("missing", "/does-not-exist", 2),  # ENOENT
-    ("file", "/etc/passwd", 20),  # ENOTDIR
-    ("inaccessible", "/root", 13),  # EACCES
-)
-MANAGED_REFUSED_CWD_MARKER = "/tmp/nvx-refused-cwd-ran"
 BOOT_MARKER = b"NVX-GUEST-BOOT-OK:"
 GUEST_BOOT_COMPLETION_MARKER = b"NVX-GUEST-BOOT-CHECK-OK"
 GUEST_IDENTITY_COMPLETION_MARKER = b"NVX-GUEST-IDENTITY-OK"
 RESTORE_PROCESSORS_FAILURE_MARKER = b"NVX-RESTORE-PROCESSORS-FAIL"
+# A platform snapshot opts into restore-time vCPU activation as an untiered one
+# does, by capturing its capacity booted with maxcpus=. A capacity of 4 leaves
+# a supported count, 8, above it.
+PLATFORM_RESTORE_PROCESSORS_CAPACITY = 4
+PLATFORM_RESTORE_PROCESSORS_BOOT_ONLINE = 1
+# The restore-online counts that OpenVMM refuses before the guest runs, and
+# why: counts that a microVM does not support, and a supported count above the
+# capacity. The snapshot's restore preparation checks them before the
+# command-line validation, which would refuse the unsupported counts too.
+PLATFORM_RESTORE_PROCESSORS_REJECTED = (
+    (0, b"restore-online VP count 0 is not supported"),
+    (3, b"restore-online VP count 3 is not supported"),
+    (8, b"restore-online VP count 8 exceeds VP capacity 4"),
+)
+PLATFORM_POST_RESTORE_MARKER = b"NVX-POST-RESTORE-OK: tier=platform"
+# A platform restore presents the captured capacity of its distro block over a
+# shorter image. The image ends inside a 4-KiB page, so the device reads that
+# page with one request across the image's end, and the restore declares the
+# fresh scratch absent.
+PLATFORM_ZERO_FILL_CAPACITY = 1024 * 1024
+PLATFORM_ZERO_FILL_IMAGE_SECTORS = 601
+PLATFORM_ZERO_FILL_SCRATCH = 1024 * 1024
+PLATFORM_ZERO_FILL_FAILURE_MARKER = b"NVX-ZERO-FILL-FAIL"
+PLATFORM_ZERO_FILL_IMAGE_MARKER = b"NVX-ZERO-FILL-IMAGE-OK"
+PLATFORM_ZERO_FILL_SCRATCH_MARKER = b"NVX-ZERO-FILL-SCRATCH-OK"
+# The restores that OpenVMM refuses before the guest runs, and why.
+PLATFORM_ZERO_FILL_REJECTED = (
+    ("longer-image", b"longer than the platform snapshot's"),
+    ("absent-and-file", b"--restore-absent-scratch attaches the scratch block"),
+    ("no-scratch", b"requires a scratch block or --restore-absent-scratch"),
+)
+PAIRED_ABSENT_SCRATCH_REJECTION = (
+    b"--restore-absent-scratch requires the fresh scratch of a platform snapshot"
+)
+# A NIC template is a platform snapshot whose NIC was captured with a complete
+# deny-all policy. Each clone restores it with a policy of its own, and must
+# keep the template's NIC identity, which the portable profile derives from the
+# network.
+PLATFORM_NETWORK_CIDR = "10.0.0.2/24"
+PLATFORM_NETWORK_GATEWAY_IPV4 = "10.0.0.1"
+PLATFORM_NETWORK_IDENTITY = (
+    b"NVX-PLATFORM-NETWORK-IDENTITY mac=52:54:00:00:00:02 ipv4=10.0.0.2/24 "
+    b"ipv6=fd00::a00:2/120"
+)
+PLATFORM_NETWORK_TEMPLATE_POLICY = (
+    "--network-egress",
+    "deny",
+    "--host-loopback",
+    "deny",
+)
+PLATFORM_NETWORK_FAILURE_MARKER = b"NVX-PLATFORM-NETWORK-FAIL"
+PLATFORM_NETWORK_LISTENING_MARKER = b"NVX-PLATFORM-NETWORK-LISTENING"
+PLATFORM_NETWORK_CHECKED = b"NVX-PLATFORM-NETWORK-CHECKED"
+PLATFORM_NETWORK_PROBE_PREFIX = b"NVX-PLATFORM-NETWORK-PROBE "
+PLATFORM_NETWORK_GUEST_PORT = 18080
+# How long a clone's probe that its policy denies waits for its connection.
+PLATFORM_NETWORK_PROBE_TIMEOUT_SECONDS = 2
+# The restores of the NIC template that OpenVMM refuses before the guest runs,
+# and why, besides the busy forward port's and the plain deny-all snapshot's.
+PLATFORM_NETWORK_REJECTED = (
+    ("kept-policy", b"restore-time egress policy does not match the snapshot"),
+    ("kept-host-loopback", b"microVM snapshots do not support --host-loopback allow"),
+    ("readdressed", b"network addressing from saved state"),
+    ("foreign-proxy", b"must match the guest gateway"),
+)
+PLATFORM_NETWORK_BUSY_FORWARD_REJECTION = b"failed to create socket for port forward"
+PLATFORM_NETWORK_NOT_TEMPLATE_REJECTION = b"is not a complete deny-all"
+# Lines that only a restored clone's guest prints, from its platform repair's
+# report to the restore's end, so that a refused restore prints none of them.
+PLATFORM_NETWORK_GUEST_MARKERS = (
+    PLATFORM_POST_RESTORE_MARKER,
+    PLATFORM_NETWORK_LISTENING_MARKER,
+    RESTORE_MARKER,
+)
+# A NIC template without a tier is a snapshot without sandbox blocks whose NIC
+# was captured with the complete deny-all policy. Each restore installs a
+# policy of its own, and its guest's repair applies the DNS server and the
+# listener announcement of that policy, which the restore packet carries.
+UNTIERED_POST_RESTORE_MARKER = b"NVX-POST-RESTORE-OK: tier=legacy"
+UNTIERED_NETWORK_FAILURE_MARKER = b"NVX-UNTIERED-NETWORK-FAIL"
+UNTIERED_NETWORK_LISTENING_MARKER = b"NVX-UNTIERED-NETWORK-LISTENING"
+UNTIERED_NETWORK_CHECKED = b"NVX-UNTIERED-NETWORK-CHECKED"
+UNTIERED_NETWORK_REPORT_PREFIX = b"NVX-UNTIERED-NETWORK-REPORT "
+UNTIERED_NETWORK_INBOUND_PREFIX = b"NVX-UNTIERED-NETWORK-INBOUND "
+# The template's NIC is on the directional network, whose documentation range
+# no host address shares: an ingress listener refuses peers inside the guest's
+# own subnets, so a host address there would not reach the port that
+# private-network ingress publishes.
+UNTIERED_NETWORK_CIDR = DIRECTIONAL_NETWORK_CIDR
+UNTIERED_NETWORK_GATEWAY_IPV4 = DIRECTIONAL_NETWORK_GATEWAY_IPV4
+# The gateway's IPv6 address, which a policy that admits DNS over IPv6 alone
+# names as the guest's DNS server.
+UNTIERED_NETWORK_GATEWAY_IPV6 = DIRECTIONAL_NETWORK_GATEWAY_IPV6
+# The most clients that the guest's server answers, as many as a restore's
+# host reaches it through: its forward and its published port.
+UNTIERED_NETWORK_MAX_CLIENTS = 2
+# The restores of the NIC template that OpenVMM refuses before the guest runs,
+# and why.
+UNTIERED_NETWORK_REJECTED = (
+    ("kept-policy", b"restore-time egress policy does not match the snapshot"),
+    ("ingress", b"microVM snapshots do not support --network-ingress allow"),
+)
+# Lines that only a restored guest prints, so that a refused restore prints
+# none of them.
+UNTIERED_NETWORK_GUEST_MARKERS = (
+    UNTIERED_POST_RESTORE_MARKER,
+    UNTIERED_NETWORK_LISTENING_MARKER,
+    RESTORE_MARKER,
+)
+# A platform restore attaches a host directory to the filesystem slot that the
+# capture left dormant. The clone mounts it after the restore's input gate
+# releases, reads the host's seed from it, and writes its result to it.
+PLATFORM_FILESYSTEM_FAILURE_MARKER = b"NVX-PLATFORM-FILESYSTEM-FAIL"
+PLATFORM_FILESYSTEM_MARKER = b"NVX-PLATFORM-FILESYSTEM-OK"
+PLATFORM_FILESYSTEM_HOST_SEED = b"NVX-HOST-TO-GUEST"
+PLATFORM_FILESYSTEM_GUEST_RESULT = b"NVX-GUEST-TO-HOST"
+# A platform restore attaches the aggregate of the filesystem-shares scenario
+# to the filesystem slot that the capture left dormant. The clone keeps its
+# captured command line, which names no filesystem, so it mounts the aggregate
+# itself and checks each child's kind, mode, and policy through its root.
+PLATFORM_AGGREGATE_FAILURE_MARKER = b"NVX-PLATFORM-AGGREGATE-FAIL"
+PLATFORM_AGGREGATE_MARKER = b"NVX-PLATFORM-AGGREGATE-OK"
+# The restores of the platform snapshot that OpenVMM refuses before the guest
+# runs, because their aggregates are ones that a cold boot refuses, and why.
+PLATFORM_AGGREGATE_REJECTED = (
+    ("overlapping-children", b"must not overlap"),
+    ("file-in-directory", b"must not overlap"),
+    ("directory-as-file", b"not a regular file"),
+    ("file-as-directory", b"not a plain directory"),
+    ("repeated-name", b"not unique"),
+    ("file-policy", b"exposes the file"),
+    ("outside-policy", b"outside the filesystem export roots"),
+    ("relative-policy", b"absolute host path"),
+)
+# A Windows host refuses caller ownership at a restore as at a cold boot.
+PLATFORM_AGGREGATE_OWNER_REJECTION = b"--mount-owner caller requires a Linux host"
+# Lines that only a restored clone's guest prints, from its platform repair's
+# report to the restore's end, so that a refused restore prints none of them.
+PLATFORM_AGGREGATE_GUEST_MARKERS = (
+    PLATFORM_POST_RESTORE_MARKER,
+    PLATFORM_AGGREGATE_MARKER,
+    RESTORE_MARKER,
+)
+# The dormant slot of a snapshot of any other tier, or without a tier, binds
+# only a --mount at a restore.
+DORMANT_AGGREGATE_REJECTION = (
+    b"--mount-aggregate on a dormant filesystem slot requires a platform snapshot"
+)
 # Records the time ABI rates and restore clock report of each restore. These
 # records are written before the restored VPs run, so they never split a guest
 # console line; targets that log while the guest runs, such as virt_kvm's
@@ -297,6 +494,64 @@ CPU_PROFILE_FALLBACK_LOG_FILTER = (
 DECLARED_CPU_PROFILE = re.compile(
     rb'time ABI rates declared [^\r\n]*\bcpu_profile="([a-z0-9.-]+)"'
 )
+# The time-host-correction scenario's host clock corrections, in ppm, that
+# OpenVMM's host-rate-offset-ppm hook makes it publish, against the sign of the
+# host's own correction, which an unhooked cold boot's time sample gives: a
+# cold boot's and a restore's within the guest's 500 ppm frequency limit, and
+# a restore beyond that limit. The hook itself is bounded by OpenVMM's parser.
+TIME_HOST_CORRECTION_BOOT_PPM = 200
+TIME_HOST_CORRECTION_RESTORE_PPM = 150
+TIME_HOST_CORRECTION_LIMIT_PPM = 900
+OPENVMM_HOST_RATE_OFFSET_LIMIT_PPM = 10_000
+# Seconds between the guest's two time samples of each phase.
+TIME_HOST_CORRECTION_SPACING_SECONDS = 5
+# Seconds after clearing the PLL phase offset: longer than one kernel second even at Linux's
+# slowest allowed correction, so the tick length no longer carries the cached phase correction.
+TIME_HOST_CORRECTION_PHASE_SETTLE_SECONDS = 2
+# The most measurement windows retried after host UTC reports a disruption.
+TIME_HOST_CORRECTION_ATTEMPTS = 3
+# The largest uncertainty, in ns, of a time sample that a measurement window
+# pairs: the bound of the guest's discipline (SAMPLE_BOUND_NS in
+# nvx-rs/src/guest/time/system.rs). nvx-time sample also reports a sample
+# beyond it, whose realtime bracket can widen the rate check's allowance past
+# the hooks' corrections: two samples 5 s apart, each uncertain by 1 ms, would
+# allow 400 ppm. Such a window is retried instead.
+TIME_HOST_CORRECTION_SAMPLE_BOUND_NS = 100_000
+# How far, in ppm, the correction that the guest's boot step or restore repair
+# took may be from the one that its first sample publishes, as the host's time
+# service may change it in between: half the 150 ppm of the smallest hook, by
+# which a guest that kept a stale correction would miss it.
+TIME_HOST_CORRECTION_HELD_PPM = 75
+# How far, in ppm, the guest's clock may run from the host's correction that it
+# holds, against the guest TSC counted at the declared rate, beyond the
+# uncertainty of the samples' pairing of the guest's realtime clock with that
+# TSC: the kernel runs a frequency correction to a fraction of a ppm, and a
+# guest that didn't apply it would run 150 ppm or more off it.
+TIME_HOST_CORRECTION_GUEST_PPM = 1
+# How far, in ppm, host UTC may run from its published correction against the
+# same TSC, beyond half the correction's change between the samples and their
+# pairing bounds: half the 150 ppm of the smallest hook that two samples
+# bracket, which a hook that skewed host UTC or its correction alone would
+# leave between them. The host's time service may slew host UTC between two
+# samples, by up to 25 ppm on the test VMs measured so far, which the guest's
+# discipline absorbs at its next poll.
+TIME_HOST_CORRECTION_HOST_PPM = 75
+TIME_HOST_CORRECTION_STATE_PREFIX = "NVX-TIME-HOST-CORRECTION-STATE: "
+TIME_HOST_CORRECTION_SAMPLE_PREFIX = "NVX-TIME-HOST-CORRECTION-SAMPLE: "
+# The time-state fields that must stay fixed over one measurement window.
+TIME_HOST_CORRECTION_DISCIPLINE_FIELDS = (
+    "frequency_ppb",
+    "frequency_limited",
+    "host_correction_ppb",
+    "discontinuities",
+    "last_step_realtime_ns",
+    "samples",
+)
+TIME_HOST_CORRECTION_COMPLETION_MARKER = b"NVX-TIME-HOST-CORRECTION-OK"
+# Linux's limit of the frequency correction, in ppb.
+LINUX_FREQUENCY_LIMIT_PPB = 500_000
+# The flag of a time sample that a test hook altered.
+TIME_SAMPLE_TEST_HOOKS = 0x08
 # The guest finishes a restore after the RCU grace-period release, which gives
 # up after rcu_cpu_stall_timeout (21 s), and the deferred C7 check.
 TIME_ABI_RESTORE_FINISH_SECONDS = 30.0
@@ -346,6 +601,18 @@ OUTCOME_TEARDOWN_FIELDS = frozenset(
 )
 
 
+def default_suite() -> tuple[str, ...]:
+    """Return the default suite of the Alpine guest on the default kernel,
+    which CI runs in the shards of microvm_shards.json: the scenarios of a
+    default run but the public sandbox scenarios, which CI runs in its guest
+    and sandbox jobs."""
+    return tuple(
+        scenario
+        for scenario in MICROVM_TEST_SCENARIOS
+        if scenario not in PUBLIC_SANDBOX_SCENARIOS
+    )
+
+
 def configure_parser(parser: argparse.ArgumentParser) -> None:
     parser.description = (
         "Run NVX-owned Linux and device correctness tests against the public "
@@ -362,9 +629,8 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         action="append",
         choices=(*MICROVM_TEST_SCENARIOS, *MICROVM_EXPLICIT_SCENARIOS),
         help=(
-            "scenario to run; repeat to select multiple (default: all except "
-            "smp-lapic, managed-exec-config, and sandbox-lifecycle, which run "
-            "only when named)"
+            "scenario to run; repeat to select multiple (default: all but "
+            "smp-lapic, which runs only when named)"
         ),
     )
     parser.add_argument(
@@ -374,6 +640,17 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             "boot the CI debug kernel (build/vmlinux-debug), which enables the "
             "soft-lockup and hung-task detectors; selects the same-host restore "
             "scenarios unless --scenario is given"
+        ),
+    )
+    parser.add_argument(
+        "--shard",
+        type=parse_shard,
+        metavar="INDEX/COUNT",
+        help=(
+            "run shard INDEX of the COUNT shards of the default Alpine suite on "
+            "the default kernel, without the public sandbox scenarios, as "
+            "scripts/nvx_tools/microvm_shards.json splits it for the backend, "
+            "such as 1/2; COUNT must be its number of shards"
         ),
     )
     parser.add_argument(
@@ -400,9 +677,27 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         "--output-dir",
         type=Path,
         default=BuildConstants.BUILD_DIR / "test-results" / "microvm",
-        help="directory for complete per-scenario OpenVMM logs",
+        help=(
+            "directory for complete per-scenario OpenVMM logs and the scenario "
+            "duration report"
+        ),
     )
     parser.set_defaults(handler=run)
+
+
+def configure_shard_parser(parser: argparse.ArgumentParser) -> None:
+    """Configure `plan-microvm-shards` for the default suite."""
+    configure_shards_parser(
+        parser, suite=default_suite, processors=MICROVM_PROCESSOR_COUNTS
+    )
+
+
+class GuestScriptResult(GuestCommandResult):
+    """A guest script's run. ``text`` is the whole console transcript, and
+    ``output`` what the console printed after the script's start line, which
+    is the script's own output."""
+
+    output: str
 
 
 def run_guest_script(
@@ -415,10 +710,29 @@ def run_guest_script(
     teardown_mode: str = "guest-exit",
     log_path: Path | None = None,
     contain_process_tree: bool = False,
-) -> GuestCommandResult:
-    return _run_guest_script(
+) -> GuestScriptResult:
+    """Run ``script`` in the shell of the guest that ``command`` boots, and
+    require it to print the line ``completion_marker``.
+
+    The guest's terminal echoes console input that arrives while a command
+    runs into whatever that command prints, so a script that the console typed
+    line by line could find the echo of its later lines inside the output of
+    its earlier ones (#785). The console therefore stages the whole script at
+    GUEST_SCRIPT_PATH first. Its last line prints GUEST_SCRIPT_START_MARKER
+    and sources the script, which runs in the shell as typed lines did, but
+    only once the guest has consumed all the input. The console output after
+    that line, ``output``, is thus the script's own, and ``completion_marker``
+    must be one of its lines.
+    """
+    result = _run_guest_script(
         command,
-        script,
+        _staged_script(
+            GUEST_SCRIPT_PATH,
+            GUEST_SCRIPT_DELIMITER,
+            script,
+            # The quotes keep the start line out of this line's echo.
+            f'echo NVX-GUEST-SCRIPT-"START"; . {GUEST_SCRIPT_PATH}',
+        ),
         completion_marker,
         timeout=timeout,
         windows_cpus=windows_cpus,
@@ -427,6 +741,31 @@ def run_guest_script(
         boot_marker=BOOT_MARKER,
         contain_process_tree=contain_process_tree,
         time_abi_status=True,
+    )
+    output = _guest_script_output(result["text"])
+    if not contains_output_line(output.encode("utf-8"), completion_marker):
+        raise RuntimeError(
+            f"guest script did not print {completion_marker.decode()!r} after "
+            f"its start line\n--- OpenVMM output ---\n{result['text'][-4096:]}"
+        )
+    return GuestScriptResult(
+        text=result["text"],
+        wall_ms=result["wall_ms"],
+        peak_rss_bytes=result["peak_rss_bytes"],
+        output=output,
+    )
+
+
+def _guest_script_output(text: str) -> str:
+    """Return what the console printed after a staged script's start line."""
+    start = GUEST_SCRIPT_START_MARKER.decode()
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if line.removesuffix("\r") == start:
+            return "\n".join(lines[index + 1 :])
+    raise RuntimeError(
+        f"guest never printed the start line {start!r} of its script"
+        f"\n--- OpenVMM output ---\n{text[-4096:]}"
     )
 
 
@@ -479,17 +818,28 @@ def _render_script(name: str, **values: str) -> str:
     return script
 
 
+def _staged_script(path: str, delimiter: str, script: str, run: str) -> str:
+    """Return console input that stores ``script`` at ``path`` and then runs
+    the command line ``run``.
+
+    The shell reads a here-document whole before it runs the command that
+    reads it, so none of the script runs before the guest has consumed all of
+    it, and ``run`` follows it as the input's last line.
+    """
+    if not script.endswith("\n"):
+        raise ValueError("a staged guest script must end with a newline")
+    if delimiter in script.split("\n"):
+        raise ValueError(f"a staged guest script cannot hold the line {delimiter!r}")
+    return f"cat >{path} <<'{delimiter}'\n{script}{delimiter}\n{run}\n"
+
+
 def _stage_script(
     process: OpenvmmProcess,
     path: str,
     delimiter: str,
     script: str,
 ) -> None:
-    process.send_bytes(
-        f"cat >{path} <<'{delimiter}'\n".encode()
-        + script.encode()
-        + f"{delimiter}\nsh {path}\n".encode()
-    )
+    process.send_bytes(_staged_script(path, delimiter, script, f"sh {path}").encode())
 
 
 def _output_lines(output: bytes) -> list[bytes]:
@@ -855,24 +1205,25 @@ def run_workload_identity(
         raise RuntimeError("root workload identity was not rejected before boot")
 
 
-def _refused_managed_exec(
-    session: ControlSession, cwd: str, *, timeout: float
-) -> ManagedExecRefused:
-    """Runs a workload in an unusable directory; returns the guest's refusal."""
-    try:
-        result = session.exec(
-            ("/bin/touch", MANAGED_REFUSED_CWD_MARKER),
-            timeout_ms=5_000,
-            response_timeout=timeout,
-            cwd=cwd,
-        )
-    except ManagedExecRefused as refusal:
-        return refusal
-    raise RuntimeError(
-        f"managed working directory {cwd} was not refused: "
-        f"returncode={result.returncode} category={result.category} "
-        f"stderr={result.stderr!r}"
-    )
+# The ignored nvx-rs test that drives the managed lifecycle of a guest whose
+# init hands the boot to the managed agent: nvx-rs/tests/managed_lifecycle.rs.
+MANAGED_LIFECYCLE_TEST = "managed_lifecycle"
+
+
+def managed_lifecycle_test_command(cargo: str) -> list[str]:
+    """Return the Cargo command that runs MANAGED_LIFECYCLE_TEST."""
+    return [
+        cargo,
+        "test",
+        "--manifest-path",
+        os.fspath(nvx_rs.DIRECTORY / "Cargo.toml"),
+        "--locked",
+        "--test",
+        MANAGED_LIFECYCLE_TEST,
+        "--",
+        "--ignored",
+        "--nocapture",
+    ]
 
 
 def run_managed_lifecycle(
@@ -885,20 +1236,39 @@ def run_managed_lifecycle(
     timeout: float,
     output_dir: Path,
 ) -> None:
+    """Run the managed lifecycle of a guest whose init hands the boot to the
+    managed agent.
+
+    The nvx-rs test MANAGED_LIFECYCLE_TEST starts OpenVMM with the command
+    built here and drives the guest's control session with nvx-rs, so that no
+    Python client of the control protocol remains. This checks what the test
+    leaves: OpenVMM's outcome report and the guest console.
+    """
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        raise ScriptError(
+            "the managed-lifecycle scenario runs the nvx-rs test "
+            f"{MANAGED_LIFECYCLE_TEST} with Cargo, which is not on PATH; "
+            "install Rust (https://rustup.rs)"
+        )
+    # Cargo runs the test in the nvx-rs directory, so every path is absolute.
+    output_dir = output_dir.resolve()
     with tempfile.TemporaryDirectory(prefix="nvx-managed-lifecycle-") as temporary:
-        root = Path(temporary)
+        root = Path(temporary).resolve()
         endpoint_value = (
             str(root / "control.sock"),
             f"//./pipe/openvmm-microvm-{uuid.uuid4().hex}",
         )[os.name == "nt"]
-        boot_console_address = _available_tcp_address()
-        capability = secrets.token_bytes(32)
         report_path = root / "managed-outcome.json"
+        # The test copies the guest console, which listens on TCP, to this log.
+        console_address = _available_tcp_address()
+        guest_log_path = output_dir / "managed-lifecycle-guest.log"
+        guest_log_path.unlink(missing_ok=True)
         command = workload_boot_command(
-            executable,
+            executable.resolve(),
             backend,
-            kernel,
-            initrd,
+            kernel.resolve(),
+            initrd.resolve(),
             memory_mib,
             "quiet loglevel=0",
         )
@@ -909,7 +1279,7 @@ def run_managed_lifecycle(
                 "--microvm-lifecycle",
                 "managed",
                 "--virtio-console",
-                f"listen=tcp:{boot_console_address[0]}:{boot_console_address[1]}",
+                f"listen=tcp:{console_address[0]}:{console_address[1]}",
                 "--microvm-control-console",
                 f"listen={endpoint_value}",
                 "--microvm-control-auth-stdin",
@@ -917,255 +1287,104 @@ def run_managed_lifecycle(
                 str(report_path),
             )
         )
-        log_path = output_dir / "managed-lifecycle.log"
-        guest_log_path = output_dir / "managed-lifecycle-guest.log"
-        process: subprocess.Popen[bytes] | None = None
-        boot_console: TcpConsole | None = None
-        with log_path.open("wb") as log:
-            try:
-                environment = os.environ.copy()
-                environment["OPENVMM_LOG"] = "off"
-                # OpenVMM reads its capability as soon as it starts.
-                capability_input = capability_pipe(capability)
-                try:
-                    process = subprocess.Popen(
-                        command,
-                        stdin=capability_input,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        env=environment,
-                    )
-                finally:
-                    os.close(capability_input)
-                record_adversarial_openvmm_pid(process.pid, environment)
-                # The guest console has no shell to query: init hands the boot
-                # to the managed agent, which serves the control console. The
-                # monitor still fails the run on a violation or failed check
-                # printed there, and a failed boot check powers the guest off
-                # with status 193, which fails the exit check below.
-                boot_console = TcpConsole.connect(
-                    boot_console_address, timeout, monitor=TimeAbiMonitor(command)
-                )
-                with ControlSession.connect(
-                    Path(endpoint_value), capability, timeout
-                ) as session:
-                    session.ping(timeout)
-                    first = session.exec(
-                        (
-                            "/bin/sh",
-                            "-c",
-                            "/bin/touch nvx-managed-state; "
-                            'printf \'%s|%s|%s\' "$PWD" "$EMPTY" "$COMPLEX"',
-                        ),
-                        timeout_ms=5_000,
-                        response_timeout=timeout,
-                        cwd="/tmp",
-                        environment=(
-                            "EMPTY=",
-                            "COMPLEX=space = \N{SNOWMAN}",
-                        ),
-                    )
-                if (
-                    first.returncode != 0
-                    or first.category != "exit"
-                    or first.stdout != "/tmp||space = \N{SNOWMAN}".encode()
-                    or first.stderr
-                ):
-                    raise RuntimeError(
-                        "first managed workload returned an invalid result"
-                    )
-
-                with ControlSession.connect(
-                    Path(endpoint_value), capability, timeout
-                ) as session:
-                    empty_environment = session.exec(
-                        ("/usr/bin/env",),
-                        timeout_ms=5_000,
-                        response_timeout=timeout,
-                        environment=(),
-                    )
-                    exact_environment = session.exec(
-                        ("/usr/bin/env",),
-                        timeout_ms=5_000,
-                        response_timeout=timeout,
-                        environment=("EMPTY=", "COMPLEX=space = \N{SNOWMAN}"),
-                    )
-                    if (
-                        empty_environment.returncode != 0
-                        or empty_environment.stdout
-                        or empty_environment.stderr
-                        or exact_environment.returncode != 0
-                        or exact_environment.stderr
-                        or exact_environment.stdout
-                        != "EMPTY=\nCOMPLEX=space = \N{SNOWMAN}\n".encode()
-                    ):
-                        raise RuntimeError(
-                            "managed exec did not preserve the exact exec environment"
-                        )
-                    for workload_timeout in (0, 3_600_001, 86_400_000, 0xFFFFFFFF):
-                        boundary = session.exec(
-                            ("/bin/true",),
-                            timeout_ms=workload_timeout,
-                            response_timeout=timeout,
-                        )
-                        if (
-                            boundary.returncode != 0
-                            or boundary.category != "exit"
-                            or boundary.stdout
-                            or boundary.stderr
-                        ):
-                            raise RuntimeError(
-                                "managed exec rejected a valid uint32 timeout"
-                            )
-                    second = session.exec(
-                        (
-                            "/bin/sh",
-                            "-c",
-                            "pwd; test -f /tmp/nvx-managed-state; "
-                            'test "${COMPLEX-unset}" = unset; '
-                            "test ! -e /run/nvx/workload-machine-id; "
-                            "printf second-exec",
-                        ),
-                        timeout_ms=5_000,
-                        response_timeout=timeout,
-                    )
-                    timed_out = session.exec(
-                        ("/bin/sleep", "5"),
-                        timeout_ms=100,
-                        response_timeout=timeout,
-                    )
-                    after_timeout = session.exec(
-                        ("/bin/sh", "-c", "printf still-usable"),
-                        timeout_ms=5_000,
-                        response_timeout=timeout,
-                    )
-                    refused_cwds = [
-                        (
-                            description,
-                            cwd,
-                            error,
-                            _refused_managed_exec(session, cwd, timeout=timeout),
-                        )
-                        for description, cwd, error in MANAGED_REFUSED_CWDS
-                    ]
-                    after_refusals = session.exec(
-                        (
-                            "/bin/sh",
-                            "-c",
-                            f"test ! -e {MANAGED_REFUSED_CWD_MARKER} && "
-                            "printf still-usable",
-                        ),
-                        timeout_ms=5_000,
-                        response_timeout=timeout,
-                    )
-                    session.stop(timeout)
-                if (
-                    second.returncode != 0
-                    or second.category != "exit"
-                    or second.stdout != b"/\nsecond-exec"
-                    or second.stderr
-                ):
-                    raise RuntimeError(
-                        "managed workload state did not survive across exec requests"
-                    )
-                if timed_out.returncode != 124 or timed_out.category != "timeout":
-                    raise RuntimeError("managed workload timeout was not reported")
-                if (
-                    after_timeout.returncode != 0
-                    or after_timeout.category != "exit"
-                    or after_timeout.stdout != b"still-usable"
-                    or after_timeout.stderr
-                ):
-                    raise RuntimeError(
-                        "managed guest was not usable after a workload timeout"
-                    )
-                for description, cwd, error, refusal in refused_cwds:
-                    if (
-                        refusal.category != "cwd-failed"
-                        or refusal.status != error
-                        or refusal.stdout
-                        or f"cannot enter working directory {cwd}: ".encode()
-                        not in refusal.stderr
-                    ):
-                        raise RuntimeError(
-                            f"{description} managed working directory was not "
-                            f"refused clearly: {refusal} stderr={refusal.stderr!r}"
-                        )
-                if (
-                    after_refusals.returncode != 0
-                    or after_refusals.category != "exit"
-                    or after_refusals.stdout != b"still-usable"
-                    or after_refusals.stderr
-                ):
-                    raise RuntimeError(
-                        "a refused managed workload ran, or the guest was not "
-                        "usable after refusals"
-                    )
-                result = process.wait(timeout=timeout)
-                if result != 0:
-                    reason = describe_exit_status(result)
-                    raise RuntimeError(
-                        f"managed OpenVMM process exited with status {result}"
-                        + (f": {reason}; see {log_path}" if reason else "")
-                    )
-                report = _read_outcome_report(report_path)
-                _preserve_outcome_report(
-                    output_dir / "managed-outcome.json",
-                    report,
-                )
-                if report["backend"] != backend or report["outcome"] != {
-                    "operation": "managed",
-                    "category": "success",
-                    "status_code": 0,
-                }:
-                    raise RuntimeError("managed lifecycle outcome report was invalid")
-                if report["network_policy"]["status"] != "not-requested":
-                    raise RuntimeError(
-                        "managed lifecycle reported an unexpected network policy"
-                    )
-                if not all(report["teardown"].values()):
-                    raise RuntimeError("managed lifecycle reported incomplete teardown")
-                # Keep the guest log, then fail on anything the monitor found
-                # in the console's tail.
-                guest_log_path.write_bytes(boot_console.finish(check=False))
-                boot_console.finish()
-                boot_console = None
-            finally:
-                if boot_console is not None:
-                    guest_log_path.write_bytes(boot_console.finish(check=False))
-                if process is not None and process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
-
-        invalid = workload_boot_command(
-            executable,
-            backend,
-            kernel,
-            initrd,
-            memory_mib,
-            "quiet loglevel=0",
-        )
-        invalid.extend(
-            (
-                "--microvm-workload-identity",
-                "65534:65534",
-                "--microvm-lifecycle",
-                "managed",
+        environment = os.environ.copy()
+        # The test records OpenVMM's process ID for an adversarial campaign
+        # as the microVM scenarios do, but from the nvx-rs directory, so a
+        # relative journal resolves here.
+        journal = environment.get("NVX_ADVERSARIAL_OPENVMM_PID_JOURNAL")
+        if journal:
+            environment["NVX_ADVERSARIAL_OPENVMM_PID_JOURNAL"] = os.path.abspath(
+                journal
             )
+        environment.update(
+            {
+                "OPENVMM_LOG": "off",
+                "NVX_MANAGED_LIFECYCLE_COMMAND": json.dumps(command),
+                "NVX_MANAGED_LIFECYCLE_ENDPOINT": endpoint_value,
+                "NVX_MANAGED_LIFECYCLE_CONSOLE": (
+                    f"{console_address[0]}:{console_address[1]}"
+                ),
+                "NVX_MANAGED_LIFECYCLE_TIMEOUT": str(timeout),
+                "NVX_MANAGED_LIFECYCLE_OUTPUT_DIR": os.fspath(output_dir),
+            }
         )
-        with OpenvmmProcess(
-            invalid,
-            output_dir / "managed-lifecycle-invalid-transition.log",
-        ) as rejected:
-            result = rejected.wait(timeout)
-        if result.returncode == 0 or BOOT_MARKER in result.output:
+        test_command = managed_lifecycle_test_command(cargo)
+        print(f">> {shlex.join(test_command)}", flush=True)
+        process = subprocess.Popen(
+            test_command,
+            cwd=BuildConstants.REPO_ROOT,
+            env=environment,
+        )
+        try:
+            returncode = process.wait()
+        except BaseException:
+            # A signal that reached nvx.py alone, such as a SIGINT, leaves
+            # Cargo's descendants running: the test and the OpenVMM that it
+            # started, which use this temporary directory. End and reap them
+            # all before it goes, as nvx.py ended the OpenVMM that it started.
+            terminate_process_tree(process, process_group=False)
+            raise
+        # The guest console has no shell to query: init hands the boot to the
+        # managed agent, which serves the control console. The monitor still
+        # fails the run on a violation or failed check printed there, before
+        # the test's own failure, which it may explain. A failed boot check
+        # powers the guest off with status 193, which fails the test.
+        try:
+            guest_output = guest_log_path.read_bytes()
+        except FileNotFoundError:
+            guest_output = b""
+        monitor = TimeAbiMonitor(command)
+        monitor.feed(guest_output)
+        monitor.finish()
+        if returncode != 0:
             raise RuntimeError(
-                "managed lifecycle without a control endpoint was not rejected before boot"
+                f"the managed lifecycle test {MANAGED_LIFECYCLE_TEST} failed with "
+                f"exit status {returncode}; see its output above and "
+                f"{output_dir / 'managed-lifecycle.log'}"
             )
+        report = _read_outcome_report(report_path)
+        _preserve_outcome_report(
+            output_dir / "managed-outcome.json",
+            report,
+        )
+        if report["backend"] != backend or report["outcome"] != {
+            "operation": "managed",
+            "category": "success",
+            "status_code": 0,
+        }:
+            raise RuntimeError("managed lifecycle outcome report was invalid")
+        if report["network_policy"]["status"] != "not-requested":
+            raise RuntimeError(
+                "managed lifecycle reported an unexpected network policy"
+            )
+        if not all(report["teardown"].values()):
+            raise RuntimeError("managed lifecycle reported incomplete teardown")
+
+    invalid = workload_boot_command(
+        executable,
+        backend,
+        kernel,
+        initrd,
+        memory_mib,
+        "quiet loglevel=0",
+    )
+    invalid.extend(
+        (
+            "--microvm-workload-identity",
+            "65534:65534",
+            "--microvm-lifecycle",
+            "managed",
+        )
+    )
+    with OpenvmmProcess(
+        invalid,
+        output_dir / "managed-lifecycle-invalid-transition.log",
+    ) as rejected:
+        result = rejected.wait(timeout)
+    if result.returncode == 0 or BOOT_MARKER in result.output:
+        raise RuntimeError(
+            "managed lifecycle without a control endpoint was not rejected before boot"
+        )
 
 
 def run_structured_outcome(
@@ -1428,7 +1647,7 @@ def run_smp(
         timeout=timeout,
         log_path=log_path,
     )
-    output = result["text"].encode("utf-8")
+    output = result["output"].encode("utf-8")
     if not contains_output_line(output, SMP_PROBE_COMPLETION_MARKER):
         raise RuntimeError(
             f"{processors}-vCPU guest finished without the SMP probe marker "
@@ -1441,16 +1660,17 @@ def run_smp(
                 f"marker {SMP_LAPIC_COUNTING_MARKER.decode()!r}"
             )
         # The boot line must also report the backend's LAPIC rate for all
-        # the CPUs; the status query alone doesn't check the CPU count.
+        # the CPUs; the status query alone doesn't check the CPU count. The
+        # query ran before the script, so its lines are in the transcript.
         monitor = TimeAbiMonitor(command)
-        monitor.feed(output)
+        monitor.feed(result["text"].encode("utf-8"))
         monitor.finish()
         try:
             monitor.require_boot("the counting-LAPIC check", online_cpus=processors)
         except TimeAbiFailure as error:
             raise RuntimeError(f"{processors}-vCPU smp-lapic: {error}") from error
     check_warp_probe(
-        result["text"],
+        result["output"],
         cpus=processors,
         context=f"{processors}-vCPU boot",
         rounds=warp_rounds(processors),
@@ -1660,7 +1880,6 @@ def run_time_abi_conformance(
         "quiet loglevel=0",
         processors=processors,
     )
-    # One input line: the console echoes all of it before the check prints.
     result = run_guest_script(
         command,
         f"{TIME_ABI_EXHAUSTIVE_COMMAND}; "
@@ -1670,7 +1889,7 @@ def run_time_abi_conformance(
         timeout=timeout,
         log_path=log_path,
     )
-    _check_exhaustive_report(result["text"], processors=processors)
+    _check_exhaustive_report(result["output"], processors=processors)
 
 
 def run_virtio_net(
@@ -1700,6 +1919,109 @@ def run_virtio_net(
         timeout=timeout,
         log_path=log_path,
     )
+
+
+def command_line_limit_command(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    memory_mib: int,
+    padding: int,
+) -> list[str]:
+    """Return the command line limit scenario's OpenVMM command, whose caller
+    tokens include a padding token with a value of ``padding`` bytes."""
+    if padding < 1:
+        raise ValueError("the command-line padding must hold at least one byte")
+    return workload_boot_command(
+        executable,
+        backend,
+        kernel,
+        initrd,
+        memory_mib,
+        f"quiet loglevel=0 {COMMAND_LINE_PADDING}{'x' * padding}",
+        network=COMMAND_LINE_LIMIT_NETWORK,
+    )
+
+
+def run_command_line_limit(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Boot a kernel command line that fills the guest kernel's buffer.
+
+    OpenVMM appends its own tokens after the caller's, ending with the
+    network bootstrap, so they are the first that the guest kernel would cut
+    from a command line that does not fit. A first boot with a one-byte
+    padding token learns the effective command line from the guest. A second
+    boot pads the caller's tokens until the effective command line holds
+    KERNEL_COMMAND_LINE_SIZE - 1 bytes; the guest's /proc/cmdline must equal
+    the first one with the longer padding, and the guest must act on the last
+    token. OpenVMM must refuse a command line one byte longer before boot.
+    """
+
+    def boot(padding: int, log_name: str) -> str:
+        result = run_guest_script(
+            command_line_limit_command(
+                executable, kernel, initrd, backend, memory_mib, padding
+            ),
+            _read_script("command-line-limit.sh"),
+            COMMAND_LINE_LIMIT_COMPLETION_MARKER,
+            timeout=timeout,
+            log_path=output_dir / log_name,
+        )
+        return _single_marker_value(
+            result["output"].encode("utf-8"), COMMAND_LINE_PREFIX
+        ).decode("utf-8")
+
+    padding_token = f"{COMMAND_LINE_PADDING}x"
+    shortest = boot(1, "command-line-limit-shortest.log")
+    tokens = shortest.split(" ")
+    if tokens.count(padding_token) != 1:
+        raise RuntimeError(
+            f"the guest's kernel command line lacks the padding token: {shortest!r}"
+        )
+    padding = KERNEL_COMMAND_LINE_SIZE - len(shortest.encode("utf-8"))
+    if padding < 1:
+        raise RuntimeError(
+            f"the shortest kernel command line already holds {len(shortest)} bytes"
+        )
+    expected = " ".join(
+        f"{COMMAND_LINE_PADDING}{'x' * padding}" if token == padding_token else token
+        for token in tokens
+    )
+    longest = boot(padding, "command-line-limit.log")
+    if longest != expected or len(longest.encode("utf-8")) != (
+        KERNEL_COMMAND_LINE_SIZE - 1
+    ):
+        raise RuntimeError(
+            f"the guest received a {len(longest)}-byte kernel command line ending "
+            f"{longest[-80:]!r}, not the expected {len(expected)}-byte one ending "
+            f"{expected[-80:]!r}"
+        )
+
+    with OpenvmmProcess(
+        command_line_limit_command(
+            executable, kernel, initrd, backend, memory_mib, padding + 1
+        ),
+        output_dir / "command-line-limit-over.log",
+    ) as process:
+        result = process.wait(timeout)
+    if (
+        result.returncode == 0
+        or BOOT_MARKER in result.output
+        or COMMAND_LINE_LIMIT_ERROR not in result.output
+    ):
+        raise RuntimeError(
+            "OpenVMM did not refuse a kernel command line one byte over the guest "
+            "kernel's limit before boot"
+        )
 
 
 def _directional_network_command(
@@ -1899,7 +2221,7 @@ def _bounded_egress_policy(
     udp_ports: tuple[int, int, int],
     *,
     policy_file: Path | None = None,
-) -> CompiledEgressPolicy:
+) -> EgressRules:
     allow: list[dict[str, object]] = []
     deny: list[dict[str, object]] = []
     for protocol, (start, denied, end) in (
@@ -1940,9 +2262,9 @@ def _bounded_egress_policy(
             )
         )
 
-    def compile_file(path: Path) -> CompiledEgressPolicy:
+    def compile_file(path: Path) -> EgressRules:
         path.write_text(json.dumps({"allow": allow, "deny": deny}), encoding="utf-8")
-        return compile_policy_file(path)
+        return compile_egress_policy(path)
 
     if policy_file is not None:
         return compile_file(policy_file)
@@ -2018,9 +2340,7 @@ def run_l3_l4_egress_policy(
             policy_file=policy_path,
         )
         command = [
-            sys.executable,
-            str(Path(__file__).parents[1] / "nvx.py"),
-            "run",
+            *nvx_rs.command_line(("run",)),
             "--guest",
             guest,
             "--hypervisor",
@@ -2148,7 +2468,7 @@ def run_l3_l4_egress_policy(
         (output_dir / "l3-l4-egress-policy-results.json").write_text(
             json.dumps(
                 {
-                    "interface": "nvx.py run",
+                    "interface": "nvx-rs run",
                     "policy_file": policy_path.name,
                     "tcp_ports": {
                         "adjacent_low": tcp_ports[0],
@@ -2386,9 +2706,7 @@ def run_l3_l4_egress_protocols(
                 encoding="utf-8",
             )
             command = [
-                sys.executable,
-                str(Path(__file__).parents[1] / "nvx.py"),
-                "run",
+                *nvx_rs.command_line(("run",)),
                 "--guest",
                 guest,
                 "--hypervisor",
@@ -2418,7 +2736,7 @@ def run_l3_l4_egress_protocols(
                     contain_process_tree=True,
                 )
                 host_reached = server.finish()
-            guest_reports = _egress_probe_reports(result["text"])
+            guest_reports = _egress_probe_reports(result["output"])
             _check_egress_case(
                 "protocol", case, L3_L4_EGRESS_PROBES, guest_reports, host_reached
             )
@@ -2467,7 +2785,7 @@ def run_l3_l4_egress_protocols(
         (output_dir / "l3-l4-egress-protocols-results.json").write_text(
             json.dumps(
                 {
-                    "interface": "nvx.py run",
+                    "interface": "nvx-rs run",
                     "ports": {"named": named_port, "other": other_port},
                     "cases": results,
                 },
@@ -2566,9 +2884,7 @@ def run_l3_l4_egress_port_ranges(
             ABOVE_PORT=str(ports["above"]),
         )
         public_run = [
-            sys.executable,
-            str(Path(__file__).parents[1] / "nvx.py"),
-            "run",
+            *nvx_rs.command_line(("run",)),
             "--guest",
             guest,
             "--hypervisor",
@@ -2595,7 +2911,7 @@ def run_l3_l4_egress_port_ranges(
             )
             # Each range must reach OpenVMM as one native rule, not as a rule
             # for each of its ports.
-            native = compile_policy_file(policy_path)
+            native = compile_egress_policy(policy_path)
             if not any(
                 rule.endswith(f":{first}-{last}")
                 for rule in (*native.allow, *native.deny)
@@ -2621,7 +2937,7 @@ def run_l3_l4_egress_port_ranges(
                     contain_process_tree=True,
                 )
                 host_reached = server.finish()
-            guest_reports = _egress_probe_reports(result["text"])
+            guest_reports = _egress_probe_reports(result["output"])
             _check_egress_case(
                 "port-range",
                 case,
@@ -2682,21 +2998,21 @@ def run_l3_l4_egress_port_ranges(
                 )
 
         # The public run rejects the same shapes in a policy file before it
-        # starts OpenVMM.
+        # starts OpenVMM, with the code of a refused request, naming the field.
         destination = [{"cidr": f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}/32"}]
-        for name, policy_rule, message in (
+        for name, policy_rule, field in (
             (
                 "reversed-end-port",
                 {
                     "to": destination,
                     "ports": [{"protocol": "tcp", "port": last, "endPort": first}],
                 },
-                f"allow[0].ports[0].endPort {first} cannot be below port {last}",
+                "allow[0].ports[0].endPort",
             ),
             (
                 "end-port-without-port",
                 {"to": destination, "ports": [{"protocol": "udp", "endPort": last}]},
-                "allow[0].ports[0].endPort requires port",
+                "allow[0].ports[0].endPort",
             ),
         ):
             policy_path = output_dir / f"l3-l4-egress-range-{name}-policy.json"
@@ -2715,8 +3031,12 @@ def run_l3_l4_egress_port_ranges(
                 timeout=timeout,
                 check=False,
             )
-            if rejected_run.returncode == 0 or message.encode() not in (
-                rejected_run.stderr
+            reported = nvx_rs.reported_error(rejected_run.stderr)
+            if (
+                rejected_run.returncode == 0
+                or reported is None
+                or reported.code != "unsupported"
+                or field not in reported.message
             ):
                 raise RuntimeError(
                     f"invalid L3/L4 port range policy {name} was not rejected "
@@ -2725,7 +3045,7 @@ def run_l3_l4_egress_port_ranges(
 
         (output_dir / "l3-l4-egress-port-ranges-results.json").write_text(
             json.dumps(
-                {"interface": "nvx.py run", "ports": ports, "cases": results},
+                {"interface": "nvx-rs run", "ports": ports, "cases": results},
                 indent=2,
             )
             + "\n",
@@ -3025,11 +3345,9 @@ def run_ipv6_egress_policy(
                 json.dumps({"allow": case.allow, "deny": case.deny}, indent=2) + "\n",
                 encoding="utf-8",
             )
-            native = compile_policy_file(policy_path)
+            native = compile_egress_policy(policy_path)
             command = [
-                sys.executable,
-                str(Path(__file__).parents[1] / "nvx.py"),
-                "run",
+                *nvx_rs.command_line(("run",)),
                 "--guest",
                 guest,
                 "--hypervisor",
@@ -3059,11 +3377,11 @@ def run_ipv6_egress_policy(
                     contain_process_tree=True,
                 )
                 host_reached = server.finish()
-            guest_reports = _egress_probe_reports(result["text"])
+            guest_reports = _egress_probe_reports(result["output"])
             _check_egress_case(
                 "IPv6 egress", case, IPV6_EGRESS_PROBES, guest_reports, host_reached
             )
-            dns = _ipv6_egress_dns_report(result["text"])
+            dns = _ipv6_egress_dns_report(result["output"])
             if dns != (case.dns or "none"):
                 raise RuntimeError(
                     f"IPv6 egress case {case.name}: the guest named {dns!r} as its "
@@ -3126,7 +3444,7 @@ def run_ipv6_egress_policy(
         (output_dir / "ipv6-egress-policy-results.json").write_text(
             json.dumps(
                 {
-                    "interface": "nvx.py run",
+                    "interface": "nvx-rs run",
                     "guest_ipv6": (
                         f"{DIRECTIONAL_NETWORK_GUEST_IPV6}/"
                         f"{DIRECTIONAL_NETWORK_IPV6_PREFIX_LENGTH}"
@@ -3145,6 +3463,32 @@ def run_ipv6_egress_policy(
             endpoint.close()
 
 
+HOST_LOOPBACK_HTTP_REQUEST_LIMIT = 8192
+
+
+def _read_http_request(connection: socket.socket, timeout: float) -> bytes:
+    """Read a request up to its blank line, however TCP splits it.
+
+    A request can arrive in several reads, so one ``recv`` is not enough. The
+    read stops at the header terminator, at the peer's close, or when the
+    request is too large or the deadline passes.
+    """
+    deadline = time.monotonic() + timeout
+    request = bytearray()
+    while b"\r\n\r\n" not in request:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("host-loopback HTTP request did not complete in time")
+        connection.settimeout(remaining)
+        chunk = connection.recv(4096)
+        if not chunk:
+            break
+        request.extend(chunk)
+        if len(request) > HOST_LOOPBACK_HTTP_REQUEST_LIMIT:
+            raise RuntimeError("host-loopback HTTP request exceeds its size limit")
+    return bytes(request)
+
+
 def _http_server(
     listener: socket.socket,
     expected_path: bytes,
@@ -3155,8 +3499,7 @@ def _http_server(
     try:
         connection, _ = listener.accept()
         with connection:
-            connection.settimeout(timeout)
-            request = connection.recv(4096)
+            request = _read_http_request(connection, timeout)
             if not request.startswith(b"GET " + expected_path + b" HTTP/1."):
                 raise RuntimeError(
                     f"unexpected host-loopback HTTP request: {request!r}"
@@ -3169,6 +3512,57 @@ def _http_server(
             )
     except Exception as error:
         errors.append(error)
+
+
+def _udp_echo_server(
+    server: socket.socket, stop: threading.Event, errors: list[Exception]
+) -> None:
+    """Answer each echo request that ``server`` receives until ``stop`` is set."""
+    try:
+        server.settimeout(0.05)
+        while not stop.is_set():
+            try:
+                request, peer = server.recvfrom(4096)
+            except (TimeoutError, ConnectionResetError):
+                # Windows reports a datagram that a closed port refused as a
+                # reset on the next receive.
+                continue
+            if request != HOST_LOOPBACK_UDP_ECHO_REQUEST:
+                raise RuntimeError(
+                    f"unexpected host-loopback UDP echo request: {request!r}"
+                )
+            server.sendto(HOST_LOOPBACK_UDP_ECHO_REPLY, peer)
+    except Exception as error:
+        errors.append(error)
+
+
+def _bind_host_loopback_udp_echo(
+    family: int, address: str, published: Sequence[int]
+) -> socket.socket:
+    """Bind a UDP socket to an ephemeral port of ``address`` outside ``published``.
+
+    The probes that drew the guest ports that OpenVMM publishes released them,
+    so an ephemeral bind can take one, keep OpenVMM from publishing it, and
+    receive the host's datagrams for the guest. Each rejected socket holds its
+    port until the search ends, so no later attempt draws that port again.
+    """
+    attempts: list[socket.socket] = []
+    try:
+        for _ in range(HOST_LOOPBACK_PORT_BIND_ATTEMPTS):
+            udp_echo = socket.socket(family, socket.SOCK_DGRAM)
+            attempts.append(udp_echo)
+            if family == socket.AF_INET6:
+                udp_echo.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            udp_echo.bind((address, 0))
+            if int(udp_echo.getsockname()[1]) not in published:
+                return attempts.pop()
+    finally:
+        for rejected in attempts:
+            rejected.close()
+    raise RuntimeError(
+        f"failed to bind a UDP port on {address} outside guest ports "
+        f"{sorted(published)} after {HOST_LOOPBACK_PORT_BIND_ATTEMPTS} attempts"
+    )
 
 
 def _host_loopback_port_candidates() -> list[int]:
@@ -3278,11 +3672,14 @@ def run_host_loopback_policy(
                 "host-loopback-policy.sh.in",
                 MODE="udp-control",
                 GATEWAY_IPV4=DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+                GATEWAY_IPV6=DIRECTIONAL_NETWORK_GATEWAY_IPV6,
                 GENERAL_PORT=str(denied_general_port),
                 PROXY_PORT=str(proxy_port),
                 GUEST_PORT="0",
                 PRIVATE_GUEST_PORT="0",
                 UDP_IPV6_GUEST_PORT="0",
+                UDP_ECHO_PORT="0",
+                UDP_ECHO_IPV6_PORT="0",
             ),
             HOST_LOOPBACK_UDP_CONTROL_MARKER,
             timeout=timeout,
@@ -3313,11 +3710,14 @@ def run_host_loopback_policy(
                 "host-loopback-policy.sh.in",
                 MODE="deny",
                 GATEWAY_IPV4=DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+                GATEWAY_IPV6=DIRECTIONAL_NETWORK_GATEWAY_IPV6,
                 GENERAL_PORT=str(denied_general_port),
                 PROXY_PORT=str(proxy_port),
                 GUEST_PORT="0",
                 PRIVATE_GUEST_PORT="0",
                 UDP_IPV6_GUEST_PORT="0",
+                UDP_ECHO_PORT="0",
+                UDP_ECHO_IPV6_PORT="0",
             ),
             HOST_LOOPBACK_DENY_MARKER,
             timeout=timeout,
@@ -3382,7 +3782,34 @@ def run_host_loopback_policy(
         daemon=True,
     )
     allow_server.start()
+    udp_echoes: list[socket.socket] = []
+    udp_echo_servers: list[threading.Thread] = []
+    udp_echo_errors: list[Exception] = []
+    udp_echo_stop = threading.Event()
     try:
+        # Host UDP services on IPv4 and IPv6 loopback, which the guest reaches
+        # at its gateway. The guest's UDP servers are dual-stack, so OpenVMM
+        # publishes both of their ports on both loopback addresses, and
+        # neither service may hold either port.
+        for family, address in (
+            (socket.AF_INET, "127.0.0.1"),
+            (socket.AF_INET6, "::1"),
+        ):
+            udp_echo = _bind_host_loopback_udp_echo(
+                family, address, (guest_port, udp_ipv6_guest_port)
+            )
+            udp_echoes.append(udp_echo)
+            udp_echo_server = threading.Thread(
+                target=_udp_echo_server,
+                args=(udp_echo, udp_echo_stop, udp_echo_errors),
+                name="nvx-host-loopback-udp-echo",
+                daemon=True,
+            )
+            udp_echo_server.start()
+            udp_echo_servers.append(udp_echo_server)
+        udp_echo_port, udp_echo_ipv6_port = (
+            int(udp_echo.getsockname()[1]) for udp_echo in udp_echoes
+        )
         allow_command = workload_boot_command(
             executable,
             backend,
@@ -3393,8 +3820,9 @@ def run_host_loopback_policy(
             network=DIRECTIONAL_NETWORK_CIDR,
         )
         # Egress admits only the guest's own connection to the general host
-        # service, so the guest's replies to the host pass because host
-        # loopback admits them, not because egress does.
+        # service and its datagrams to the UDP services, so the guest's
+        # replies to the host pass because host loopback admits them, not
+        # because egress does.
         allow_command.extend(
             (
                 "--host-loopback",
@@ -3405,6 +3833,10 @@ def run_host_loopback_policy(
                 "deny",
                 "--network-egress-allow",
                 f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}/32:tcp:{allowed_general_port}",
+                "--network-egress-allow",
+                f"{DIRECTIONAL_NETWORK_GATEWAY_IPV4}/32:udp:{udp_echo_port}",
+                "--network-egress-allow",
+                f"{DIRECTIONAL_NETWORK_GATEWAY_IPV6}/128:udp:{udp_echo_ipv6_port}",
                 "--host-loopback-forward",
                 f"tcp:{host_forward_port}:{guest_port}",
             )
@@ -3422,11 +3854,14 @@ def run_host_loopback_policy(
                     "host-loopback-policy.sh.in",
                     MODE="allow",
                     GATEWAY_IPV4=DIRECTIONAL_NETWORK_GATEWAY_IPV4,
+                    GATEWAY_IPV6=DIRECTIONAL_NETWORK_GATEWAY_IPV6,
                     GENERAL_PORT=str(allowed_general_port),
                     PROXY_PORT="0",
                     GUEST_PORT=str(guest_port),
                     PRIVATE_GUEST_PORT=str(private_guest_port),
                     UDP_IPV6_GUEST_PORT=str(udp_ipv6_guest_port),
+                    UDP_ECHO_PORT=str(udp_echo_port),
+                    UDP_ECHO_IPV6_PORT=str(udp_echo_ipv6_port),
                 ),
             )
             process.wait_for_line(HOST_LOOPBACK_INGRESS_READY_MARKER, timeout)
@@ -3451,9 +3886,18 @@ def run_host_loopback_policy(
             raise RuntimeError("general host-loopback server failed") from allow_errors[
                 0
             ]
+        if udp_echo_errors:
+            raise RuntimeError(
+                "host-loopback UDP echo service failed"
+            ) from udp_echo_errors[0]
     finally:
         allowed_general.close()
         allow_server.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
+        udp_echo_stop.set()
+        for udp_echo_server in udp_echo_servers:
+            udp_echo_server.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
+        for udp_echo in udp_echoes:
+            udp_echo.close()
 
     run_host_loopback_rejections(
         executable,
@@ -3630,14 +4074,22 @@ def run_host_loopback_rejections(
     timeout: float,
     output_dir: Path,
 ) -> None:
-    for name, extra, expected in (
+    for name, network, extra, expected in (
         (
             "allow-snapshot",
+            DIRECTIONAL_NETWORK_CIDR,
             ("--host-loopback", "allow", "--snapshot-destination"),
             b"microVM snapshots do not support --host-loopback allow",
         ),
         (
+            "allow-narrow-network",
+            HOST_LOOPBACK_NARROW_NETWORK_CIDR,
+            ("--host-loopback", "allow"),
+            b"--host-loopback allow requires an IPv4 network of /29 or larger",
+        ),
+        (
             "deny-forward",
+            DIRECTIONAL_NETWORK_CIDR,
             (
                 "--host-loopback",
                 "deny",
@@ -3648,6 +4100,7 @@ def run_host_loopback_rejections(
         ),
         (
             "wrong-proxy-address",
+            DIRECTIONAL_NETWORK_CIDR,
             (
                 "--host-loopback",
                 "deny",
@@ -3664,7 +4117,7 @@ def run_host_loopback_rejections(
             initrd,
             memory_mib,
             "quiet loglevel=0",
-            network=DIRECTIONAL_NETWORK_CIDR,
+            network=network,
         )
         invalid.extend(extra)
         with tempfile.TemporaryDirectory(prefix="nvx-loopback-rejection-") as temporary:
@@ -4511,7 +4964,7 @@ def run_sandbox_blocks(
             memory_mib,
             "quiet loglevel=0",
         )
-        for role in ("distro", "runtime", "custom", "scratch"):
+        for role in ("distro", "scratch"):
             path = root / f"{role}.img"
             with path.open("wb") as disk:
                 disk.truncate(SANDBOX_BLOCK_SIZE)
@@ -4761,6 +5214,547 @@ def run_cpu_profile_fallback(
             )
 
 
+def time_host_correction_hook(ppm: int) -> tuple[str, str]:
+    """Return OpenVMM's test hook that publishes host UTC as running ``ppm``
+    faster than it does, with the clock correction to match."""
+    return ("--x-time-abi-test-hook", f"host-rate-offset-ppm={ppm}")
+
+
+def time_host_correction_script(
+    spacing_seconds: int = TIME_HOST_CORRECTION_SPACING_SECONDS,
+    settle_seconds: int = TIME_HOST_CORRECTION_PHASE_SETTLE_SECONDS,
+) -> str:
+    """Return the guest's report of the time-host-correction scenario: its time
+    state, then up to ``TIME_HOST_CORRECTION_ATTEMPTS`` pairs of samples
+    ``spacing_seconds`` apart until host UTC's disruption counter and the
+    discipline are stable and both samples lie within
+    ``TIME_HOST_CORRECTION_SAMPLE_BOUND_NS``, unless Linux's limit holds its
+    frequency correction."""
+    return _render_script(
+        "time-host-correction.sh.in",
+        STATE_PREFIX=TIME_HOST_CORRECTION_STATE_PREFIX,
+        SAMPLE_PREFIX=TIME_HOST_CORRECTION_SAMPLE_PREFIX,
+        SPACING_SECONDS=str(spacing_seconds),
+        PHASE_SETTLE_SECONDS=str(settle_seconds),
+        ATTEMPTS=str(TIME_HOST_CORRECTION_ATTEMPTS),
+        SAMPLE_BOUND_NS=str(TIME_HOST_CORRECTION_SAMPLE_BOUND_NS),
+    )
+
+
+def _time_host_correction_report(
+    output: str, *, context: str
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Return the bracket states and samples of every measurement window in
+    the time-host-correction scenario's guest report."""
+    states: list[dict[str, str]] = []
+    samples: list[dict[str, str]] = []
+    try:
+        for raw in output.splitlines():
+            line = raw.removesuffix("\r")
+            if line.startswith(TIME_HOST_CORRECTION_STATE_PREFIX):
+                states.append(
+                    parse_fields(line.removeprefix(TIME_HOST_CORRECTION_STATE_PREFIX))
+                )
+            elif line.startswith(TIME_HOST_CORRECTION_SAMPLE_PREFIX):
+                samples.append(
+                    parse_fields(line.removeprefix(TIME_HOST_CORRECTION_SAMPLE_PREFIX))
+                )
+    except ValueError as error:
+        raise RuntimeError(f"{context}: malformed guest report: {error}") from error
+    if not states or not samples:
+        raise RuntimeError(f"{context}: the guest reported no time state or sample")
+    return states, samples
+
+
+def _failed_sample(sample: dict[str, str]) -> str | None:
+    """Return the fields of an ``nvx-time sample`` report that paired no
+    sample with the guest's clocks, or None if it did."""
+    if "theta_ns" in sample and "epsilon_ns" in sample:
+        return None
+    return " ".join(f"{key}={value}" for key, value in sample.items())
+
+
+def _time_host_correction_window(
+    states: list[dict[str, str]],
+    samples: list[dict[str, str]],
+    *,
+    context: str,
+    limit: bool,
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    """Return the state and samples of the first stable and conclusive
+    measurement window.
+
+    Each window's states must keep the accepted-sample count, held correction,
+    and clock-step fields, and its samples the host disruption counter, and
+    each sample must pair within ``TIME_HOST_CORRECTION_SAMPLE_BOUND_NS``.
+    Another window is retried, up to ``TIME_HOST_CORRECTION_ATTEMPTS`` times;
+    the limited phase, which takes one sample, is not.
+    """
+    if len(states) % 3:
+        raise RuntimeError(
+            f"{context}: the guest reported {len(states)} window states, not triples"
+        )
+    windows = len(states) // 3
+    if not 1 <= windows <= TIME_HOST_CORRECTION_ATTEMPTS:
+        raise RuntimeError(
+            f"{context}: the guest reported {windows} measurement windows, not 1 to "
+            f"{TIME_HOST_CORRECTION_ATTEMPTS}"
+        )
+    for index, (initial, before, after) in enumerate(
+        zip(states[::3], states[1::3], states[2::3], strict=True), start=1
+    ):
+        if (
+            initial.get("attempt") != str(index)
+            or initial.get("point") != "initial"
+            or before.get("attempt") != str(index)
+            or before.get("point") != "before"
+            or after.get("attempt") != str(index)
+            or after.get("point") != "after"
+        ):
+            raise RuntimeError(
+                f"{context}: malformed state brackets for measurement window {index}"
+            )
+    state_reports_limit = (
+        windows == 1 and len(samples) == 1 and states[2].get("frequency_limited") == "1"
+    )
+    if limit or state_reports_limit:
+        if windows != 1 or len(samples) != 1:
+            raise RuntimeError(
+                f"{context}: the limited phase reported {windows} windows and "
+                f"{len(samples)} samples, not one of each"
+            )
+        failed = _failed_sample(samples[0])
+        if failed is not None:
+            raise RuntimeError(f"{context}: nvx-time sample failed: {failed}")
+        return states[2], samples
+    if len(samples) != 2 * windows:
+        raise RuntimeError(
+            f"{context}: the guest reported {len(samples)} time samples for "
+            f"{windows} measurement windows, not {2 * windows}"
+        )
+    reasons: list[str] = []
+    for window in range(windows):
+        initial, before, after = states[3 * window : 3 * window + 3]
+        first, second = samples[2 * window : 2 * window + 2]
+        missing = [
+            field
+            for field in TIME_HOST_CORRECTION_DISCIPLINE_FIELDS
+            if any(field not in state for state in (initial, before, after))
+        ]
+        if missing:
+            raise RuntimeError(
+                f"{context}: measurement window {window + 1} states lack "
+                + ", ".join(missing)
+            )
+        signature_initial = tuple(
+            initial[field] for field in TIME_HOST_CORRECTION_DISCIPLINE_FIELDS
+        )
+        signature_before = tuple(
+            before[field] for field in TIME_HOST_CORRECTION_DISCIPLINE_FIELDS
+        )
+        signature_after = tuple(
+            after[field] for field in TIME_HOST_CORRECTION_DISCIPLINE_FIELDS
+        )
+        first_disruption = first.get("disruption")
+        failed = next(
+            (report for report in map(_failed_sample, (first, second)) if report),
+            None,
+        )
+        if failed is not None:
+            reasons.append(f"window {window + 1}: nvx-time sample failed: {failed}")
+            continue
+        try:
+            uncertainty_ns = max(
+                int(sample["epsilon_ns"]) for sample in (first, second)
+            )
+        except (KeyError, ValueError) as error:
+            raise RuntimeError(
+                f"{context}: malformed guest report: {error!r}"
+            ) from error
+        if not signature_initial == signature_before == signature_after:
+            reasons.append(f"window {window + 1}: the discipline changed")
+        elif first_disruption is None or first_disruption != second.get("disruption"):
+            reasons.append(
+                f"window {window + 1}: host UTC's disruption counter changed"
+            )
+        elif uncertainty_ns > TIME_HOST_CORRECTION_SAMPLE_BOUND_NS:
+            reasons.append(
+                f"window {window + 1}: a sample's uncertainty of {uncertainty_ns} ns "
+                f"exceeds the {TIME_HOST_CORRECTION_SAMPLE_BOUND_NS} ns bound"
+            )
+        else:
+            return after, [first, second]
+    raise RuntimeError(
+        f"{context}: no measurement window was stable and conclusive: "
+        + "; ".join(reasons)
+    )
+
+
+def time_host_correction_host(output: str, *, context: str) -> tuple[float, int]:
+    """Return the host's own clock correction, in ppm, and the declared TSC
+    rate that the unhooked guest report publishes.
+
+    No test hook may have altered the first sample. The TSC rate determines
+    whether Linux's kHz rounding would saturate an ordinary hooked phase.
+    """
+    states, samples = _time_host_correction_report(output, context=context)
+    state, samples = _time_host_correction_window(
+        states, samples, context=context, limit=False
+    )
+    sample = samples[0]
+    try:
+        if "theta_ns" not in sample:
+            raise RuntimeError(
+                f"{context}: nvx-time sample failed: "
+                + " ".join(f"{key}={value}" for key, value in sample.items())
+            )
+        if int(sample["flags"], 16) & TIME_SAMPLE_TEST_HOOKS:
+            raise RuntimeError(
+                f"{context}: time sample flags {sample['flags']} carry the "
+                "test-hook flag, so a hook altered the host's own correction"
+            )
+        return int(sample["correction"]) / 65_536, int(state["tsc_hz"])
+    except (KeyError, ValueError) as error:
+        raise RuntimeError(f"{context}: malformed guest report: {error!r}") from error
+
+
+def time_host_correction_host_ppm(output: str, *, context: str) -> float:
+    """Return only the host correction from [`time_host_correction_host`]."""
+    return time_host_correction_host(output, context=context)[0]
+
+
+def time_host_correction_composed_ppm(host_ppm: float, hook_ppm: int) -> float:
+    """Return the published correction when OpenVMM composes the host's rate
+    with ``hook_ppm`` multiplicatively."""
+    return host_ppm + hook_ppm + host_ppm * hook_ppm / 1_000_000
+
+
+def time_host_correction_guest_ppm(correction_ppm: float, tsc_hz: int) -> float:
+    """Return the correction that Linux must hold after it rounds
+    ``tsc_hz`` down to the kHz."""
+    if tsc_hz <= 0:
+        raise RuntimeError(f"the declared TSC rate is invalid: {tsc_hz} Hz")
+    kernel_hz = tsc_hz // 1000 * 1000
+    return (1_000_000 + correction_ppm) * kernel_hz / tsc_hz - 1_000_000
+
+
+def time_host_correction_hooks(host_ppm: float, tsc_hz: int) -> tuple[int, int, int]:
+    """Return the ``host-rate-offset-ppm`` hooks, in ppm, of the
+    time-host-correction scenario's cold boot, restore, and limit restore on a
+    host whose own clock correction is ``host_ppm``.
+
+    The first two aim to make OpenVMM publish corrections of
+    ``TIME_HOST_CORRECTION_BOOT_PPM`` and ``TIME_HOST_CORRECTION_RESTORE_PPM``
+    against the sign of the host's own. OpenVMM composes the two rates
+    multiplicatively, so solve that composition for the hook. The hooks stay
+    within OpenVMM's accepted range; near its edge they publish the closest
+    correction that remains below Linux's 500 ppm limit. A host whose
+    correction cannot be brought below that limit fails here with an explicit
+    diagnostic. The last hook extends the host's own correction beyond Linux's
+    limit.
+    """
+    sign = 1 if host_ppm >= 0 else -1
+    denominator = 1_000_000 + host_ppm
+    if denominator <= 0:
+        raise RuntimeError(f"the host's own correction is invalid: {host_ppm:+.3f} ppm")
+
+    def ordinary(target_ppm: int) -> int:
+        target = -sign * target_ppm
+        hook = round((target - host_ppm) * 1_000_000 / denominator)
+        hook = max(
+            -OPENVMM_HOST_RATE_OFFSET_LIMIT_PPM,
+            min(OPENVMM_HOST_RATE_OFFSET_LIMIT_PPM, hook),
+        )
+        published = time_host_correction_composed_ppm(host_ppm, hook)
+        guest = time_host_correction_guest_ppm(published, tsc_hz)
+        if abs(guest) >= LINUX_FREQUENCY_LIMIT_PPB / 1000:
+            raise RuntimeError(
+                f"the host's own correction of {host_ppm:+.3f} ppm cannot be "
+                "composed with Linux's rounded TSC rate below its 500 ppm "
+                "limit within OpenVMM's host-rate-offset-ppm range of +/-"
+                f"{OPENVMM_HOST_RATE_OFFSET_LIMIT_PPM:,} ppm (published "
+                f"{published:+.3f} ppm, guest {guest:+.3f} ppm at {tsc_hz} Hz)"
+            )
+        return hook
+
+    return (
+        ordinary(TIME_HOST_CORRECTION_BOOT_PPM),
+        ordinary(TIME_HOST_CORRECTION_RESTORE_PPM),
+        sign * TIME_HOST_CORRECTION_LIMIT_PPM,
+    )
+
+
+def time_host_correction_frequency_allowance_ppb(
+    tsc_hz: int, correction_ppb: int
+) -> int:
+    """Return the rounding allowance between the host and kernel corrections.
+
+    Linux counts the declared TSC rate rounded down to the kHz, up to 999 Hz
+    slow. Scale that worst case at ``tsc_hz`` by the correction, and allow one
+    more ppb for the correction's integer rounding. The time ABI admits rates
+    as low as 500 MHz, where this is nearly 2,000 ppb rather than the 1,001 ppb
+    sufficient at 1 GHz.
+    """
+    if tsc_hz <= 0:
+        raise ValueError(f"invalid TSC rate {tsc_hz}")
+    numerator = 999 * (1_000_000_000 + abs(correction_ppb))
+    return (numerator + tsc_hz - 1) // tsc_hz + 1
+
+
+def check_time_host_correction(
+    output: str, *, context: str, limit: bool = False
+) -> str:
+    """Check the guest's report of the time-host-correction scenario in its
+    console ``output``, and return a summary of it.
+
+    The correction that the guest's boot step or restore repair took must be
+    the one that its first sample publishes, give or take the host's own
+    changes, so that it isn't a stale one. With ``limit``, that correction must
+    exceed Linux's limit, and the guest must hold the limit and report it.
+    Otherwise it must lie within the limit, and the guest's frequency
+    correction must be it, short of the kernel's kHz rounding of the TSC rate;
+    between its two samples, the guest's clock must run at the correction that
+    it holds against the guest TSC counted at the declared rate, as each sample
+    pairs the clock with the TSC, within an allowance below half that
+    correction, and host UTC, which each sample pairs with
+    the same TSC, at its published correction, give or take the slews of the
+    host's time service, so that the hook skewed both alike. A pair whose
+    disruption counter changes, or whose samples failed to pair or are
+    uncertain beyond the discipline's bound, is discarded in favor of one of
+    the bounded retry windows. Every sample must carry OpenVMM's test-hook
+    flag, so that the hook reached it."""
+    states, samples = _time_host_correction_report(output, context=context)
+    state, samples = _time_host_correction_window(
+        states, samples, context=context, limit=limit
+    )
+    try:
+        for sample in samples:
+            if "theta_ns" not in sample:
+                raise RuntimeError(
+                    f"{context}: nvx-time sample failed: "
+                    + " ".join(f"{key}={value}" for key, value in sample.items())
+                )
+            if int(sample["flags"], 16) & TIME_SAMPLE_TEST_HOOKS == 0:
+                raise RuntimeError(
+                    f"{context}: time sample flags {sample['flags']} lack the "
+                    "test-hook flag, so OpenVMM's hook did not reach it"
+                )
+        frequency_ppb = int(state["frequency_ppb"])
+        correction_ppb = int(state["host_correction_ppb"])
+        limited = state["frequency_limited"] == "1"
+
+        def check_held(sample: dict[str, str]) -> float:
+            published = int(sample["correction"]) / 65_536
+            if abs(correction_ppb / 1000 - published) > TIME_HOST_CORRECTION_HELD_PPM:
+                raise RuntimeError(
+                    f"{context}: the guest holds the host's correction of "
+                    f"{correction_ppb} ppb, but its first stable sample publishes "
+                    f"{published:+.3f} ppm, more than "
+                    f"{TIME_HOST_CORRECTION_HELD_PPM} ppm away: its boot step or "
+                    "restore repair kept a stale correction"
+                )
+            return published
+
+        tsc_hz = int(state["tsc_hz"])
+        required_ppm = time_host_correction_guest_ppm(correction_ppb / 1000, tsc_hz)
+        beyond = abs(required_ppm) > LINUX_FREQUENCY_LIMIT_PPB / 1000
+        if limit:
+            check_held(samples[0])
+            if not beyond:
+                raise RuntimeError(
+                    f"{context}: Linux's required correction of "
+                    f"{required_ppm:+.3f} ppm is within its limit, so this phase "
+                    "does not exercise it"
+                )
+            held = (
+                LINUX_FREQUENCY_LIMIT_PPB
+                if required_ppm > 0
+                else (-LINUX_FREQUENCY_LIMIT_PPB)
+            )
+            if not limited or frequency_ppb != held:
+                raise RuntimeError(
+                    f"{context}: Linux's required correction of "
+                    f"{required_ppm:+.3f} ppm exceeds its limit, but the guest "
+                    f"holds {frequency_ppb} ppb "
+                    f"with frequency_limited={state['frequency_limited']}, not "
+                    f"{held} ppb with frequency_limited=1"
+                )
+            return (
+                f"{context}: host_correction_ppb={correction_ppb} "
+                f"frequency_ppb={frequency_ppb} frequency_limited=1"
+            )
+        if limited or beyond:
+            raise RuntimeError(
+                f"{context}: Linux's required correction of {required_ppm:+.3f} "
+                f"ppm reaches its limit (frequency_limited="
+                f"{state['frequency_limited']}), so "
+                "this phase cannot check the guest's rate"
+            )
+        first, second = samples
+        published_ppm = check_held(first)
+        allowance_ppb = time_host_correction_frequency_allowance_ppb(
+            tsc_hz, correction_ppb
+        )
+        if abs(frequency_ppb - correction_ppb) > allowance_ppb:
+            raise RuntimeError(
+                f"{context}: the guest holds a frequency correction of "
+                f"{frequency_ppb} ppb, not the host's correction of "
+                f"{correction_ppb} ppb (allowance {allowance_ppb} ppb at "
+                f"{tsc_hz} Hz)"
+            )
+        # The guest TSC, counted at the declared rate, paces both clocks: each
+        # sample pairs it with host UTC and, at host UTC less theta, with the
+        # guest's realtime clock, within its uncertainty less the pairing bound.
+        elapsed_ns = (int(second["tsc"]) - int(first["tsc"])) * 1e9 / tsc_hz
+        utc_ns = int(second["utc_ns"]) - int(first["utc_ns"])
+        realtime_ns = utc_ns - (int(second["theta_ns"]) - int(first["theta_ns"]))
+        realtime_error_ns = sum(
+            int(sample["epsilon_ns"]) - int(sample["pairing_ns"]) for sample in samples
+        )
+        pairing_error_ns = sum(int(sample["pairing_ns"]) for sample in samples)
+        first_ppm, second_ppm = (
+            int(sample["correction"]) / 65_536 for sample in samples
+        )
+    except (KeyError, ValueError, ZeroDivisionError) as error:
+        raise RuntimeError(f"{context}: malformed guest report: {error!r}") from error
+    if elapsed_ns <= 0:
+        raise RuntimeError(
+            f"{context}: the guest TSC did not advance between the samples"
+        )
+    seconds = elapsed_ns / 1e9
+    held_ppm = correction_ppb / 1000
+    guest_ppm = (realtime_ns / elapsed_ns - 1) * 1e6
+    guest_limit = TIME_HOST_CORRECTION_GUEST_PPM + realtime_error_ns / elapsed_ns * 1e6
+    # A guest that ignored the correction that it holds would run its clock at
+    # the TSC's own rate, about 0 ppm, so an allowance of half the correction or
+    # more could not tell it from one that applied the correction.
+    conclusive_ppm = abs(held_ppm) / 2
+    if guest_limit >= conclusive_ppm:
+        raise RuntimeError(
+            f"{context}: the allowance of {guest_limit:.3f} ppm for the guest's "
+            f"clock in {seconds:.1f} s is not below {conclusive_ppm:.3f} ppm, half "
+            f"the host's correction of {held_ppm:+.3f} ppm that it holds, so its "
+            "rate check is inconclusive"
+        )
+    if abs(guest_ppm - held_ppm) > guest_limit:
+        raise RuntimeError(
+            f"{context}: the guest's clock ran at {guest_ppm:+.3f} ppm against its "
+            f"TSC in {seconds:.1f} s, not at the host's correction of "
+            f"{held_ppm:+.3f} ppm that it holds, within {guest_limit:.3f} ppm"
+        )
+    host_ppm = (utc_ns / elapsed_ns - 1) * 1e6
+    published_ppm = (first_ppm + second_ppm) / 2
+    host_limit = (
+        TIME_HOST_CORRECTION_HOST_PPM
+        + abs(second_ppm - first_ppm) / 2
+        + pairing_error_ns / elapsed_ns * 1e6
+    )
+    if abs(host_ppm - published_ppm) > host_limit:
+        raise RuntimeError(
+            f"{context}: host UTC ran at {host_ppm:+.3f} ppm against the guest TSC "
+            f"in {seconds:.1f} s, not at its published correction of "
+            f"{published_ppm:+.3f} ppm, within {host_limit:.3f} ppm"
+        )
+    return (
+        f"{context}: host_correction_ppb={correction_ppb} frequency_ppb={frequency_ppb} "
+        f"guest_ppm={guest_ppm:+.3f} host_ppm={host_ppm:+.3f} "
+        f"published_ppm={published_ppm:+.3f} in {seconds:.1f} s"
+    )
+
+
+def run_time_host_correction(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Check that the guest applies the host's clock correction that OpenVMM
+    publishes with each time sample, through the ``host-rate-offset-ppm`` test
+    hook, which publishes host UTC as running faster or slower than it does.
+
+    An unhooked cold boot's time sample gives the host's own correction, from
+    which ``time_host_correction_hooks`` chooses the hooks. A cold boot with the
+    hook must hold the published correction from its boot step on, and keep its
+    clock on the hooked host UTC. A snapshot, captured without the hook,
+    restored with another rate must hold the destination's correction from its
+    repair on, and pass the warp probe and its restore checks; restored with a
+    rate beyond Linux's 500 ppm limit, in the direction of the host's own
+    correction, it must hold the limit and report it."""
+    boot_command = workload_boot_command(
+        executable,
+        backend,
+        kernel,
+        initrd,
+        memory_mib,
+        "quiet loglevel=0",
+        processors=1,
+    )
+    completion = f"echo {TIME_HOST_CORRECTION_COMPLETION_MARKER.decode()}\nnvx-exit 0\n"
+    context = "host clock correction probe"
+    probe = run_guest_script(
+        boot_command,
+        time_host_correction_script(spacing_seconds=0) + completion,
+        TIME_HOST_CORRECTION_COMPLETION_MARKER,
+        timeout=timeout,
+        log_path=output_dir / "time-host-correction-probe.log",
+    )
+    host_ppm, tsc_hz = time_host_correction_host(probe["output"], context=context)
+    boot_ppm, restore_ppm, limit_ppm = time_host_correction_hooks(host_ppm, tsc_hz)
+    print(f"{context}: the host's own correction is {host_ppm:+.3f} ppm", flush=True)
+    context = f"host clock correction cold boot (hook {boot_ppm:+d} ppm)"
+    result = run_guest_script(
+        [*boot_command, *time_host_correction_hook(boot_ppm)],
+        time_host_correction_script() + completion,
+        TIME_HOST_CORRECTION_COMPLETION_MARKER,
+        timeout=timeout,
+        log_path=output_dir / "time-host-correction-boot.log",
+    )
+    print(check_time_host_correction(result["output"], context=context), flush=True)
+    with tempfile.TemporaryDirectory(prefix="nvx-time-host-correction-") as temporary:
+        snapshot_path = Path(temporary) / "snapshot"
+        capture_snapshot(
+            [*boot_command, "--snapshot-destination", str(snapshot_path)],
+            snapshot_path,
+            timeout=timeout,
+            processors=1,
+            post_restore_script=time_host_correction_script() + post_restore_checks(),
+            log_path=output_dir / "time-host-correction-capture.log",
+        )
+        for name, ppm, limit in (
+            ("restore", restore_ppm, False),
+            ("limit", limit_ppm, True),
+        ):
+            context = f"host clock correction {name} (hook {ppm:+d} ppm)"
+            restore_command = [
+                *snapshot_restore_command(
+                    executable, backend, snapshot_path, processors=1
+                ),
+                *time_host_correction_hook(ppm),
+            ]
+            output = _measure_restore(
+                restore_command,
+                context=context,
+                environment=_restore_environment(),
+                timeout=timeout,
+                log_path=output_dir / f"time-host-correction-{name}.log",
+                failure_marker=WARP_PROBE_FAILURE_MARKER,
+            )
+            print(
+                check_time_host_correction(
+                    output.decode("utf-8", "replace"), context=context, limit=limit
+                ),
+                flush=True,
+            )
+            _check_restore_warp(output, processors=1, context=context)
+            _check_restore_status(
+                output, restore_command, processors=1, context=context
+            )
+
+
 def _restore_vp_bindings(output: bytes) -> list[int]:
     """Return the VP indices bound by one profiled OpenVMM process."""
     bound: list[int] = []
@@ -4895,6 +5889,1479 @@ def run_restore_processors(
                 raise RuntimeError(
                     f"{_restore_label(target)} modified snapshot artifacts"
                 )
+
+
+def run_platform_restore_processors(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    processor_counts: list[int],
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Bring a different vCPU prefix online in each clone of one platform
+    snapshot.
+
+    The platform capture boots its capacity with ``maxcpus=1``, its only
+    caller token. Each restore of a requested count up to the capacity, and
+    one without a target, runs the platform repair and the checks of
+    ``restore-processors``. OpenVMM refuses unsupported and over-capacity
+    counts before the guest runs.
+    """
+    capacity = PLATFORM_RESTORE_PROCESSORS_CAPACITY
+    boot_online = PLATFORM_RESTORE_PROCESSORS_BOOT_ONLINE
+    script = _read_script("restore-processors.sh") + post_restore_checks()
+    environment = _restore_environment()
+    environment["OPENVMM_LOG"] = TIME_ABI_RESTORE_LOG_FILTER
+    environment[SNAPSHOT_PROFILE_ENV] = "1"
+    with tempfile.TemporaryDirectory(
+        prefix="nvx-platform-restore-processors-"
+    ) as temporary:
+        root = Path(temporary)
+        snapshot_path = root / "snapshot"
+        layer = root / "distro.erofs"
+        capture_scratch = root / "capture-scratch.raw"
+        _write_pattern(layer, 1024 * 1024, 0x3C)
+        _write_pattern(capture_scratch, 1024 * 1024, 0xA5)
+        boot_command = workload_boot_command(
+            executable,
+            backend,
+            kernel,
+            initrd,
+            memory_mib,
+            f"maxcpus={boot_online}",
+            processors=capacity,
+        )
+        capture_snapshot(
+            [
+                *boot_command,
+                "--snapshot-destination",
+                str(snapshot_path),
+                "--snapshot-tier",
+                "platform",
+                "--microvm-sandbox-block",
+                _block_arg("distro", layer, read_only=True),
+                "--microvm-sandbox-block",
+                _block_arg("scratch", capture_scratch, read_only=False),
+            ],
+            snapshot_path,
+            timeout=timeout,
+            processors=boot_online,
+            post_restore_script=script,
+            log_path=output_dir / "platform-restore-processors-capture.log",
+        )
+        fingerprint = _scratch_snapshot_fingerprint(snapshot_path)
+
+        def restore_command(target: int | None, name: str) -> list[str]:
+            # Each clone gets its own fresh scratch of the captured geometry.
+            scratch = root / f"restore-scratch-{name}.raw"
+            _write_pattern(scratch, 1024 * 1024, 0x5A)
+            command = snapshot_restore_command(
+                executable,
+                backend,
+                snapshot_path,
+                processors=capacity,
+                restore_processors=target,
+            )
+            command.extend(
+                (
+                    "--microvm-sandbox-block",
+                    _block_arg("distro", layer, read_only=True),
+                    "--microvm-sandbox-block",
+                    _block_arg("scratch", scratch, read_only=False),
+                )
+            )
+            return command
+
+        # An untargeted restore keeps the captured boot-online prefix.
+        targets: list[int | None] = [
+            *(count for count in dict.fromkeys(processor_counts) if count <= capacity),
+            None,
+        ]
+        for target in targets:
+            name = "untargeted" if target is None else str(target)
+            online = boot_online if target is None else target
+            context = f"platform {_restore_label(target)}"
+            command = restore_command(target, name)
+            output = _measure_restore(
+                command,
+                context=context,
+                environment=environment,
+                timeout=timeout,
+                log_path=output_dir / f"platform-restore-processors-{name}.log",
+                failure_marker=RESTORE_PROCESSORS_FAILURE_MARKER,
+            )
+            if not contains_output_line(output, PLATFORM_POST_RESTORE_MARKER):
+                raise RuntimeError(f"{context} did not run the platform repair")
+            marker = f"NVX-RESTORE-PROCESSORS-OK count={online}".encode()
+            if not contains_output_line(output, marker):
+                raise RuntimeError(f"{context} did not report {marker.decode()!r}")
+            _check_restore_warp(output, processors=online, context=context)
+            _check_restore_status(output, command, processors=online, context=context)
+            _check_restore_vp_bindings(
+                output,
+                backend,
+                target=target,
+                capacity=capacity,
+            )
+            if _scratch_snapshot_fingerprint(snapshot_path) != fingerprint:
+                raise RuntimeError(f"{context} modified snapshot artifacts")
+
+        for target, reason in PLATFORM_RESTORE_PROCESSORS_REJECTED:
+            _expect_process_failure(
+                restore_command(target, f"rejected-{target}"),
+                output_dir / f"platform-restore-processors-rejected-{target}.log",
+                timeout,
+                reason,
+                forbidden_markers=(RESTORE_MARKER,),
+            )
+        if _scratch_snapshot_fingerprint(snapshot_path) != fingerprint:
+            raise RuntimeError("a refused platform restore modified snapshot artifacts")
+
+
+def _zero_fill_image(sectors: int) -> bytes:
+    """Return an image of ``sectors`` sectors whose sector N is full of the
+    byte N % 251 + 1, so that neither zeros nor another sector match it."""
+    return b"".join(bytes((sector % 251 + 1,)) * 512 for sector in range(sectors))
+
+
+def platform_zero_fill_script(image: bytes, capacity: int, scratch_length: int) -> str:
+    """Return the checks that a clone of the zero-fill platform snapshot runs:
+    reads inside, across, and past the end of ``image`` in a distro device of
+    ``capacity`` bytes, and an absent scratch of ``scratch_length`` bytes."""
+    sector = 512
+    page = 4096
+    if len(image) % sector or not len(image) % page or len(image) >= capacity:
+        raise ValueError("the image must end inside a page before the capacity")
+    image_sectors = len(image) // sector
+    across_page = len(image) // page
+    across = image[across_page * page :].ljust(page, b"\0")
+    tail_sectors = capacity // sector - image_sectors
+
+    def digest(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    return _render_script(
+        "platform-zero-fill.sh.in",
+        CAPACITY=str(capacity),
+        IMAGE_SECTORS=str(image_sectors),
+        IMAGE_SHA256=digest(image),
+        ACROSS_PAGE=str(across_page),
+        ACROSS_SHA256=digest(across),
+        TAIL_SECTORS=str(tail_sectors),
+        TAIL_SHA256=digest(bytes(tail_sectors * sector)),
+        SCRATCH_LENGTH=str(scratch_length),
+        SCRATCH_PAGES=str(scratch_length // page),
+        SCRATCH_SHA256=digest(bytes(scratch_length)),
+    )
+
+
+def run_platform_zero_fill(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Restore one platform snapshot with a shorter distro image and with its
+    fresh scratch declared absent.
+
+    The capture's distro placeholder fixes the capacity that every clone's
+    distro device presents. The clone's guest must read its image inside it,
+    zeros past its end, including in the page across it, and zeros from a
+    scratch device that stays writable but fails every write. OpenVMM must
+    refuse a longer image, an absent scratch together with a scratch file, and
+    a restore with neither before the guest runs, and must refuse the option on
+    a cold boot. No restore may change the image or the snapshot.
+    """
+    capacity = PLATFORM_ZERO_FILL_CAPACITY
+    image = _zero_fill_image(PLATFORM_ZERO_FILL_IMAGE_SECTORS)
+    script = platform_zero_fill_script(image, capacity, PLATFORM_ZERO_FILL_SCRATCH)
+    with tempfile.TemporaryDirectory(prefix="nvx-platform-zero-fill-") as temporary:
+        root = Path(temporary)
+        snapshot_path = root / "snapshot"
+        placeholder = root / "placeholder.erofs"
+        capture_scratch = root / "capture-scratch.raw"
+        image_path = root / "image.erofs"
+        longer_image = root / "longer.erofs"
+        restore_scratch = root / "restore-scratch.raw"
+        _write_pattern(placeholder, capacity, 0x3C)
+        _write_pattern(capture_scratch, PLATFORM_ZERO_FILL_SCRATCH, 0xA5)
+        image_path.write_bytes(image)
+        _write_pattern(longer_image, capacity + 512, 0xC3)
+        _write_pattern(restore_scratch, PLATFORM_ZERO_FILL_SCRATCH, 0x5A)
+        boot_command = workload_boot_command(
+            executable, backend, kernel, initrd, memory_mib, ""
+        )
+        capture_snapshot(
+            [
+                *boot_command,
+                "--snapshot-destination",
+                str(snapshot_path),
+                "--snapshot-tier",
+                "platform",
+                "--microvm-sandbox-block",
+                _block_arg("distro", placeholder, read_only=True),
+                "--microvm-sandbox-block",
+                _block_arg("scratch", capture_scratch, read_only=False),
+            ],
+            snapshot_path,
+            timeout=timeout,
+            processors=1,
+            post_restore_script=script,
+            log_path=output_dir / "platform-zero-fill-capture.log",
+        )
+        fingerprint = _scratch_snapshot_fingerprint(snapshot_path)
+
+        def restore_command(
+            distro: Path, scratch: Path | None, *, absent_scratch: bool
+        ) -> list[str]:
+            command = snapshot_restore_command(executable, backend, snapshot_path)
+            command.extend(
+                (
+                    "--microvm-sandbox-block",
+                    _block_arg("distro", distro, read_only=True),
+                )
+            )
+            if scratch is not None:
+                command.extend(
+                    (
+                        "--microvm-sandbox-block",
+                        _block_arg("scratch", scratch, read_only=False),
+                    )
+                )
+            if absent_scratch:
+                command.append("--restore-absent-scratch")
+            return command
+
+        def check_unchanged(context: str) -> None:
+            if image_path.read_bytes() != image:
+                raise RuntimeError(f"{context} changed the distro image")
+            if _scratch_snapshot_fingerprint(snapshot_path) != fingerprint:
+                raise RuntimeError(f"{context} modified snapshot artifacts")
+
+        context = "platform zero-fill restore"
+        output = _measure_restore(
+            restore_command(image_path, None, absent_scratch=True),
+            context=context,
+            environment=_restore_environment(),
+            timeout=timeout,
+            log_path=output_dir / "platform-zero-fill-restore.log",
+            failure_marker=PLATFORM_ZERO_FILL_FAILURE_MARKER,
+        )
+        for marker in (
+            PLATFORM_POST_RESTORE_MARKER,
+            PLATFORM_ZERO_FILL_IMAGE_MARKER,
+            PLATFORM_ZERO_FILL_SCRATCH_MARKER,
+        ):
+            if not contains_output_line(output, marker):
+                raise RuntimeError(f"{context} did not report {marker.decode()!r}")
+        check_unchanged(context)
+
+        rejected_commands = {
+            "longer-image": restore_command(
+                longer_image, restore_scratch, absent_scratch=False
+            ),
+            "absent-and-file": restore_command(
+                image_path, restore_scratch, absent_scratch=True
+            ),
+            "no-scratch": restore_command(image_path, None, absent_scratch=False),
+        }
+        for name, reason in PLATFORM_ZERO_FILL_REJECTED:
+            _expect_process_failure(
+                rejected_commands[name],
+                output_dir / f"platform-zero-fill-rejected-{name}.log",
+                timeout,
+                reason,
+                forbidden_markers=(RESTORE_MARKER,),
+            )
+        _expect_boot_failure(
+            [
+                *boot_command,
+                "--microvm-sandbox-block",
+                _block_arg("distro", placeholder, read_only=True),
+                "--microvm-sandbox-block",
+                _block_arg("scratch", capture_scratch, read_only=False),
+                "--restore-absent-scratch",
+            ],
+            output_dir / "platform-zero-fill-rejected-cold-boot.log",
+            timeout,
+            b"--restore-snapshot",
+        )
+        check_unchanged("a refused platform zero-fill restore")
+
+
+def platform_network_policy_script(
+    *, allowed_port: int, other_port: int, guest_port: int
+) -> str:
+    """Return the checks that each clone of the NIC template runs: it reports
+    its NIC's identity, probes the host services at ``allowed_port`` and
+    ``other_port`` of the gateway, and serves the host at ``guest_port`` until
+    the host has checked its forward."""
+    return _render_script(
+        "platform-network-policy.sh.in",
+        GATEWAY_IPV4=PLATFORM_NETWORK_GATEWAY_IPV4,
+        ALLOWED_PORT=str(allowed_port),
+        OTHER_PORT=str(other_port),
+        GUEST_PORT=str(guest_port),
+        PROBE_TIMEOUT=str(PLATFORM_NETWORK_PROBE_TIMEOUT_SECONDS),
+    )
+
+
+@dataclass(frozen=True)
+class PlatformNetworkClone:
+    """A clone of the NIC template: the policy that its restore installs, and
+    whether, under it, the guest reaches the allowed and the other host
+    service and the host reaches the guest through a forward."""
+
+    name: str
+    policy: tuple[str, ...]
+    allowed: bool
+    other: bool
+    forward: bool
+
+    def probe_report(self) -> bytes:
+        """Return the line in which the clone's guest reports its probes."""
+        report = (
+            f"allowed={'reached' if self.allowed else 'denied'} "
+            f"other={'reached' if self.other else 'denied'} "
+            f"inbound={'reached' if self.forward else 'none'}"
+        )
+        return PLATFORM_NETWORK_PROBE_PREFIX + report.encode()
+
+
+def platform_network_clones(
+    *, allowed_port: int, other_port: int, host_port: int, guest_port: int
+) -> tuple[PlatformNetworkClone, ...]:
+    """Return the clones that restore the NIC template: one without
+    connectivity, under the template's own deny-all, and three whose policies
+    lead to outcomes that differ from it and from each other's: egress rules;
+    explicit host loopback with a forward from ``host_port`` to
+    ``guest_port`` and private-network ingress; and a proxy."""
+    gateway = PLATFORM_NETWORK_GATEWAY_IPV4
+    return (
+        PlatformNetworkClone(
+            "deny-all",
+            PLATFORM_NETWORK_TEMPLATE_POLICY,
+            allowed=False,
+            other=False,
+            forward=False,
+        ),
+        PlatformNetworkClone(
+            "egress-rules",
+            (
+                "--network-egress",
+                "deny",
+                "--network-egress-allow",
+                f"{gateway}/32:tcp:{allowed_port}",
+            ),
+            allowed=True,
+            other=False,
+            forward=False,
+        ),
+        PlatformNetworkClone(
+            "forward",
+            (
+                "--network-egress",
+                "allow",
+                "--host-loopback",
+                "allow",
+                "--host-loopback-forward",
+                f"tcp:{host_port}:{guest_port}",
+                "--network-ingress",
+                "allow",
+            ),
+            allowed=True,
+            other=True,
+            forward=True,
+        ),
+        PlatformNetworkClone(
+            "proxy",
+            (
+                "--network-egress",
+                "deny",
+                "--host-loopback",
+                "deny",
+                "--network-proxy",
+                f"{gateway}:{other_port}",
+            ),
+            allowed=False,
+            other=True,
+            forward=False,
+        ),
+    )
+
+
+class _HostLoopbackService:
+    """An HTTP service on host IPv4 loopback that answers ``GET /NAME`` with
+    ``NVX-PLATFORM-NETWORK-NAME`` and counts the requests that it receives."""
+
+    def __init__(self, name: str, timeout: float) -> None:
+        self.name = name
+        self.errors: list[Exception] = []
+        self._timeout = timeout
+        self._requests = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self._listener.bind(("127.0.0.1", 0))
+            self._listener.listen(4)
+            self._listener.settimeout(0.05)
+        except BaseException:
+            self._listener.close()
+            raise
+        self.port = int(self._listener.getsockname()[1])
+        self._thread = threading.Thread(
+            target=self._serve, name=f"nvx-platform-network-{name}", daemon=True
+        )
+        self._thread.start()
+
+    def _serve(self) -> None:
+        body = f"NVX-PLATFORM-NETWORK-{self.name}".encode()
+        request_line = f"GET /{self.name} HTTP/1.".encode()
+        while not self._stop.is_set():
+            try:
+                connection, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError as error:
+                if not self._stop.is_set():
+                    self.errors.append(error)
+                return
+            with connection:
+                try:
+                    request = _read_http_request(connection, self._timeout)
+                    if not request.startswith(request_line):
+                        raise RuntimeError(
+                            f"unexpected request to the {self.name} service: "
+                            f"{request!r}"
+                        )
+                    # The guest learns that it reached the service only from
+                    # the answer, so the request counts before it.
+                    with self._lock:
+                        self._requests += 1
+                    connection.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: "
+                        + str(len(body)).encode("ascii")
+                        + b"\r\nConnection: close\r\n\r\n"
+                        + body
+                    )
+                except Exception as error:
+                    self.errors.append(error)
+
+    def take_requests(self) -> int:
+        """Return the number of requests received since the last call."""
+        with self._lock:
+            requests, self._requests = self._requests, 0
+        return requests
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=NETWORK_SERVER_JOIN_TIMEOUT_SECONDS)
+        self._listener.close()
+
+
+def _run_platform_network_clone(
+    command: list[str],
+    clone: PlatformNetworkClone,
+    *,
+    services: tuple[_HostLoopbackService, _HostLoopbackService],
+    host_port: int,
+    timeout: float,
+    log_path: Path,
+) -> None:
+    """Restore ``clone`` with ``command``, exchange a line with its guest
+    through its forward while the guest serves it, and check the identity and
+    the probes that the guest reports and the requests that the allowed and
+    the other host service in ``services`` received."""
+    context = f"platform network policy clone {clone.name}"
+    exchange = "forward" if clone.forward else "none"
+    try:
+        with OpenvmmProcess(command, log_path) as process:
+            process.wait_for_line(PLATFORM_NETWORK_LISTENING_MARKER, timeout)
+            if clone.forward:
+                _host_loopback_tcp_exchange("127.0.0.1", host_port, timeout)
+            process.send_line(f"{PLATFORM_NETWORK_CHECKED.decode()} {exchange}")
+            result = process.wait(timeout)
+    except Exception as error:
+        failures = [
+            line.decode("utf-8", "replace")
+            for line in _output_lines(
+                log_path.read_bytes() if log_path.is_file() else b""
+            )
+            if line.startswith(PLATFORM_NETWORK_FAILURE_MARKER)
+        ]
+        raise RuntimeError(
+            f"{context} failed{f': {failures[0]}' if failures else ''}; see {log_path}"
+        ) from error
+    if result.returncode != 0:
+        raise RuntimeError(f"{context} exited with {result.returncode}")
+    for marker in (
+        PLATFORM_POST_RESTORE_MARKER,
+        PLATFORM_NETWORK_IDENTITY,
+        clone.probe_report(),
+        RESTORE_MARKER,
+    ):
+        if not contains_output_line(result.output, marker):
+            raise RuntimeError(f"{context} did not report {marker.decode()!r}")
+    requests = tuple(service.take_requests() for service in services)
+    expected = (int(clone.allowed), int(clone.other))
+    if requests != expected:
+        raise RuntimeError(
+            f"{context}: the allowed and other host services received "
+            f"{requests} requests, not {expected}"
+        )
+
+
+def run_platform_network_policy(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Restore one NIC template with four network policies of its clones' own.
+
+    The template is a platform snapshot whose NIC was captured with a complete
+    deny-all policy. Each clone's restore installs another policy with
+    ``--restore-network-policy``: the template's deny-all, egress rules,
+    explicit host loopback with a forward and private-network ingress, and a
+    proxy. Each clone must keep the template's NIC identity, reach exactly the
+    host services that its policy admits, which must receive no other
+    request, and serve the host through a forward only when its policy has
+    one. OpenVMM must refuse, before the guest runs, a restore of the template
+    that keeps its policy but passes another, or explicit host loopback;
+    readdressing; a proxy at another address than the gateway; a forward
+    whose host port is busy; the option on a snapshot captured with plain
+    deny-all egress, which leaves host loopback allowed; and the option on a
+    cold boot. No restore may change the template.
+    """
+    guest_port = PLATFORM_NETWORK_GUEST_PORT
+    with ExitStack() as stack:
+        services = (
+            _HostLoopbackService("allowed", timeout),
+            _HostLoopbackService("other", timeout),
+        )
+        for service in services:
+            stack.callback(service.close)
+        allowed, other = services
+        _, host_port = _available_tcp_address()
+        clones = platform_network_clones(
+            allowed_port=allowed.port,
+            other_port=other.port,
+            host_port=host_port,
+            guest_port=guest_port,
+        )
+        root = Path(
+            stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="nvx-platform-network-policy-")
+            )
+        )
+        template = root / "template"
+        placeholder = root / "placeholder.erofs"
+        capture_scratch = root / "capture-scratch.raw"
+        _write_pattern(placeholder, PLATFORM_ZERO_FILL_CAPACITY, 0x3C)
+        _write_pattern(capture_scratch, PLATFORM_ZERO_FILL_SCRATCH, 0xA5)
+        boot_command = [
+            *workload_boot_command(
+                executable,
+                backend,
+                kernel,
+                initrd,
+                memory_mib,
+                "",
+                network=PLATFORM_NETWORK_CIDR,
+            ),
+            "--microvm-sandbox-block",
+            _block_arg("distro", placeholder, read_only=True),
+            "--microvm-sandbox-block",
+            _block_arg("scratch", capture_scratch, read_only=False),
+        ]
+
+        def capture(
+            snapshot: Path, policy: Sequence[str], post_restore_script: str | None
+        ) -> None:
+            capture_snapshot(
+                [
+                    *boot_command,
+                    *policy,
+                    "--snapshot-destination",
+                    str(snapshot),
+                    "--snapshot-tier",
+                    "platform",
+                ],
+                snapshot,
+                timeout=timeout,
+                processors=1,
+                post_restore_script=post_restore_script,
+                log_path=output_dir
+                / f"platform-network-policy-{snapshot.name}-capture.log",
+            )
+
+        capture(
+            template,
+            PLATFORM_NETWORK_TEMPLATE_POLICY,
+            platform_network_policy_script(
+                allowed_port=allowed.port,
+                other_port=other.port,
+                guest_port=guest_port,
+            ),
+        )
+        fingerprint = _scratch_snapshot_fingerprint(template)
+
+        def restore_command(snapshot: Path, *arguments: str) -> list[str]:
+            command = snapshot_restore_command(
+                executable, backend, snapshot, network_profile="portable"
+            )
+            command.extend(
+                (
+                    "--microvm-sandbox-block",
+                    _block_arg("distro", placeholder, read_only=True),
+                    "--restore-absent-scratch",
+                    *arguments,
+                )
+            )
+            return command
+
+        def check_template(context: str) -> None:
+            if _scratch_snapshot_fingerprint(template) != fingerprint:
+                raise RuntimeError(f"{context} modified the NIC template")
+            errors = [error for service in services for error in service.errors]
+            if errors:
+                raise RuntimeError(f"a host service failed by {context}") from errors[0]
+
+        check_template("the capture")
+        # The template's guest probed nothing before its capture.
+        if any(service.take_requests() for service in services):
+            raise RuntimeError("the NIC template's capture reached a host service")
+        for clone in clones:
+            _run_platform_network_clone(
+                restore_command(template, "--restore-network-policy", *clone.policy),
+                clone,
+                services=services,
+                host_port=host_port,
+                timeout=timeout,
+                log_path=output_dir / f"platform-network-policy-{clone.name}.log",
+            )
+            check_template(f"clone {clone.name}")
+
+        rejected_commands = {
+            "kept-policy": restore_command(template, "--network-egress", "allow"),
+            "kept-host-loopback": restore_command(
+                template, "--network-egress", "deny", "--host-loopback", "allow"
+            ),
+            "readdressed": restore_command(
+                template,
+                "--restore-network-policy",
+                "--net",
+                "10.1.0.2/24",
+                *PLATFORM_NETWORK_TEMPLATE_POLICY,
+            ),
+            "foreign-proxy": restore_command(
+                template,
+                "--restore-network-policy",
+                *PLATFORM_NETWORK_TEMPLATE_POLICY,
+                "--network-proxy",
+                f"10.0.0.9:{other.port}",
+            ),
+        }
+        for name, reason in PLATFORM_NETWORK_REJECTED:
+            _expect_process_failure(
+                rejected_commands[name],
+                output_dir / f"platform-network-policy-rejected-{name}.log",
+                timeout,
+                reason,
+                forbidden_markers=PLATFORM_NETWORK_GUEST_MARKERS,
+            )
+        # A forward whose host port another socket holds fails the restore.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as busy:
+            busy.bind(("127.0.0.1", 0))
+            busy.listen(1)
+            _expect_process_failure(
+                restore_command(
+                    template,
+                    "--restore-network-policy",
+                    "--host-loopback",
+                    "allow",
+                    "--host-loopback-forward",
+                    f"tcp:{busy.getsockname()[1]}:{guest_port}",
+                ),
+                output_dir / "platform-network-policy-rejected-busy-forward.log",
+                timeout,
+                PLATFORM_NETWORK_BUSY_FORWARD_REJECTION,
+                forbidden_markers=PLATFORM_NETWORK_GUEST_MARKERS,
+            )
+        # Deny-all egress alone leaves host loopback allowed, so a capture with
+        # it is no NIC template.
+        plain = root / "plain-deny-all"
+        capture(plain, ("--network-egress", "deny"), None)
+        _expect_process_failure(
+            restore_command(
+                plain, "--restore-network-policy", *PLATFORM_NETWORK_TEMPLATE_POLICY
+            ),
+            output_dir / "platform-network-policy-rejected-plain-deny-all.log",
+            timeout,
+            PLATFORM_NETWORK_NOT_TEMPLATE_REJECTION,
+            forbidden_markers=PLATFORM_NETWORK_GUEST_MARKERS,
+        )
+        _expect_boot_failure(
+            [
+                *boot_command,
+                *PLATFORM_NETWORK_TEMPLATE_POLICY,
+                "--restore-network-policy",
+            ],
+            output_dir / "platform-network-policy-rejected-cold-boot.log",
+            timeout,
+            b"--restore-snapshot",
+        )
+        check_template("a refused restore")
+        if any(service.take_requests() for service in services):
+            raise RuntimeError("a refused restore reached a host service")
+
+
+def untiered_network_policy_script(
+    *, allowed_port: int, other_port: int, guest_port: int
+) -> str:
+    """Return the checks that each restore of the NIC template without a tier
+    runs: it reports the nameservers of its resolver, whether the announcer of
+    its listeners runs, and whether it reaches the host services at
+    ``allowed_port`` and ``other_port`` of the gateway, then serves the host at
+    ``guest_port`` until the host releases it."""
+    return _render_script(
+        "untiered-network-policy.sh.in",
+        GATEWAY_IPV4=UNTIERED_NETWORK_GATEWAY_IPV4,
+        ALLOWED_PORT=str(allowed_port),
+        OTHER_PORT=str(other_port),
+        GUEST_PORT=str(guest_port),
+        MAX_CLIENTS=str(UNTIERED_NETWORK_MAX_CLIENTS),
+        PROBE_TIMEOUT=str(PLATFORM_NETWORK_PROBE_TIMEOUT_SECONDS),
+    )
+
+
+@dataclass(frozen=True)
+class UntieredNetworkRestore:
+    """A restore of the NIC template without a tier: the policy that it
+    installs; the DNS server that its guest learns from the restore packet;
+    whether its guest reaches the allowed and the other host service; and how
+    the host reaches the guest's server: through a forward, and through the
+    port that the policy publishes on host loopback, ``host-loopback``, or to
+    the host's private networks, ``private-networks``, for which the guest
+    announces its listeners."""
+
+    name: str
+    policy: tuple[str, ...]
+    dns_server: str | None
+    allowed: bool
+    other: bool
+    forward: bool
+    publication: str | None
+
+    @property
+    def announces(self) -> bool:
+        """Return whether the guest announces its listeners: whether the
+        policy publishes them."""
+        return self.publication is not None
+
+    @property
+    def network_settings(self) -> bool:
+        """Return whether the guest's repair applies network settings, after
+        which it reports the restore's completion."""
+        return self.dns_server is not None or self.announces
+
+    @property
+    def exchanges(self) -> int:
+        """Return how many lines the host exchanges with the guest's server:
+        one through the forward, and one through the published port."""
+        return int(self.forward) + int(self.announces)
+
+
+def untiered_network_restores(
+    *, allowed_port: int, host_port: int, guest_port: int
+) -> tuple[UntieredNetworkRestore, ...]:
+    """Return the restores of the NIC template without a tier: one under the
+    template's own deny-all, which names no DNS server and publishes nothing;
+    egress rules that admit DNS over IPv4 and the allowed service; explicit
+    host loopback with a forward from ``host_port`` to ``guest_port``, under
+    egress rules that admit DNS over IPv6 alone; and private-network ingress
+    with allowed egress."""
+    gateway = UNTIERED_NETWORK_GATEWAY_IPV4
+    return (
+        UntieredNetworkRestore(
+            "deny-all",
+            PLATFORM_NETWORK_TEMPLATE_POLICY,
+            dns_server=None,
+            allowed=False,
+            other=False,
+            forward=False,
+            publication=None,
+        ),
+        UntieredNetworkRestore(
+            "egress-dns",
+            (
+                "--network-egress",
+                "deny",
+                "--network-egress-allow",
+                f"{gateway}/32:udp:53",
+                "--network-egress-allow",
+                f"{gateway}/32:tcp:{allowed_port}",
+            ),
+            dns_server=gateway,
+            allowed=True,
+            other=False,
+            forward=False,
+            publication=None,
+        ),
+        UntieredNetworkRestore(
+            "host-loopback",
+            (
+                "--network-egress",
+                "deny",
+                "--network-egress-allow",
+                f"{UNTIERED_NETWORK_GATEWAY_IPV6}/128:udp:53",
+                "--host-loopback",
+                "allow",
+                "--host-loopback-forward",
+                f"tcp:{host_port}:{guest_port}",
+            ),
+            dns_server=UNTIERED_NETWORK_GATEWAY_IPV6,
+            allowed=False,
+            other=False,
+            forward=True,
+            publication="host-loopback",
+        ),
+        UntieredNetworkRestore(
+            "private-ingress",
+            (
+                "--network-egress",
+                "allow",
+                "--network-ingress",
+                "allow",
+                "--host-loopback",
+                "allow",
+            ),
+            dns_server=gateway,
+            allowed=True,
+            other=True,
+            forward=False,
+            publication="private-networks",
+        ),
+    )
+
+
+def _untiered_network_report(output: bytes, context: str) -> dict[str, str]:
+    """Return the fields of the one line in ``output`` in which a restored
+    guest reported its resolver, its announcer, and its probes."""
+    reports = [
+        line
+        for line in _output_lines(output)
+        if line.startswith(UNTIERED_NETWORK_REPORT_PREFIX)
+    ]
+    if len(reports) != 1:
+        raise RuntimeError(f"{context} printed {len(reports)} network reports, not 1")
+    fields: dict[str, str] = {}
+    text = reports[0].removeprefix(UNTIERED_NETWORK_REPORT_PREFIX)
+    for field in text.decode("ascii", "replace").split():
+        key, separator, value = field.partition("=")
+        if not separator or key in fields:
+            raise RuntimeError(f"{context} printed a malformed report: {reports[0]!r}")
+        fields[key] = value
+    if set(fields) != {"resolver", "announcer", "allowed", "other"}:
+        raise RuntimeError(f"{context} printed a malformed report: {reports[0]!r}")
+    return fields
+
+
+def _check_untiered_network_report(
+    restore: UntieredNetworkRestore, report: dict[str, str], context: str
+) -> None:
+    """Check that ``report``, the guest's, has the resolver, the announcer,
+    and the probes that ``restore``'s policy gives it. Without a DNS server,
+    the resolver keeps what the guest's image names, which is no gateway."""
+    resolver = report["resolver"]
+    nameservers = [] if resolver == "none" else resolver.split(",")
+    if restore.dns_server is not None:
+        if nameservers != [restore.dns_server]:
+            raise RuntimeError(
+                f"{context}: the guest's resolver names {resolver}, not "
+                f"{restore.dns_server}"
+            )
+    elif {UNTIERED_NETWORK_GATEWAY_IPV4, UNTIERED_NETWORK_GATEWAY_IPV6}.intersection(
+        nameservers
+    ):
+        raise RuntimeError(
+            f"{context}: the guest's resolver names {resolver}, although the "
+            "policy names no DNS server"
+        )
+    expected = {
+        "announcer": "running" if restore.announces else "none",
+        "allowed": "reached" if restore.allowed else "denied",
+        "other": "reached" if restore.other else "denied",
+    }
+    for key, value in expected.items():
+        if report[key] != value:
+            raise RuntimeError(f"{context}: the guest reported {key}={report[key]}")
+
+
+def _accepts_tcp(address: str, port: int) -> bool:
+    """Return whether a TCP connection to ``address:port`` completes."""
+    try:
+        connection = socket.create_connection((address, port), timeout=1)
+    except OSError:
+        return False
+    connection.close()
+    return True
+
+
+def _untiered_network_exchanges(
+    restore: UntieredNetworkRestore,
+    *,
+    host_port: int,
+    guest_port: int,
+    timeout: float,
+) -> int:
+    """Exchange a line with the guest's server through each way that
+    ``restore``'s policy gives the host, and return how many it exchanged.
+
+    The forward binds ``host_port`` on host loopback before the guest runs. A
+    published port is ``guest_port``, which the gateway publishes once the
+    guest's announcer has announced the server: on host loopback alone, which
+    no other host address reaches, or on every host address, through one of
+    which, other than loopback, the host reaches it as a peer on its private
+    networks would. Without an announcer, nothing publishes the guest's port.
+    """
+    exchanges = 0
+    if restore.forward:
+        _host_loopback_tcp_exchange("127.0.0.1", host_port, timeout)
+        exchanges += 1
+    if restore.publication == "host-loopback":
+        _wait_until(
+            lambda: _holds_loopback(socket.AF_INET, socket.SOCK_STREAM, guest_port),
+            timeout,
+            f"guest port {guest_port} was not published on host loopback",
+        )
+        for address in _host_ipv4_addresses():
+            if _accepts_tcp(address, guest_port):
+                raise RuntimeError(
+                    f"host-loopback access published guest port {guest_port} on "
+                    f"{address}"
+                )
+        _host_loopback_tcp_exchange("127.0.0.1", guest_port, timeout)
+        exchanges += 1
+    elif restore.publication == "private-networks":
+        addresses = _host_ipv4_addresses()
+        if not addresses:
+            raise RuntimeError(
+                "the host has no known IPv4 address other than loopback, through "
+                "which to reach the port that private-network ingress publishes"
+            )
+        # A wildcard bind fails over a loopback-only listener too, so only the
+        # exchange through another address shows the port's publication to
+        # the host's private networks.
+        _wait_until(
+            lambda: _publishes(guest_port, socket.SOCK_STREAM),
+            timeout,
+            f"guest port {guest_port} was not published to the host",
+        )
+        _host_loopback_tcp_exchange(addresses[0], guest_port, timeout)
+        exchanges += 1
+    elif _holds_loopback(socket.AF_INET, socket.SOCK_STREAM, guest_port):
+        raise RuntimeError(f"guest port {guest_port} was published without ingress")
+    return exchanges
+
+
+def _run_untiered_network_restore(
+    command: list[str],
+    restore: UntieredNetworkRestore,
+    *,
+    services: tuple[_HostLoopbackService, _HostLoopbackService],
+    host_port: int,
+    guest_port: int,
+    timeout: float,
+    log_path: Path,
+) -> None:
+    """Restore the NIC template with ``command``, which installs
+    ``restore``'s policy, exchange lines with its guest's server while the
+    guest serves the host, and check what the guest reports, whether its
+    repair applied network settings, and the requests that the allowed and the
+    other host service in ``services`` received."""
+    context = f"untiered network policy restore {restore.name}"
+    try:
+        with OpenvmmProcess(command, log_path) as process:
+            process.wait_for_line(UNTIERED_NETWORK_LISTENING_MARKER, timeout)
+            exchanges = _untiered_network_exchanges(
+                restore, host_port=host_port, guest_port=guest_port, timeout=timeout
+            )
+            process.send_line(f"{UNTIERED_NETWORK_CHECKED.decode()} {exchanges}")
+            result = process.wait(timeout)
+    except Exception as error:
+        failures = [
+            line.decode("utf-8", "replace")
+            for line in _output_lines(
+                log_path.read_bytes() if log_path.is_file() else b""
+            )
+            if line.startswith(UNTIERED_NETWORK_FAILURE_MARKER)
+        ]
+        raise RuntimeError(
+            f"{context} failed{f': {failures[0]}' if failures else ''}; see {log_path}"
+        ) from error
+    if result.returncode != 0:
+        raise RuntimeError(f"{context} exited with {result.returncode}")
+    _check_untiered_network_report(
+        restore, _untiered_network_report(result.output, context), context
+    )
+    for marker in (
+        UNTIERED_NETWORK_INBOUND_PREFIX + str(restore.exchanges).encode(),
+        RESTORE_MARKER,
+    ):
+        if not contains_output_line(result.output, marker):
+            raise RuntimeError(f"{context} did not report {marker.decode()!r}")
+    # A restore without network settings to apply finishes quietly, as a plain
+    # restore without a tier does.
+    if (
+        contains_output_line(result.output, UNTIERED_POST_RESTORE_MARKER)
+        != restore.network_settings
+    ):
+        raise RuntimeError(
+            f"{context}: the guest's repair "
+            f"{'did not report' if restore.network_settings else 'reported'} "
+            f"{UNTIERED_POST_RESTORE_MARKER.decode()!r}"
+        )
+    requests = tuple(service.take_requests() for service in services)
+    expected = (int(restore.allowed), int(restore.other))
+    if requests != expected:
+        raise RuntimeError(
+            f"{context}: the allowed and other host services received "
+            f"{requests} requests, not {expected}"
+        )
+
+
+def run_untiered_network_policy(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Restore one NIC template without a tier with four network policies.
+
+    The template is a snapshot without sandbox blocks, as the non-sandbox
+    mode captures one, whose NIC was captured with a complete deny-all
+    policy, so its guest learned no DNS server and announces no listeners.
+    Each restore installs another policy with ``--restore-network-policy``:
+    the template's deny-all; egress rules that admit DNS over IPv4 and one
+    host service; explicit host loopback with a forward, under egress rules
+    that admit DNS over IPv6 alone; and private-network ingress with allowed
+    egress. Each restore's guest must name the DNS server of its policy in its
+    resolver, and no gateway without one, run the announcer of its listeners
+    exactly when its policy publishes them, and reach exactly the host
+    services that its policy admits, which must receive no other request. The
+    host must reach the guest's server through the forward, and through the
+    port that the policy publishes: on host loopback alone, which no other
+    host address reaches, or to the host's private networks, through a host
+    address other than loopback. It must find the server on no host loopback
+    port without a publication. OpenVMM must refuse, before the guest runs, a
+    restore that keeps the template's policy but passes another, and one that
+    passes private-network ingress without the option. No restore may change
+    the template.
+    """
+    with ExitStack() as stack:
+        services = (
+            _HostLoopbackService("allowed", timeout),
+            _HostLoopbackService("other", timeout),
+        )
+        for service in services:
+            stack.callback(service.close)
+        allowed, other = services
+        guest_port = _host_loopback_publication_port()
+        _, host_port = _available_tcp_address()
+        while host_port == guest_port:
+            _, host_port = _available_tcp_address()
+        restores = untiered_network_restores(
+            allowed_port=allowed.port, host_port=host_port, guest_port=guest_port
+        )
+        root = Path(
+            stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="nvx-untiered-network-policy-")
+            )
+        )
+        template = root / "template"
+        capture_snapshot(
+            [
+                *workload_boot_command(
+                    executable,
+                    backend,
+                    kernel,
+                    initrd,
+                    memory_mib,
+                    "",
+                    network=UNTIERED_NETWORK_CIDR,
+                ),
+                *PLATFORM_NETWORK_TEMPLATE_POLICY,
+                "--snapshot-destination",
+                str(template),
+            ],
+            template,
+            timeout=timeout,
+            processors=1,
+            post_restore_script=untiered_network_policy_script(
+                allowed_port=allowed.port,
+                other_port=other.port,
+                guest_port=guest_port,
+            ),
+            log_path=output_dir / "untiered-network-policy-capture.log",
+        )
+        fingerprint = _snapshot_fingerprint(template)
+
+        def restore_command(*arguments: str) -> list[str]:
+            return [
+                *snapshot_restore_command(
+                    executable, backend, template, network_profile="portable"
+                ),
+                *arguments,
+            ]
+
+        def check_template(context: str) -> None:
+            if _snapshot_fingerprint(template) != fingerprint:
+                raise RuntimeError(f"{context} modified the NIC template")
+            errors = [error for service in services for error in service.errors]
+            if errors:
+                raise RuntimeError(f"a host service failed by {context}") from errors[0]
+
+        check_template("the capture")
+        # The template's guest probed nothing before its capture.
+        if any(service.take_requests() for service in services):
+            raise RuntimeError("the NIC template's capture reached a host service")
+        for restore in restores:
+            _run_untiered_network_restore(
+                restore_command("--restore-network-policy", *restore.policy),
+                restore,
+                services=services,
+                host_port=host_port,
+                guest_port=guest_port,
+                timeout=timeout,
+                log_path=output_dir / f"untiered-network-policy-{restore.name}.log",
+            )
+            check_template(f"restore {restore.name}")
+
+        rejected_commands = {
+            "kept-policy": restore_command("--network-egress", "allow"),
+            "ingress": restore_command(
+                *PLATFORM_NETWORK_TEMPLATE_POLICY, "--network-ingress", "allow"
+            ),
+        }
+        for name, reason in UNTIERED_NETWORK_REJECTED:
+            _expect_process_failure(
+                rejected_commands[name],
+                output_dir / f"untiered-network-policy-rejected-{name}.log",
+                timeout,
+                reason,
+                forbidden_markers=UNTIERED_NETWORK_GUEST_MARKERS,
+            )
+        check_template("a refused restore")
+        if any(service.take_requests() for service in services):
+            raise RuntimeError("a refused restore reached a host service")
+
+
+def run_platform_filesystem(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Attach a host directory to the filesystem slot that a platform snapshot
+    left dormant, and use it from the clone.
+
+    A tiered restore starts the clone's devices behind the post-restore input
+    gate. Once the guest's platform repair releases it, the guest must mount
+    the share, read the file that the host wrote, and write one that the host
+    reads. The restore may not change the snapshot.
+    """
+    with tempfile.TemporaryDirectory(prefix="nvx-platform-filesystem-") as temporary:
+        root = Path(temporary)
+        snapshot_path = root / "snapshot"
+        layer = root / "distro.erofs"
+        capture_scratch = root / "capture-scratch.raw"
+        restore_scratch = root / "restore-scratch.raw"
+        share = root / "share"
+        _write_pattern(layer, 1024 * 1024, 0x3C)
+        _write_pattern(capture_scratch, 1024 * 1024, 0xA5)
+        _write_pattern(restore_scratch, 1024 * 1024, 0x5A)
+        share.mkdir()
+        (share / "host-seed").write_bytes(PLATFORM_FILESYSTEM_HOST_SEED)
+        boot_command = workload_boot_command(
+            executable, backend, kernel, initrd, memory_mib, ""
+        )
+        # Without --mount, the capture leaves the filesystem slot dormant.
+        capture_snapshot(
+            [
+                *boot_command,
+                "--snapshot-destination",
+                str(snapshot_path),
+                "--snapshot-tier",
+                "platform",
+                "--microvm-sandbox-block",
+                _block_arg("distro", layer, read_only=True),
+                "--microvm-sandbox-block",
+                _block_arg("scratch", capture_scratch, read_only=False),
+            ],
+            snapshot_path,
+            timeout=timeout,
+            processors=1,
+            post_restore_script=_read_script("platform-filesystem.sh"),
+            log_path=output_dir / "platform-filesystem-capture.log",
+        )
+        fingerprint = _scratch_snapshot_fingerprint(snapshot_path)
+
+        command = snapshot_restore_command(executable, backend, snapshot_path)
+        command.extend(
+            (
+                "--microvm-sandbox-block",
+                _block_arg("distro", layer, read_only=True),
+                "--microvm-sandbox-block",
+                _block_arg("scratch", restore_scratch, read_only=False),
+                "--mount",
+                f"/mnt/late,{share},rw",
+            )
+        )
+        context = "platform filesystem restore"
+        output = _measure_restore(
+            command,
+            context=context,
+            environment=_restore_environment(),
+            timeout=timeout,
+            log_path=output_dir / "platform-filesystem-restore.log",
+            failure_marker=PLATFORM_FILESYSTEM_FAILURE_MARKER,
+        )
+        for marker in (PLATFORM_POST_RESTORE_MARKER, PLATFORM_FILESYSTEM_MARKER):
+            if not contains_output_line(output, marker):
+                raise RuntimeError(f"{context} did not report {marker.decode()!r}")
+        result = share / "guest-result"
+        if (
+            not result.is_file()
+            or result.read_bytes() != PLATFORM_FILESYSTEM_GUEST_RESULT
+        ):
+            raise RuntimeError(f"{context} did not write the guest's result")
+        if _scratch_snapshot_fingerprint(snapshot_path) != fingerprint:
+            raise RuntimeError(f"{context} modified snapshot artifacts")
+
+
+def run_platform_aggregate_export(
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    backend: str,
+    *,
+    memory_mib: int,
+    timeout: float,
+    output_dir: Path,
+) -> None:
+    """Attach an aggregate of host directories and files to the filesystem
+    slot that a platform snapshot left dormant, and use it from the clone.
+
+    The aggregate is the filesystem-shares scenario's: a read-write workspace
+    and a read-only tool cache, each with a denied path, a read-write data
+    directory whose root exposes only its allowed paths and whose notes alone
+    are writable, and a read-only and a read-write file. The clone keeps its
+    captured command line, so its guest mounts the aggregate itself, checks
+    each child's kind, mode, and policy through the aggregate's root, and binds
+    a directory and a file child; the host then checks that the guest changed
+    exactly what the policy lets it change. Before the guest runs, OpenVMM must
+    refuse the restores whose aggregates a cold boot refuses, and on a Windows
+    host caller ownership, and no restore may change the snapshot.
+    """
+    with tempfile.TemporaryDirectory(
+        prefix="nvx-platform-aggregate-export-"
+    ) as temporary:
+        root = Path(temporary)
+        snapshot_path = root / "snapshot"
+        layer = root / "distro.erofs"
+        capture_scratch = root / "capture-scratch.raw"
+        restore_scratch = root / "restore-scratch.raw"
+        outside = root / "outside"
+        _write_pattern(layer, 1024 * 1024, 0x3C)
+        _write_pattern(capture_scratch, 1024 * 1024, 0xA5)
+        _write_pattern(restore_scratch, 1024 * 1024, 0x5A)
+        outside.mkdir()
+        workspace, toolcache, data, files = _create_shared_trees(root)
+        settings, output = _shared_files(files)
+        toolcache_contents = _tree_contents(toolcache)
+        data_contents = _tree_contents(data)
+        files_contents = _tree_contents(files)
+        boot_command = workload_boot_command(
+            executable, backend, kernel, initrd, memory_mib, ""
+        )
+        # Without --mount or --mount-aggregate, the capture leaves the
+        # filesystem slot dormant.
+        capture_snapshot(
+            [
+                *boot_command,
+                "--snapshot-destination",
+                str(snapshot_path),
+                "--snapshot-tier",
+                "platform",
+                "--microvm-sandbox-block",
+                _block_arg("distro", layer, read_only=True),
+                "--microvm-sandbox-block",
+                _block_arg("scratch", capture_scratch, read_only=False),
+            ],
+            snapshot_path,
+            timeout=timeout,
+            processors=1,
+            post_restore_script=_read_script("platform-aggregate-export.sh"),
+            log_path=output_dir / "platform-aggregate-export-capture.log",
+        )
+        fingerprint = _scratch_snapshot_fingerprint(snapshot_path)
+
+        def restore_command(*arguments: str) -> list[str]:
+            command = snapshot_restore_command(executable, backend, snapshot_path)
+            command.extend(
+                (
+                    "--microvm-sandbox-block",
+                    _block_arg("distro", layer, read_only=True),
+                    "--microvm-sandbox-block",
+                    _block_arg("scratch", restore_scratch, read_only=False),
+                    *arguments,
+                )
+            )
+            return command
+
+        aggregate = (
+            *_aggregate_arguments(workspace, toolcache, data, files),
+            "--mount-deny",
+            str(workspace / "secrets"),
+            "--mount-deny",
+            str(toolcache / "credentials"),
+        )
+        context = "platform aggregate export restore"
+        restored = _measure_restore(
+            restore_command(*aggregate),
+            context=context,
+            environment=_restore_environment(),
+            timeout=timeout,
+            log_path=output_dir / "platform-aggregate-export-restore.log",
+            failure_marker=PLATFORM_AGGREGATE_FAILURE_MARKER,
+        )
+        for marker in (PLATFORM_POST_RESTORE_MARKER, PLATFORM_AGGREGATE_MARKER):
+            if not contains_output_line(restored, marker):
+                raise RuntimeError(f"{context} did not report {marker.decode()!r}")
+        guest_write = workspace / "from-guest"
+        if (
+            not guest_write.is_file()
+            or guest_write.read_bytes() != b"NVX-GUEST-WRITE\n"
+        ):
+            raise RuntimeError(f"{context} did not write to the read-write directory")
+        if not (workspace / "guest-directory").is_dir():
+            raise RuntimeError(f"{context} did not create the guest's directory")
+        if (workspace / "secrets" / "token").read_bytes() != b"NVX-SECRET":
+            raise RuntimeError(f"{context} changed a denied path")
+        if _tree_contents(toolcache) != toolcache_contents:
+            raise RuntimeError(f"{context} changed the read-only directory")
+        data_contents["notes one.txt"] = b"NVX-NOTES\nNVX-GUEST-NOTE\n"
+        if _tree_contents(data) != data_contents:
+            raise RuntimeError(
+                f"{context} changed the data directory beyond its writable path"
+            )
+        files_contents["results/output.txt"] = b"NVX-GUEST-OUTPUT\n"
+        if _tree_contents(files) != files_contents:
+            raise RuntimeError(
+                f"{context} changed the shared files' directories, the read-only "
+                "file, or the read-write file other than as it wrote"
+            )
+        if _scratch_snapshot_fingerprint(snapshot_path) != fingerprint:
+            raise RuntimeError(f"{context} modified snapshot artifacts")
+        workspace_contents = _tree_contents(workspace)
+
+        rejected_arguments = {
+            "overlapping-children": (
+                "--mount-aggregate",
+                "/run/nvx/shares",
+                "--mount-child",
+                f"0,{toolcache},ro",
+                "--mount-child",
+                f"1,{toolcache / 'tools'},ro",
+            ),
+            "file-in-directory": (
+                "--mount-aggregate",
+                "/run/nvx/shares",
+                "--mount-child",
+                f"0,{settings.parent},rw",
+                "--mount-child",
+                f"1,{settings},ro,file",
+            ),
+            "directory-as-file": (
+                "--mount-aggregate",
+                "/run/nvx/shares",
+                "--mount-child",
+                f"0,{settings.parent},ro,file",
+            ),
+            "file-as-directory": (
+                "--mount-aggregate",
+                "/run/nvx/shares",
+                "--mount-child",
+                f"0,{settings},ro",
+            ),
+            "repeated-name": (
+                "--mount-aggregate",
+                "/run/nvx/shares",
+                "--mount-child",
+                f"same,{workspace},rw",
+                "--mount-child",
+                f"same,{toolcache},ro",
+            ),
+            "file-policy": (*aggregate, "--mount-deny", str(output)),
+            "outside-policy": (*aggregate, "--mount-deny", str(outside)),
+            "relative-policy": (*aggregate, "--mount-deny", "secrets"),
+        }
+        rejected = [
+            (name, rejected_arguments[name], reason)
+            for name, reason in PLATFORM_AGGREGATE_REJECTED
+        ]
+        if sys.platform == "win32":
+            rejected.append(
+                (
+                    "caller-owner",
+                    (*aggregate, "--mount-owner", "caller"),
+                    PLATFORM_AGGREGATE_OWNER_REJECTION,
+                )
+            )
+        for name, arguments, reason in rejected:
+            _expect_process_failure(
+                restore_command(*arguments),
+                output_dir / f"platform-aggregate-export-rejected-{name}.log",
+                timeout,
+                reason,
+                forbidden_markers=PLATFORM_AGGREGATE_GUEST_MARKERS,
+            )
+        if _scratch_snapshot_fingerprint(snapshot_path) != fingerprint:
+            raise RuntimeError(
+                "a refused platform aggregate export restore modified snapshot "
+                "artifacts"
+            )
+        if (
+            _tree_contents(workspace) != workspace_contents
+            or _tree_contents(toolcache) != toolcache_contents
+            or _tree_contents(data) != data_contents
+            or _tree_contents(files) != files_contents
+        ):
+            raise RuntimeError(
+                "a refused platform aggregate export restore changed a shared tree"
+            )
 
 
 def run_restore_downtime(
@@ -5066,14 +7533,19 @@ RCU_STALL_SUPPRESS_PATH = "/sys/module/rcupdate/parameters/rcu_cpu_stall_suppres
 
 def canceled_capture_checks() -> str:
     """Return the guest checks after a snapshot request that OpenVMM released:
-    the time ABI status, then whether RCU stall detection is still suppressed."""
+    the time ABI status, then whether RCU stall detection is still suppressed.
+
+    They form one console line, which the shell reads whole before it runs
+    any of it, so that the terminal echoes none of it into the status lines
+    (#785).
+    """
     rcu = CANCELED_CAPTURE_RCU_PREFIX.decode()
     done = CANCELED_CAPTURE_DONE_MARKER.decode()
     # A quote pair splits each marker, so the console's echo of the command,
     # which the tty may wrap, never contains it.
     return (
-        status_script()
-        + f'echo "{rcu[:4]}""{rcu[4:]}$(cat {RCU_STALL_SUPPRESS_PATH})"; '
+        status_script().removesuffix("\n")
+        + f'; echo "{rcu[:4]}""{rcu[4:]}$(cat {RCU_STALL_SUPPRESS_PATH})"; '
         + f'echo "{done[:4]}""{done[4:]}"\n'
     )
 
@@ -5275,6 +7747,14 @@ def run_snapshot_core(
                     f"snapshot restore {restore_index} emitted a malformed temp ID"
                 )
             temp_ids.append(temp_id)
+            port_access = _single_marker_value(
+                restored.output, b"NVX-SNAPSHOT-PORT-ACCESS-"
+            )
+            if port_access != b"denied":
+                raise RuntimeError(
+                    f"snapshot restore {restore_index} started a process that reached "
+                    f"OpenVMM's ports: {port_access.decode(errors='replace')}"
+                )
             if _snapshot_fingerprint(snapshot_path) != fingerprint:
                 raise RuntimeError(
                     f"snapshot restore {restore_index} modified snapshot artifacts"
@@ -5837,6 +8317,19 @@ def run_filesystem_snapshot(
             (late_root / "guest-result").read_bytes() != b"NVX-GUEST-TO-HOST"
         ):
             raise RuntimeError("dormant filesystem late attachment failed")
+        # Only a platform snapshot's dormant slot binds an aggregate.
+        aggregate_restore = snapshot_restore_command(
+            executable, backend, dormant_snapshot
+        )
+        aggregate_restore.extend(
+            ("--mount-aggregate", "/mnt/late", "--mount-child", f"0,{late_root},rw")
+        )
+        _expect_process_failure(
+            aggregate_restore,
+            output_dir / "filesystem-dormant-aggregate.log",
+            timeout,
+            DORMANT_AGGREGATE_REJECTION,
+        )
         if _snapshot_fingerprint(dormant_snapshot) != dormant_fingerprint:
             raise RuntimeError(
                 "dormant filesystem restores modified snapshot artifacts"
@@ -5846,6 +8339,11 @@ def run_filesystem_snapshot(
         live_root.mkdir()
         open_handle = live_root / "open-handle"
         open_handle.write_bytes(b"")
+        # The guest's write through a shared mapping replaces the page, and
+        # each restore's host change replaces it in place, so that the file
+        # stays the object that the mapping holds.
+        mapped_page = live_root / "mapped-page"
+        mapped_page.write_bytes(b"NVX-HOST-INITIAL")
         live_snapshot = root / "live-snapshot"
         live_capture = [
             *workload_boot_command(
@@ -5881,6 +8379,10 @@ def run_filesystem_snapshot(
             raise RuntimeError("live filesystem source crossed the capture boundary")
         if open_handle.read_bytes() != b"NVX-HANDLE-BEFORE":
             raise RuntimeError("live filesystem source completed a post-capture write")
+        if mapped_page.read_bytes() != b"NVX-GUEST-MAPPED":
+            raise RuntimeError(
+                "live filesystem capture did not write back a dirty shared mapping"
+            )
         assert_guest_symlink(live_root / "handle-link", "open-handle")
         assert_live_exchange(live_root)
         live_fingerprint = _snapshot_fingerprint(live_snapshot)
@@ -5955,6 +8457,9 @@ def run_filesystem_snapshot(
             )
 
         for restore_index in range(2):
+            host_change = f"NVX-HOST-AFTER-{restore_index}".encode()
+            with mapped_page.open("r+b") as page:
+                page.write(host_change)
             restore_command = snapshot_restore_command(
                 executable, backend, live_snapshot
             )
@@ -5969,6 +8474,11 @@ def run_filesystem_snapshot(
                 raise RuntimeError(
                     f"live filesystem restore {restore_index} exited with "
                     f"{restored.returncode}"
+                )
+            if mapped_page.read_bytes() != host_change:
+                raise RuntimeError(
+                    f"live filesystem restore {restore_index} wrote captured "
+                    "mapped data back to the host file"
                 )
             if _snapshot_fingerprint(live_snapshot) != live_fingerprint:
                 raise RuntimeError(
@@ -6070,6 +8580,38 @@ def _shares_command(
     return command
 
 
+def _create_shared_trees(root: Path) -> tuple[Path, Path, Path, Path]:
+    """Create the workspace, the tool cache, the data directory, and the
+    directory of the shared files that the aggregate of
+    `_aggregate_arguments` shares, below `root`, and return them. Each holds
+    paths that the aggregate's policy hides or exposes, and each shared file a
+    sibling that the aggregate does not share."""
+    workspace = root / "workspace"
+    toolcache = root / "toolcache"
+    data = root / "data"
+    files = root / "files"
+    settings, output = _shared_files(files)
+    (workspace / "secrets").mkdir(parents=True)
+    (toolcache / "tools").mkdir(parents=True)
+    (toolcache / "credentials").mkdir()
+    (data / "public").mkdir(parents=True)
+    settings.parent.mkdir(parents=True)
+    output.parent.mkdir(parents=True)
+    (workspace / "seed").write_bytes(b"NVX-WORKSPACE")
+    (workspace / "secrets" / "token").write_bytes(b"NVX-SECRET")
+    (toolcache / "seed").write_bytes(b"NVX-TOOLCACHE")
+    (toolcache / "tools" / "node").write_bytes(b"NVX-TOOL")
+    (toolcache / "credentials" / "token").write_bytes(b"NVX-CREDENTIAL")
+    (data / "public" / "readme").write_bytes(b"NVX-PUBLIC")
+    (data / "notes one.txt").write_bytes(b"NVX-NOTES\n")
+    (data / "private.txt").write_bytes(b"NVX-PRIVATE")
+    settings.write_bytes(b"NVX-SETTINGS")
+    (settings.parent / "secret.json").write_bytes(b"NVX-CONFIG-SECRET")
+    output.write_bytes(b"NVX-OUTPUT\n")
+    (output.parent / "other.txt").write_bytes(b"NVX-OTHER")
+    return workspace, toolcache, data, files
+
+
 def run_filesystem_shares(
     executable: Path,
     kernel: Path,
@@ -6085,29 +8627,8 @@ def run_filesystem_shares(
     its directory, together, as the children of one aggregate."""
     with tempfile.TemporaryDirectory(prefix="nvx-filesystem-shares-") as temporary:
         root = Path(temporary)
-        workspace = root / "workspace"
-        toolcache = root / "toolcache"
-        data = root / "data"
-        files = root / "files"
+        workspace, toolcache, data, files = _create_shared_trees(root)
         settings, output = _shared_files(files)
-        (workspace / "secrets").mkdir(parents=True)
-        (toolcache / "tools").mkdir(parents=True)
-        (toolcache / "credentials").mkdir()
-        (data / "public").mkdir(parents=True)
-        settings.parent.mkdir(parents=True)
-        output.parent.mkdir(parents=True)
-        (workspace / "seed").write_bytes(b"NVX-WORKSPACE")
-        (workspace / "secrets" / "token").write_bytes(b"NVX-SECRET")
-        (toolcache / "seed").write_bytes(b"NVX-TOOLCACHE")
-        (toolcache / "tools" / "node").write_bytes(b"NVX-TOOL")
-        (toolcache / "credentials" / "token").write_bytes(b"NVX-CREDENTIAL")
-        (data / "public" / "readme").write_bytes(b"NVX-PUBLIC")
-        (data / "notes one.txt").write_bytes(b"NVX-NOTES\n")
-        (data / "private.txt").write_bytes(b"NVX-PRIVATE")
-        settings.write_bytes(b"NVX-SETTINGS")
-        (settings.parent / "secret.json").write_bytes(b"NVX-CONFIG-SECRET")
-        output.write_bytes(b"NVX-OUTPUT\n")
-        (output.parent / "other.txt").write_bytes(b"NVX-OTHER")
         toolcache_contents = _tree_contents(toolcache)
         files_contents = _tree_contents(files)
 
@@ -6609,7 +9130,7 @@ def run_filesystem_comma_paths(
     output_dir: Path,
     guest: str = "alpine",
 ) -> None:
-    """Share host directories whose paths contain commas through `nvx.py run`:
+    """Share host directories whose paths contain commas through `nvx-rs run`:
     a read-write `alpha,beta` and a read-only `2026, final`, each with a
     denied subdirectory, first each alone, as OpenVMM's `--mount`, and then
     both, as the children of an aggregate. The guest must find each exact
@@ -6638,9 +9159,7 @@ def run_filesystem_comma_paths(
             ("aggregate", (alpha, reports)),
         ):
             command = [
-                sys.executable,
-                str(Path(__file__).parents[1] / "nvx.py"),
-                "run",
+                *nvx_rs.command_line(("run",)),
                 "--guest",
                 guest,
                 "--hypervisor",
@@ -6796,6 +9315,14 @@ def run_scratch_snapshot(
             paired_restore_command(wrong_layer),
             output_dir / "scratch-paired-wrong-layer.log",
             timeout,
+            forbidden_markers=forbidden_paired,
+        )
+        # Only a platform snapshot's fresh scratch may be absent.
+        _expect_process_failure(
+            [*paired_restore_command(layer), "--restore-absent-scratch"],
+            output_dir / "scratch-paired-absent.log",
+            timeout,
+            PAIRED_ABSENT_SCRATCH_REJECTION,
             forbidden_markers=forbidden_paired,
         )
         scratch_bytes = published_scratch.read_bytes()
@@ -7400,10 +9927,19 @@ def require_debug_kernel(config: Path) -> None:
 def run(args: argparse.Namespace) -> int:
     validate_openvmm_test_backend(args.backend)
     descriptor = guest_descriptor(args.guest)
+    debug_kernel = getattr(args, "debug_kernel", False)
+    shard: tuple[int, int] | None = getattr(args, "shard", None)
+    if shard is not None and (
+        args.scenario is not None or debug_kernel or descriptor.name != "alpine"
+    ):
+        raise ScriptError(
+            "--shard runs a shard of the default Alpine suite on the default "
+            "kernel, so it takes neither --scenario, --debug-kernel, nor another "
+            "--guest"
+        )
     if args.memory_mib is None:
         args.memory_mib = descriptor.default_memory_mib
     executable = require_file(openvmm_binary_path(), "OpenVMM release binary")
-    debug_kernel = getattr(args, "debug_kernel", False)
     if debug_kernel:
         require_debug_kernel(artifact_path(KernelBuildConstants.DEBUG_CONFIG_NAME))
         kernel = require_file(
@@ -7426,13 +9962,16 @@ def run(args: argparse.Namespace) -> int:
         unsupported_scenarios.update(UBUNTU_UNSUPPORTED_SCENARIOS)
     if not descriptor.sandbox_control:
         unsupported_scenarios.update(SANDBOX_CONTROL_SCENARIOS)
-    if args.scenario is None:
+    if shard is not None:
+        # Fails unless every default scenario is in exactly one shard of every
+        # backend, and the backend has as many shards as CI runs.
+        scenarios = shard_scenarios(
+            load_partition(), args.backend, shard, default_suite()
+        )
+    elif args.scenario is None:
         defaults = DEBUG_KERNEL_SCENARIOS if debug_kernel else MICROVM_TEST_SCENARIOS
         scenarios = tuple(
-            scenario
-            for scenario in defaults
-            if scenario not in unsupported_scenarios
-            and scenario not in PUBLIC_SANDBOX_SCENARIOS
+            scenario for scenario in defaults if scenario not in unsupported_scenarios
         )
     else:
         scenarios = tuple(dict.fromkeys(args.scenario))
@@ -7445,11 +9984,72 @@ def run(args: argparse.Namespace) -> int:
                 f"{guest_label} guest does not support correctness scenario(s): "
                 + ", ".join(sorted(unsupported))
             )
+    # A default run runs the public sandbox scenarios too, so their Ubuntu
+    # artifacts must be there before any scenario runs.
+    public = [
+        scenario for scenario in scenarios if scenario in PUBLIC_SANDBOX_SCENARIOS
+    ]
+    if public:
+        try:
+            for path, description in workload_artifact_paths():
+                require_file(path, description)
+        except ScriptError as error:
+            raise ScriptError(
+                f"{error}; {', '.join(public)} "
+                f"{'reads' if len(public) == 1 else 'read'} the Ubuntu distro "
+                "layer and the sandbox scratch template: install them with "
+                "`nvx-rs download` or build them with `build-guest --guest "
+                "all`, format the template alone with `build-scratch-template` "
+                "on Linux, or name other scenarios with --scenario"
+            ) from error
 
+    with DurationReport(
+        output_dir / REPORT_NAME,
+        backend=args.backend,
+        guest=descriptor.name,
+        kernel="debug" if debug_kernel else "default",
+        processors=args.processors,
+        scenarios=scenarios,
+    ) as report:
+        _run_scenarios(
+            report,
+            args,
+            scenarios,
+            descriptor=descriptor,
+            executable=executable,
+            kernel=kernel,
+            initrd=initrd,
+            output_dir=output_dir,
+        )
+        report.finish()
+        report_time_abi_evidence(
+            output_dir,
+            backend=args.backend,
+            guest=descriptor.name,
+            debug_kernel=debug_kernel,
+        )
+        print(f"Wrote microVM correctness logs to {output_dir}")
+    return 0
+
+
+def _run_scenarios(
+    report: DurationReport,
+    args: argparse.Namespace,
+    scenarios: Collection[str],
+    *,
+    descriptor: GuestDescriptor,
+    executable: Path,
+    kernel: Path,
+    initrd: Path,
+    output_dir: Path,
+) -> None:
+    """Run the selected scenarios in their fixed order, and time each
+    execution in `report`."""
     if "guest-boot" in scenarios:
-        print(
+        report.start(
+            "guest-boot",
             f"Running {descriptor.distribution} initramfs boot correctness "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
         )
         run_guest_boot(
             executable,
@@ -7462,9 +10062,10 @@ def run(args: argparse.Namespace) -> int:
             log_path=output_dir / f"{descriptor.name}-guest-boot.log",
         )
     if "guest-identity" in scenarios:
-        print(
+        report.start(
+            "guest-identity",
             f"Running {descriptor.distribution} identity correctness "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
         )
         run_guest_identity(
             executable,
@@ -7478,9 +10079,11 @@ def run(args: argparse.Namespace) -> int:
         )
     if "console-exit" in scenarios:
         for processors in dict.fromkeys(args.processors):
-            print(
+            report.start(
+                "console-exit",
                 f"Running microVM console exit correctness ({processors} vCPU) "
-                f"on OpenVMM/{args.backend}"
+                f"on OpenVMM/{args.backend}",
+                processors=[processors],
             )
             run_console_exit(
                 executable,
@@ -7493,7 +10096,10 @@ def run(args: argparse.Namespace) -> int:
                 output_dir=output_dir,
             )
     if "console-snapshot" in scenarios:
-        print(f"Running microVM console snapshot correctness on OpenVMM/{args.backend}")
+        report.start(
+            "console-snapshot",
+            f"Running microVM console snapshot correctness on OpenVMM/{args.backend}",
+        )
         run_console_snapshot(
             executable,
             kernel,
@@ -7504,9 +10110,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "cpu-profile-fallback" in scenarios:
-        print(
+        report.start(
+            "cpu-profile-fallback",
             "Running microVM CPU profile fallback correctness on "
-            f"OpenVMM/{args.backend}"
+            f"OpenVMM/{args.backend}",
         )
         run_cpu_profile_fallback(
             executable,
@@ -7518,9 +10125,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "endpoint-policy-snapshot" in scenarios:
-        print(
+        report.start(
+            "endpoint-policy-snapshot",
             "Running microVM endpoint-policy snapshot correctness on "
-            f"OpenVMM/{args.backend}"
+            f"OpenVMM/{args.backend}",
         )
         run_endpoint_policy_snapshot(
             executable,
@@ -7532,9 +10140,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "filesystem-shares" in scenarios:
-        print(
+        report.start(
+            "filesystem-shares",
             "Running read-write, read-only, and hidden-root microVM shares "
-            f"through one aggregate on OpenVMM/{args.backend}"
+            f"through one aggregate on OpenVMM/{args.backend}",
         )
         run_filesystem_shares(
             executable,
@@ -7546,9 +10155,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "filesystem-policy" in scenarios:
-        print(
+        report.start(
+            "filesystem-policy",
             "Running microVM share write narrowing and read masking "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
         )
         run_filesystem_policy(
             executable,
@@ -7560,9 +10170,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "filesystem-comma-paths" in scenarios:
-        print(
-            "Running public nvx.py shares of host paths with commas "
-            f"on OpenVMM/{args.backend}"
+        report.start(
+            "filesystem-comma-paths",
+            "Running public nvx-rs shares of host paths with commas "
+            f"on OpenVMM/{args.backend}",
         )
         run_filesystem_comma_paths(
             args.backend,
@@ -7572,8 +10183,9 @@ def run(args: argparse.Namespace) -> int:
             guest=descriptor.name,
         )
     if "filesystem-snapshot" in scenarios:
-        print(
-            f"Running microVM filesystem snapshot correctness on OpenVMM/{args.backend}"
+        report.start(
+            "filesystem-snapshot",
+            f"Running microVM filesystem snapshot correctness on OpenVMM/{args.backend}",
         )
         run_filesystem_snapshot(
             executable,
@@ -7585,7 +10197,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "lifecycle" in scenarios:
-        print(f"Running microVM lifecycle correctness on OpenVMM/{args.backend}")
+        report.start(
+            "lifecycle",
+            f"Running microVM lifecycle correctness on OpenVMM/{args.backend}",
+        )
         run_lifecycle(
             executable,
             kernel,
@@ -7596,8 +10211,9 @@ def run(args: argparse.Namespace) -> int:
             log_path=output_dir / "lifecycle.log",
         )
     if "workload-identity" in scenarios:
-        print(
-            f"Running microVM workload identity correctness on OpenVMM/{args.backend}"
+        report.start(
+            "workload-identity",
+            f"Running microVM workload identity correctness on OpenVMM/{args.backend}",
         )
         run_workload_identity(
             executable,
@@ -7609,17 +10225,38 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "managed-exec-config" in scenarios:
-        print(
-            f"Running public managed execution configuration on OpenVMM/{args.backend}"
+        report.start(
+            "managed-exec-config",
+            f"Running public managed execution configuration on OpenVMM/{args.backend}",
         )
         run_managed_exec_configuration(
             args.backend, timeout=args.timeout, output_dir=output_dir
         )
     if "sandbox-lifecycle" in scenarios:
-        print(f"Running public managed sandbox lifecycle on OpenVMM/{args.backend}")
+        report.start(
+            "sandbox-lifecycle",
+            f"Running public managed sandbox lifecycle on OpenVMM/{args.backend}",
+        )
         run_sandbox_lifecycle(args.backend, timeout=args.timeout, output_dir=output_dir)
+    if "sandbox-proxy-only" in scenarios:
+        report.start(
+            "sandbox-proxy-only",
+            f"Running public proxy-only sandbox networking on OpenVMM/{args.backend}",
+        )
+        run_sandbox_proxy_only(
+            args.backend, timeout=args.timeout, output_dir=output_dir
+        )
+    if "sandbox-ram-upper" in scenarios:
+        report.start(
+            "sandbox-ram-upper",
+            f"Running public RAM-upper sandboxes on OpenVMM/{args.backend}",
+        )
+        run_sandbox_ram_upper(args.backend, timeout=args.timeout, output_dir=output_dir)
     if "managed-lifecycle" in scenarios:
-        print(f"Running managed microVM lifecycle on OpenVMM/{args.backend}")
+        report.start(
+            "managed-lifecycle",
+            f"Running managed microVM lifecycle on OpenVMM/{args.backend}",
+        )
         run_managed_lifecycle(
             executable,
             kernel,
@@ -7630,7 +10267,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "structured-outcome" in scenarios:
-        print(f"Running structured microVM outcomes on OpenVMM/{args.backend}")
+        report.start(
+            "structured-outcome",
+            f"Running structured microVM outcomes on OpenVMM/{args.backend}",
+        )
         run_structured_outcome(
             executable,
             kernel,
@@ -7641,9 +10281,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "l3-l4-egress-policy" in scenarios:
-        print(
-            "Running public nvx.py L3/L4 egress policy acceptance "
-            f"on OpenVMM/{args.backend}"
+        report.start(
+            "l3-l4-egress-policy",
+            "Running public nvx-rs L3/L4 egress policy acceptance "
+            f"on OpenVMM/{args.backend}",
         )
         run_l3_l4_egress_policy(
             executable,
@@ -7656,9 +10297,10 @@ def run(args: argparse.Namespace) -> int:
             guest=descriptor.name,
         )
     if "l3-l4-egress-protocols" in scenarios:
-        print(
-            "Running public nvx.py L3/L4 egress protocol acceptance "
-            f"on OpenVMM/{args.backend}"
+        report.start(
+            "l3-l4-egress-protocols",
+            "Running public nvx-rs L3/L4 egress protocol acceptance "
+            f"on OpenVMM/{args.backend}",
         )
         run_l3_l4_egress_protocols(
             executable,
@@ -7671,9 +10313,10 @@ def run(args: argparse.Namespace) -> int:
             guest=descriptor.name,
         )
     if "l3-l4-egress-port-ranges" in scenarios:
-        print(
-            "Running public nvx.py L3/L4 egress port-range acceptance "
-            f"on OpenVMM/{args.backend}"
+        report.start(
+            "l3-l4-egress-port-ranges",
+            "Running public nvx-rs L3/L4 egress port-range acceptance "
+            f"on OpenVMM/{args.backend}",
         )
         run_l3_l4_egress_port_ranges(
             executable,
@@ -7686,9 +10329,10 @@ def run(args: argparse.Namespace) -> int:
             guest=descriptor.name,
         )
     if "ipv6-egress-policy" in scenarios:
-        print(
-            "Running public nvx.py IPv6 egress policy acceptance "
-            f"on OpenVMM/{args.backend}"
+        report.start(
+            "ipv6-egress-policy",
+            "Running public nvx-rs IPv6 egress policy acceptance "
+            f"on OpenVMM/{args.backend}",
         )
         run_ipv6_egress_policy(
             executable,
@@ -7701,7 +10345,10 @@ def run(args: argparse.Namespace) -> int:
             guest=descriptor.name,
         )
     if "host-loopback-policy" in scenarios:
-        print(f"Running microVM host-loopback policy on OpenVMM/{args.backend}")
+        report.start(
+            "host-loopback-policy",
+            f"Running microVM host-loopback policy on OpenVMM/{args.backend}",
+        )
         run_host_loopback_policy(
             executable,
             kernel,
@@ -7712,7 +10359,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "private-network-ingress" in scenarios:
-        print(f"Running microVM private-network ingress on OpenVMM/{args.backend}")
+        report.start(
+            "private-network-ingress",
+            f"Running microVM private-network ingress on OpenVMM/{args.backend}",
+        )
         run_private_network_ingress(
             executable,
             kernel,
@@ -7723,7 +10373,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "denied-filesystem-paths" in scenarios:
-        print(f"Running microVM denied filesystem paths on OpenVMM/{args.backend}")
+        report.start(
+            "denied-filesystem-paths",
+            f"Running microVM denied filesystem paths on OpenVMM/{args.backend}",
+        )
         run_denied_filesystem_paths(
             executable,
             kernel,
@@ -7734,7 +10387,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "filesystem-owner" in scenarios:
-        print(f"Running microVM filesystem caller ownership on OpenVMM/{args.backend}")
+        report.start(
+            "filesystem-owner",
+            f"Running microVM filesystem caller ownership on OpenVMM/{args.backend}",
+        )
         run_filesystem_owner(
             executable,
             kernel,
@@ -7745,7 +10401,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "network-snapshot" in scenarios:
-        print(f"Running microVM network snapshot correctness on OpenVMM/{args.backend}")
+        report.start(
+            "network-snapshot",
+            f"Running microVM network snapshot correctness on OpenVMM/{args.backend}",
+        )
         run_network_snapshot(
             executable,
             kernel,
@@ -7759,9 +10418,11 @@ def run(args: argparse.Namespace) -> int:
         if scenario not in scenarios:
             continue
         for processors in dict.fromkeys(args.processors):
-            print(
+            report.start(
+                scenario,
                 f"Running microVM {scenario} correctness ({processors} vCPU) "
-                f"on OpenVMM/{args.backend}"
+                f"on OpenVMM/{args.backend}",
+                processors=[processors],
             )
             run_smp(
                 executable,
@@ -7775,7 +10436,10 @@ def run(args: argparse.Namespace) -> int:
                 counting_lapic=counting_lapic,
             )
     if "sandbox-blocks" in scenarios:
-        print(f"Running microVM sandbox-block correctness on OpenVMM/{args.backend}")
+        report.start(
+            "sandbox-blocks",
+            f"Running microVM sandbox-block correctness on OpenVMM/{args.backend}",
+        )
         run_sandbox_blocks(
             executable,
             kernel,
@@ -7786,7 +10450,10 @@ def run(args: argparse.Namespace) -> int:
             log_path=output_dir / "sandbox-blocks.log",
         )
     if "scratch-snapshot" in scenarios:
-        print(f"Running microVM scratch snapshot correctness on OpenVMM/{args.backend}")
+        report.start(
+            "scratch-snapshot",
+            f"Running microVM scratch snapshot correctness on OpenVMM/{args.backend}",
+        )
         run_scratch_snapshot(
             executable,
             kernel,
@@ -7797,7 +10464,11 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "smp-snapshot" in scenarios:
-        print(f"Running microVM SMP snapshot correctness on OpenVMM/{args.backend}")
+        report.start(
+            "smp-snapshot",
+            f"Running microVM SMP snapshot correctness on OpenVMM/{args.backend}",
+            processors=args.processors,
+        )
         run_smp_snapshot(
             executable,
             kernel,
@@ -7809,8 +10480,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "restore-processors" in scenarios:
-        print(
-            f"Running microVM restore-processor correctness on OpenVMM/{args.backend}"
+        report.start(
+            "restore-processors",
+            f"Running microVM restore-processor correctness on OpenVMM/{args.backend}",
+            processors=args.processors,
         )
         run_restore_processors(
             executable,
@@ -7822,10 +10495,107 @@ def run(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             output_dir=output_dir,
         )
+    if "platform-restore-processors" in scenarios:
+        report.start(
+            "platform-restore-processors",
+            "Running microVM platform-snapshot restore-processor correctness on "
+            f"OpenVMM/{args.backend}",
+            processors=[
+                count
+                for count in args.processors
+                if count <= PLATFORM_RESTORE_PROCESSORS_CAPACITY
+            ],
+        )
+        run_platform_restore_processors(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            args.processors,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "platform-zero-fill" in scenarios:
+        report.start(
+            "platform-zero-fill",
+            "Running microVM platform-snapshot zero-fill correctness on "
+            f"OpenVMM/{args.backend}",
+        )
+        run_platform_zero_fill(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "platform-network-policy" in scenarios:
+        report.start(
+            "platform-network-policy",
+            "Running microVM platform-snapshot network policy replacement on "
+            f"OpenVMM/{args.backend}",
+        )
+        run_platform_network_policy(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "untiered-network-policy" in scenarios:
+        report.start(
+            "untiered-network-policy",
+            "Running microVM untiered-snapshot network policy replacement on "
+            f"OpenVMM/{args.backend}",
+        )
+        run_untiered_network_policy(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "platform-filesystem" in scenarios:
+        report.start(
+            "platform-filesystem",
+            "Running microVM platform-snapshot filesystem attachment correctness "
+            f"on OpenVMM/{args.backend}",
+        )
+        run_platform_filesystem(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
+    if "platform-aggregate-export" in scenarios:
+        report.start(
+            "platform-aggregate-export",
+            "Running microVM platform-snapshot aggregate export correctness on "
+            f"OpenVMM/{args.backend}",
+        )
+        run_platform_aggregate_export(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
     if "restore-downtime" in scenarios:
-        print(
+        report.start(
+            "restore-downtime",
             "Running microVM long-downtime restore correctness on "
-            f"OpenVMM/{args.backend}"
+            f"OpenVMM/{args.backend}",
         )
         run_restore_downtime(
             executable,
@@ -7837,7 +10607,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "restore-memory" in scenarios:
-        print(f"Running microVM restore-memory correctness on OpenVMM/{args.backend}")
+        report.start(
+            "restore-memory",
+            f"Running microVM restore-memory correctness on OpenVMM/{args.backend}",
+        )
         run_restore_memory(
             executable,
             kernel,
@@ -7847,7 +10620,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "snapshot-core" in scenarios:
-        print(f"Running microVM snapshot-core correctness on OpenVMM/{args.backend}")
+        report.start(
+            "snapshot-core",
+            f"Running microVM snapshot-core correctness on OpenVMM/{args.backend}",
+        )
         run_snapshot_core(
             executable,
             kernel,
@@ -7858,7 +10634,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "snapshot-tiers" in scenarios:
-        print(f"Running microVM snapshot-tier correctness on OpenVMM/{args.backend}")
+        report.start(
+            "snapshot-tiers",
+            f"Running microVM snapshot-tier correctness on OpenVMM/{args.backend}",
+        )
         run_snapshot_tiers(
             executable,
             kernel,
@@ -7869,7 +10648,10 @@ def run(args: argparse.Namespace) -> int:
             output_dir=output_dir,
         )
     if "directional-network-policy" in scenarios:
-        print(f"Running microVM directional network policy on OpenVMM/{args.backend}")
+        report.start(
+            "directional-network-policy",
+            f"Running microVM directional network policy on OpenVMM/{args.backend}",
+        )
         run_directional_network_policy(
             executable,
             kernel,
@@ -7881,9 +10663,11 @@ def run(args: argparse.Namespace) -> int:
         )
     if "time-abi-conformance" in scenarios:
         processors = max(args.processors)
-        print(
+        report.start(
+            "time-abi-conformance",
             f"Running microVM time ABI conformance ({processors} vCPU) "
-            f"on OpenVMM/{args.backend}"
+            f"on OpenVMM/{args.backend}",
+            processors=[processors],
         )
         run_time_abi_conformance(
             executable,
@@ -7895,8 +10679,25 @@ def run(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             log_path=output_dir / "time-abi-conformance.log",
         )
+    if "time-host-correction" in scenarios:
+        report.start(
+            "time-host-correction",
+            f"Running microVM host clock correction correctness on OpenVMM/{args.backend}",
+        )
+        run_time_host_correction(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )
     if "virtio-net" in scenarios:
-        print(f"Running microVM virtio-net correctness on OpenVMM/{args.backend}")
+        report.start(
+            "virtio-net",
+            f"Running microVM virtio-net correctness on OpenVMM/{args.backend}",
+        )
         run_virtio_net(
             executable,
             kernel,
@@ -7906,12 +10707,18 @@ def run(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             log_path=output_dir / "virtio-net.log",
         )
-
-    report_time_abi_evidence(
-        output_dir,
-        backend=args.backend,
-        guest=descriptor.name,
-        debug_kernel=debug_kernel,
-    )
-    print(f"Wrote microVM correctness logs to {output_dir}")
-    return 0
+    if "command-line-limit" in scenarios:
+        report.start(
+            "command-line-limit",
+            "Running a microVM kernel command line at the guest kernel's limit "
+            f"on OpenVMM/{args.backend}",
+        )
+        run_command_line_limit(
+            executable,
+            kernel,
+            initrd,
+            args.backend,
+            memory_mib=args.memory_mib,
+            timeout=args.timeout,
+            output_dir=output_dir,
+        )

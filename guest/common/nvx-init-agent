@@ -6,9 +6,14 @@ cmdline=$(cat /proc/cmdline)
 runtime=/run/nvx
 layers=$runtime/layers
 scratch=$runtime/scratch
+# The mount point of a RAM upper, which nvx::guest::root names alike.
+tmpfs=$runtime/tmpfs
 rootfs=$runtime/rootfs
-# Mounted live shares, one per line and most recent first, so that teardown
-# unmounts them in reverse mount order.
+# The host export of a managed sandbox goes at $hostfs/root, where only root
+# can enter, as in the guest's plain path.
+hostfs=$runtime/hostfs
+# Mounted live shares, or the host export of a managed sandbox, one per line
+# and most recent first, so that teardown unmounts them in reverse mount order.
 share_mountpoints=
 
 unmount_live_shares() {
@@ -119,6 +124,20 @@ configure_cgroups() {
     fi
 }
 
+# The host's process limit, which configure_cgroups applies, holds one more
+# process than the workload's for the one-shot launcher's `unshare` parent.
+# A managed execution has no such parent, so the container cgroup gives that
+# process back.
+give_back_launcher_process() {
+    case "$pids_max" in
+        '' | *[!0-9]*) ;;
+        *)
+            echo "$((pids_max - 1))" >/sys/fs/cgroup/container/pids.max ||
+                fatal "invalid container process limit"
+            ;;
+    esac
+}
+
 mount_layer() {
     role=$1
     address=$2
@@ -141,11 +160,161 @@ mount_layer() {
     mount -t erofs -o ro "$device" "$directory" ||
         fatal "failed to mount $role layer from $device"
 
-    if [ "$expected_uuid" != "-" ]; then
+    if [ -n "$expected_uuid" ]; then
         actual_uuid=$(blkid -s UUID -o value "$device" || true)
         [ "$actual_uuid" = "$expected_uuid" ] ||
             fatal "$role layer UUID is $actual_uuid, expected $expected_uuid"
     fi
+}
+
+# Returns whether $1 is a UUID in its canonical text: 32 lowercase hexadecimal
+# digits in groups of 8, 4, 4, 4, and 12, joined by hyphens.
+is_canonical_uuid() {
+    case "$1" in
+        # The shape fixes four hyphens, so a fifth would stand for a digit.
+        *[!0-9a-f-]* | *-*-*-*-*-*) return 1 ;;
+        ????????-????-????-????-????????????) return 0 ;;
+    esac
+    return 1
+}
+
+# Reads the value of the nvx_layer token for read_root_tokens:
+# distro,0xd0003000,FORMAT[:IDENTITY], where this init accepts only the erofs
+# format, with or without the filesystem UUID that the image must have.
+read_layer_token() {
+    layer_image=${1#distro,0xd0003000,}
+    case "$1" in
+        distro,0xd0003000,*,*) ;;
+        distro,0xd0003000,erofs)
+            layer_uuid=
+            return 0
+            ;;
+        distro,0xd0003000,erofs:*)
+            layer_uuid=${layer_image#erofs:}
+            is_canonical_uuid "$layer_uuid" ||
+                fatal "the nvx_layer kernel parameter names an invalid EROFS filesystem UUID: '$layer_uuid'"
+            return 0
+            ;;
+        distro,0xd0003000,gpt | distro,0xd0003000,gpt:*)
+            fatal "nvx_layer=$1 names a GPT image, which this init cannot assemble: it assembles only an EROFS image"
+            ;;
+        distro,0xd0003000,*)
+            layer_format=${layer_image%%:*}
+            # The form without a format names the UUID in its place.
+            if [ -z "$layer_format" ] || is_canonical_uuid "$layer_format"; then
+                fatal "the nvx_layer kernel parameter names no image format, erofs or gpt: '$1'"
+            fi
+            fatal "the nvx_layer kernel parameter names the unsupported image format '$layer_format'"
+            ;;
+    esac
+    fatal "the nvx_layer kernel parameter must be distro,0xd0003000,FORMAT[:IDENTITY], not '$1'"
+}
+
+# Reads the boot tokens of the layered root, with the rules of the host's
+# renderer, nvx::protocol::root: nvx_layer names the image of the distro block
+# device, and nvx_scratch=0xd0006000,ext4 or nvx_overlay_upper=ramfs the upper,
+# each once. This init assembles only an EROFS image, so it also refuses a GPT
+# image. Sets layer_uuid to the filesystem UUID that the image must have, or to
+# nothing if the token names none, and upper to scratch or ram. The parser also
+# refuses a RAM upper beside a scratch block device, which this init checks
+# against the kernel's devices instead, with refuse_scratch_device. The tests
+# replay nvx-rs/tests/fixtures/root-tokens.json through it.
+read_root_tokens() {
+    layer_seen=false
+    scratch_seen=false
+    ram_seen=false
+    layer_uuid=
+    # Kernel command-line tokens are deliberately split on spaces.
+    # shellcheck disable=SC2086
+    set -f
+    for token in $cmdline; do
+        case "$token" in
+            nvx_layer | nvx_scratch | nvx_overlay_upper)
+                fatal "the $token kernel parameter has no value"
+                ;;
+            nvx_layer=*)
+                [ "$layer_seen" = false ] ||
+                    fatal "the nvx_layer kernel parameter is repeated"
+                layer_seen=true
+                read_layer_token "${token#*=}"
+                ;;
+            nvx_scratch=*)
+                [ "$scratch_seen" = false ] ||
+                    fatal "the nvx_scratch kernel parameter is repeated"
+                scratch_seen=true
+                [ "${token#*=}" = 0xd0006000,ext4 ] ||
+                    fatal "the nvx_scratch kernel parameter must be 0xd0006000,ext4, not '${token#*=}'"
+                ;;
+            nvx_overlay_upper=*)
+                [ "$ram_seen" = false ] ||
+                    fatal "the nvx_overlay_upper kernel parameter is repeated"
+                ram_seen=true
+                [ "${token#*=}" = ramfs ] ||
+                    fatal "the nvx_overlay_upper kernel parameter must be ramfs, not '${token#*=}'"
+                ;;
+        esac
+    done
+    set +f
+    [ "$scratch_seen" = false ] || [ "$ram_seen" = false ] ||
+        fatal "a layered root has one upper, but the command line names both nvx_scratch and nvx_overlay_upper"
+    [ "$layer_seen" = true ] ||
+        fatal "the command line names no distro layer: this init needs nvx_layer=distro,0xd0003000,erofs[:UUID]"
+    if [ "$scratch_seen" = true ]; then
+        upper=scratch
+    elif [ "$ram_seen" = true ]; then
+        upper=ram
+    else
+        fatal "the nvx_layer kernel parameter needs an upper, nvx_scratch or nvx_overlay_upper"
+    fi
+}
+
+# Fails if the kernel has a virtio-mmio device at the scratch block device's
+# MMIO base, 0xd0006000, which a RAM upper must not have. nvx::protocol::root
+# reads the devices from the virtio_mmio.device= parameters of the command
+# line, with the kernel's rules; this init asks the kernel instead, which lists
+# the window of each device that it added in /proc/iomem, where
+# resolve_block_device finds them too.
+refuse_scratch_device() {
+    scratch_address=$(printf '%d' 0xd0006000)
+    while IFS=' ' read -r range separator platform _; do
+        [ "$separator" = : ] || continue
+        case "$platform" in virtio-mmio.*) ;; *) continue ;; esac
+        start=$(printf '%d' "0x${range%%-*}") || continue
+        [ "$start" -ne "$scratch_address" ] ||
+            fatal "a RAM upper takes no scratch block device, but the kernel has a virtio-mmio device at 0xd0006000"
+    done </proc/iomem
+}
+
+# Mounts the upper that read_root_tokens read, and creates the overlay's upper
+# and work directories on it: the ext4 scratch disk at 0xd0006000, or a tmpfs,
+# with the mode of an ext4 scratch's root rather than tmpfs's world-writable
+# default, and with the kernel's default size, half of the guest's RAM, as
+# nvx::guest::root mounts them. Sets upper_point to the upper's mount point,
+# and upper_name to what messages call it. A tmpfs upper's pages are charged to
+# the memory cgroup of the process that writes them, so the workload's writes
+# count against its nvx_memory_max.
+mount_upper() {
+    case "$upper" in
+        scratch)
+            upper_point=$scratch
+            upper_name=scratch
+            mkdir -p "$upper_point"
+            scratch_device=$(resolve_block_device 0xd0006000) ||
+                fatal "scratch device at 0xd0006000 did not appear"
+            blockdev --flushbufs "$scratch_device" ||
+                fatal "failed to drop cached blocks for scratch"
+            mount -t ext4 -o rw,nosuid,nodev "$scratch_device" "$upper_point" ||
+                fatal "failed to mount scratch from $scratch_device"
+            ;;
+        ram)
+            upper_point=$tmpfs
+            upper_name="the tmpfs upper"
+            mkdir -p "$upper_point"
+            mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$upper_point" ||
+                fatal "failed to mount the tmpfs upper"
+            ;;
+    esac
+    mkdir -p "$upper_point/upper" "$upper_point/work"
 }
 
 validate_share_target() {
@@ -156,13 +325,17 @@ validate_share_target() {
     case "$1/" in
         //* | *//* | */./* | */../*) fatal "live share target is not canonical: $1" ;;
     esac
+    # nvx::protocol::share::RESERVED_TARGET_CHARACTERS lists the same
+    # characters: Linux reads a double quote as a quote, which could make it
+    # read the rest of the command line as part of the target's token.
     case "$1" in
-        *[\\=,]*) fatal "live share target contains a reserved character: $1" ;;
+        *[\\=,\"]*) fatal "live share target contains a reserved character: $1" ;;
     esac
     # The container runtime mounts or binds these paths after the share, so a
     # share there would be shadowed or would expose host data to runtime writes.
+    # It also creates /run and /run/nvx, and binds its time state over /run/nvx/time.
     case "$1" in
-        /proc | /proc/* | /sys | /sys/* | /dev | /dev/* | /.nvx-agent | /.nvx-agent/* | /etc | /etc/machine-id | /etc/machine-id/*)
+        /proc | /proc/* | /sys | /sys/* | /dev | /dev/* | /.nvx-agent | /.nvx-agent/* | /etc | /etc/machine-id | /etc/machine-id/* | /run | /run/nvx | /run/nvx/time | /run/nvx/time/*)
             fatal "live share target is reserved: $1"
             ;;
     esac
@@ -386,8 +559,77 @@ mount_live_shares() {
     set +f
 }
 
-# Unmount in dependency order: the live shares are children of the overlay,
-# and the overlay uses the layers and scratch.
+# Mounts the host's virtio-fs export of a managed sandbox, from which its
+# guest agent maps host paths into the container rootfs as the mapping table
+# that the host sends once the control session is ready orders them. OpenVMM
+# appends one virtfs_dir=, virtfs_tag=, virtfs_mode= triplet and
+# virtfs_aggregate=1 for the export, whose root lists one child per host
+# directory or file. It goes at $hostfs/root, where only root can enter, so
+# that a workload reaches host paths only through their mappings. The agent
+# reads the nvx_maps= count itself, and nvx_share= tokens, which place the
+# children of a one-shot sandbox, are refused. Every token is checked before
+# anything is mounted.
+mount_host_export() {
+    export_dir=
+    export_tag=
+    export_mode=
+    export_fields=0
+    export_aggregate=false
+    # Kernel command-line tokens are deliberately split on spaces.
+    # shellcheck disable=SC2086
+    set -f
+    for token in $cmdline; do
+        case "$token" in
+            virtfs_dir=?*)
+                export_dir=${token#*=}
+                export_fields=$((export_fields + 1))
+                ;;
+            virtfs_tag=?*)
+                export_tag=${token#*=}
+                export_fields=$((export_fields + 1))
+                ;;
+            virtfs_mode=?*)
+                export_mode=${token#*=}
+                export_fields=$((export_fields + 1))
+                ;;
+            virtfs_dir=* | virtfs_tag=* | virtfs_mode=*)
+                set +f
+                fatal "host export bootstrap is incomplete"
+                ;;
+            virtfs_aggregate=1) export_aggregate=true ;;
+            nvx_share=*)
+                set +f
+                fatal "a managed sandbox maps its live shares from the host's mapping table, not from nvx_share= tokens"
+                ;;
+        esac
+    done
+    set +f
+    if [ "$export_fields" -eq 0 ] && [ "$export_aggregate" = false ]; then
+        return 0
+    fi
+    [ "$export_fields" -eq 3 ] && [ "$export_aggregate" = true ] ||
+        fatal "host export bootstrap is incomplete"
+    [ "$export_dir" = "$hostfs/root" ] ||
+        fatal "the host export must be mounted at $hostfs/root"
+    case "$export_tag" in
+        '' | *[!A-Za-z0-9_-]*) fatal "host export tag is invalid" ;;
+    esac
+    case "$export_mode" in
+        ro | rw) ;;
+        *) fatal "host export mode is unsupported: $export_mode" ;;
+    esac
+    if ! (umask 077 && mkdir "$hostfs") || ! mkdir "$export_dir"; then
+        fatal "failed to create the host export directory"
+    fi
+    mount -t virtiofs -o "$export_mode,nosuid,nodev" "$export_tag" "$export_dir" ||
+        fatal "failed to mount the host export $export_tag"
+    record_live_share "$export_dir"
+    echo "NVX-SANDBOX-EXPORT: mode=$export_mode tag=$export_tag"
+}
+
+# Unmount in dependency order: the live shares are children of the overlay, as
+# are the mappings that a managed sandbox's agent unmounts in its own mount
+# namespace before it returns, and the overlay uses the layers and the upper.
 teardown() {
     status=$1
     rm -f "$runtime/container.pid" "$runtime/workload-machine-id"
@@ -396,15 +638,13 @@ teardown() {
         echo "NVX-SANDBOX-ERROR: failed to unmount the container overlay" >&2
         status=1
     fi
-    for role in custom runtime distro; do
-        directory=$layers/$role
-        if mountpoint -q "$directory" && ! umount "$directory"; then
-            echo "NVX-SANDBOX-ERROR: failed to unmount the $role layer" >&2
-            status=1
-        fi
-    done
-    if ! umount "$scratch"; then
-        echo "NVX-SANDBOX-ERROR: failed to unmount scratch" >&2
+    directory=$layers/distro
+    if mountpoint -q "$directory" && ! umount "$directory"; then
+        echo "NVX-SANDBOX-ERROR: failed to unmount the distro layer" >&2
+        status=1
+    fi
+    if ! umount "$upper_point"; then
+        echo "NVX-SANDBOX-ERROR: failed to unmount $upper_name" >&2
         status=1
     fi
     echo "NVX-SANDBOX-EXIT: status=$status"
@@ -414,88 +654,26 @@ teardown() {
     done
 }
 
-mkdir -p "$layers" "$scratch" "$rootfs"
+mkdir -p "$layers" "$rootfs"
 # init mounts /run before the time ABI boot check, whose state lives there.
 mountpoint -q /run || mount -t tmpfs -o mode=755,nosuid,nodev tmpfs /run ||
     fatal "failed to mount runtime tmpfs"
-mkdir -p "$layers" "$scratch" "$rootfs"
+mkdir -p "$layers" "$rootfs"
 configure_cgroups
 
 layer_capacity=$(cmdline_value nvx_layer_capacity_sectors || true)
-distro=false
-runtime_layer=false
-custom=false
-layer_count=0
-# Kernel command-line tokens are deliberately split on spaces.
-# shellcheck disable=SC2086
-set -f
-for token in $cmdline; do
-    case "$token" in
-        nvx_layer=*)
-            specification=${token#*=}
-            role=${specification%%,*}
-            remainder=${specification#*,}
-            [ "$remainder" != "$specification" ] ||
-                fatal "layer specification lacks an MMIO address"
-            address=${remainder%%,*}
-            expected_uuid=${remainder#*,}
-            [ "$expected_uuid" != "$remainder" ] ||
-                fatal "$role layer specification lacks an EROFS UUID"
-            case "$role" in
-                distro)
-                    [ "$distro" = false ] || fatal "duplicate distro layer"
-                    distro=true
-                    ;;
-                runtime)
-                    [ "$runtime_layer" = false ] || fatal "duplicate runtime layer"
-                    runtime_layer=true
-                    ;;
-                custom)
-                    [ "$custom" = false ] || fatal "duplicate custom layer"
-                    custom=true
-                    ;;
-                *) fatal "unknown layer role: $role" ;;
-            esac
-            layer_count=$((layer_count + 1))
-            [ "$layer_count" -le 3 ] || fatal "at most three layers are supported"
-            set +f
-            mount_layer "$role" "$address" "$expected_uuid" "$layer_capacity"
-            set -f
-            ;;
-    esac
-done
-set +f
-[ "$layer_count" -gt 0 ] || fatal "at least one EROFS layer is required"
+read_root_tokens
+# A RAM upper is refused beside a scratch block device before anything mounts.
+[ "$upper" = scratch ] || refuse_scratch_device
+mount_layer distro 0xd0003000 "$layer_uuid" "$layer_capacity"
+layer_count=1
 
-lowerdirs=
-if [ "$distro" = true ]; then
-    lowerdirs=$layers/distro
-fi
-if [ "$runtime_layer" = true ]; then
-    lowerdirs=$layers/runtime${lowerdirs:+:$lowerdirs}
-fi
-if [ "$custom" = true ]; then
-    lowerdirs=$layers/custom${lowerdirs:+:$lowerdirs}
-fi
+lowerdirs=$layers/distro
 
-scratch_spec=$(cmdline_value nvx_scratch || true)
-[ -n "$scratch_spec" ] || fatal "a scratch device is required"
-scratch_address=${scratch_spec%%,*}
-scratch_fstype=${scratch_spec#*,}
-if [ "$scratch_fstype" = "$scratch_spec" ]; then
-    scratch_fstype=ext4
-fi
-[ "$scratch_fstype" = ext4 ] || fatal "unsupported scratch filesystem: $scratch_fstype"
-scratch_device=$(resolve_block_device "$scratch_address") ||
-    fatal "scratch device at $scratch_address did not appear"
-blockdev --flushbufs "$scratch_device" ||
-    fatal "failed to drop cached blocks for scratch"
-mount -t ext4 -o rw,nosuid,nodev "$scratch_device" "$scratch" ||
-    fatal "failed to mount scratch from $scratch_device"
-mkdir -p "$scratch/upper" "$scratch/work"
+mount_upper
 
 mount -t overlay overlay \
-    -o "lowerdir=$lowerdirs,upperdir=$scratch/upper,workdir=$scratch/work,metacopy=on,xino=on" \
+    -o "lowerdir=$lowerdirs,upperdir=$upper_point/upper,workdir=$upper_point/work,metacopy=on,xino=on" \
     "$rootfs" || fatal "failed to assemble the container overlay"
 
 entrypoint=$(cmdline_value nvx_entrypoint || true)
@@ -545,11 +723,18 @@ case "$workload_lifecycle" in
     *) fatal "unsupported workload lifecycle: $workload_lifecycle" ;;
 esac
 
-mount_live_shares
-workload_machine_id=$(tr -d - </proc/sys/kernel/random/uuid)
-printf '%s\n' "$workload_machine_id" >"$runtime/workload-machine-id"
+# A one-shot sandbox binds its live shares now, as their boot tokens place
+# them, and a managed sandbox's agent maps them from the host export once the
+# host sends their mapping table.
+case "$workload_lifecycle" in
+    managed) mount_host_export ;;
+    *) mount_live_shares ;;
+esac
 
 if [ "$workload_lifecycle" = managed ]; then
+    # The managed agent enters each execution itself, as the first process of
+    # its own PID namespace, and generates the workload's machine ID.
+    give_back_launcher_process
     echo "NVX-SANDBOX-READY: managed layers=$layer_count"
     # The agent returns after a stop request, so managed sandboxes share the
     # one-shot teardown instead of powering off with their mounts in place.
@@ -560,6 +745,9 @@ if [ "$workload_lifecycle" = managed ]; then
         status=$?
     teardown "$status"
 fi
+
+workload_machine_id=$(tr -d - </proc/sys/kernel/random/uuid)
+printf '%s\n' "$workload_machine_id" >"$runtime/workload-machine-id"
 
 set -- "$entrypoint"
 # Kernel command-line tokens are deliberately split on spaces.

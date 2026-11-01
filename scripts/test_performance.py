@@ -3,22 +3,35 @@
 
 import contextlib
 import copy
+import hashlib
 import io
 import json
+import os
 import re
 import statistics
+import struct
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
-from collections.abc import Sequence
+import zipfile
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import nvx  # noqa: E402
-from nvx_tools import benchmark, benchmark_host, performance  # noqa: E402
+from nvx_tools import (  # noqa: E402
+    benchmark,
+    benchmark_host,
+    performance,
+    performance_history,
+)
 from nvx_tools.common import sha256_file  # noqa: E402
+from nvx_tools.nightly_ci import GitHubApiError  # noqa: E402
 
 COLD_START_LOG = """
     base                     :    101.0 ms  (min 100, max 102, n=5)
@@ -35,7 +48,10 @@ COLD_START_LOG = """
 VIRTFS_LOG = """
     rw live host directory      write    500.0 MB/s  (min 490, max 510, n=3)
                                                             read   1,200.0 MB/s  (min 1100, max 1300, n=3)
+    write samples                     : 490.0, 500.0, 510.0 MB/s
+    read samples                      : 1100.0, 1200.0, 1300.0 MB/s
     live exchange (cold each)         :     200 ms  (min 190, max 210, n=3)
+    exchange samples                  : 190.000, 200.000, 210.000 ms
 """
 
 DEVICE_IO_LOG = """
@@ -101,22 +117,26 @@ SHELL_SNAPSHOT_LOG = """
 == 128 MiB ==
     cold boot           : median   520.0 ms   (min 510.0, max 530.0, n=5)
     snapshot restore    : median     5.5 ms   (min 5.3, max 5.7, n=5)
+    restore samples     : 5.300, 5.400, 5.500, 5.600, 5.700 ms
     speedup             : 95x (fast-path cold) .. 95x (median cold) faster via snapshot
 
 == 256 MiB ==
     cold boot           : median   540.0 ms   (min 530.0, max 550.0, n=5)
     snapshot restore    : median     6.0 ms   (min 5.8, max 6.2, n=5)
+    restore samples     : 5.800, 5.900, 6.000, 6.100, 6.200 ms
     speedup             : 90x (fast-path cold) .. 90x (median cold) faster via snapshot
 
 == 512 MiB ==
     cold boot           : median   580.0 ms   (min 570.0, max 590.0, n=5)
     snapshot restore    : median     7.0 ms   (min 6.8, max 7.2, n=5)
+    restore samples     : 6.800, 6.900, 7.000, 7.100, 7.200 ms
     speedup             : 83x (fast-path cold) .. 83x (median cold) faster via snapshot
 """
 
 SHELL_SNAPSHOT_RESTORE_LOG = """
 == 512 MiB ==
     snapshot restore    : median     7.0 ms   (p95 7.2, min 6.8, max 7.2, n=5)
+    restore samples     : 6.800, 6.900, 7.000, 7.100, 7.200 ms
 """
 
 
@@ -357,6 +377,34 @@ WHP_RUNNER_HOST: dict[str, object] = {
 }
 KVM_SERIES = "linux-kvm-virtual-machine"
 WHP_SERIES = "windows-whp-virtual-machine"
+MSHV_SERIES = "linux-mshv-virtual-machine"
+# azure-mshv-4, the MSHV benchmark runner, on 2026-10-28 (#980): its kernel
+# and the Microsoft hypervisor beneath it, which CPUID leaf 0x40000002 reports.
+MSHV_RUNNER_HOST: dict[str, object] = {
+    **copy.deepcopy(KVM_RUNNER_HOST),
+    "runner_name": "azure-mshv-4",
+    "machine_name": "esaurez-nvx-ci-linux-vmss000005",
+    "os": "Linux-6.18.34.mshv3-1.azl3-x86_64-with-glibc2.38",
+    "os_version": {
+        "system": "Linux",
+        "release": "6.18.34.mshv3-1.azl3",
+        "revision": None,
+    },
+    "hypervisor": {"vendor": "Microsoft Hv", "build": "10.0.26100.9444"},
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "cpu": {
+        "vendor": "GenuineIntel",
+        "family": 6,
+        "model": 207,
+        "stepping": 2,
+        "microcode": "0xffffffff",
+    },
+    "memory_bytes": 33186406400,
+}
+# The provenance that NVX recorded before it read the hypervisor.
+MSHV_RUNNER_HOST_BEFORE_980 = {
+    key: value for key, value in MSHV_RUNNER_HOST.items() if key != "hypervisor"
+}
 
 
 def changed_host(
@@ -452,6 +500,80 @@ def validate_attempt(source: Path, log: Path) -> int:
                 str(log),
             ]
         )
+
+
+# 256 MiB restores of the Linux/MSHV platform job of CI run 37212738981: a host
+# stall delayed the warmup and the first six samples and failed the gate (#345).
+STALLED_RESTORE_MS = [
+    85.689,
+    74.955,
+    69.875,
+    72.078,
+    107.193,
+    47.428,
+    37.112,
+    37.751,
+    36.336,
+    36.276,
+]
+# 512 MiB restores of CI run 39844925001 on azure-mshv-4: only the last two
+# samples escaped the stall, so only the gap limit sees it.
+LATE_RECOVERY_RESTORE_MS = [66.6, 68.9, 82.1, 65.9, 66.7, 64.2, 63.8, 62.6, 44.0, 43.2]
+# The rerun of CI run 37212738981's 256 MiB restores.
+STABLE_RESTORE_MS = [37.2, 36.5, 36.5, 35.6, 36.2, 36.4, 35.7, 35.7, 37.1, 36.6]
+# 256 MiB restores of CI run 38296918379 on azure-kvm-2. Both modes are usual
+# on the KVM runners.
+BIMODAL_KVM_RESTORE_MS = [58.9, 29.1, 59.6, 28.8, 26.9, 54.2, 61.8, 26.1, 59.1, 64.9]
+
+
+def shell_snapshot_log(restores: dict[int, Sequence[float]]) -> str:
+    """Render shell-snapshot.log as the harness writes it: each series' sample
+    lines precede the section that summarizes it."""
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        for memory_mib, restored in restores.items():
+            for index, value in enumerate(restored, 1):
+                print(f"  sample {index}/{len(restored)}: {value:.3f} ms")
+            cold = [300.0 + index for index in range(len(restored))]
+            benchmark._print_shell_snapshot_summary(memory_mib, cold, restored)
+    return output.getvalue()
+
+
+def shell_snapshot_restore_log(restores: dict[int, Sequence[float]]) -> str:
+    """Render shell-snapshot-restore.log as the restore-only suite writes it."""
+    lines: list[str] = []
+    for memory_mib, restored in restores.items():
+        lines.extend(
+            f"  sample {index}/{len(restored)}: {value:.3f} ms"
+            for index, value in enumerate(restored, 1)
+        )
+        lines.extend(
+            (
+                f"== {memory_mib} MiB ==",
+                benchmark._format_shell_snapshot_line("snapshot restore", restored),
+                benchmark._format_restore_samples_line(restored),
+                "",
+            )
+        )
+    return "\n".join(lines)
+
+
+def git_repository(path: Path) -> Callable[..., str]:
+    """Initialize a git repository at ``path`` and return a git runner for it."""
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "user.name", "test")
+    git("config", "commit.gpgsign", "false")
+    return git
 
 
 class PerformanceTests(unittest.TestCase):
@@ -551,6 +673,38 @@ class PerformanceTests(unittest.TestCase):
             | performance.LIFECYCLE_METRICS
             | performance.DEVICE_IO_METRIC_NAMES,
         )
+
+    def test_documented_gate_thresholds_match_ci_and_cli(self):
+        repository = Path(__file__).parents[1]
+        workflow = (repository / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        threshold, tolerance = (
+            re.findall(rf"^[ \t]*{name}:[ \t]*(\d+)[ \t]*$", workflow, re.MULTILINE)
+            for name in (
+                "PERFORMANCE_REGRESSION_THRESHOLD",
+                "PERFORMANCE_REGRESSION_ABSOLUTE_TOLERANCE_MS",
+            )
+        )
+        benchmarks, usage = (
+            " ".join((repository / "doc" / name).read_text(encoding="utf-8").split())
+            for name in ("benchmarks.md", "usage.md")
+        )
+        defaults = nvx.parse_args(
+            ["performance", "gate", "--baseline-dir", "base", "--target-dir", "target"]
+        )
+        threshold_default = f"{defaults.threshold:g}"
+        tolerance_default = f"{defaults.absolute_tolerance_ms:g}"
+
+        self.assertEqual(len(threshold), 1)
+        self.assertEqual(len(tolerance), 1)
+        self.assertIn(f"more than {threshold[0]}% worse", benchmarks)
+        self.assertIn(f"more than {tolerance[0]} ms slower", benchmarks)
+        self.assertIn(
+            f"defaults to {threshold_default}% and {tolerance_default} ms", benchmarks
+        )
+        self.assertIn(f"`--threshold` to `{threshold_default}`", usage)
+        self.assertIn(f"`--absolute-tolerance-ms` to `{tolerance_default}`", usage)
 
     def test_collect_cli_accepts_lifecycle_input(self):
         args = nvx.parse_args(
@@ -981,7 +1135,7 @@ class PerformanceTests(unittest.TestCase):
                     ]
                 )
 
-        self.assertEqual(status, performance.UNSTABLE_LIFECYCLE_EXIT_CODE)
+        self.assertEqual(status, performance.UNSTABLE_EXIT_CODE)
         self.assertEqual(status, 75)
         self.assertIn("unstable snapshot generation", stderr.getvalue())
 
@@ -1009,6 +1163,359 @@ class PerformanceTests(unittest.TestCase):
 
         self.assertEqual(status, 2)
         self.assertIn("does not match platform", stderr.getvalue())
+
+    def test_restore_samples_come_from_the_section_of_their_series(self):
+        # Each series' sample lines precede its section, inside the previous
+        # one; only the listed samples belong to a section.
+        log = shell_snapshot_log(
+            {
+                128: STABLE_RESTORE_MS,
+                256: STALLED_RESTORE_MS,
+                512: LATE_RECOVERY_RESTORE_MS,
+            }
+        )
+
+        self.assertEqual(
+            performance._shell_snapshot_restore_samples(log, "shell-snapshot.log"),
+            {
+                128: STABLE_RESTORE_MS,
+                256: STALLED_RESTORE_MS,
+                512: LATE_RECOVERY_RESTORE_MS,
+            },
+        )
+        # Logs that passed through Windows tools keep CRLF line ends.
+        self.assertEqual(
+            performance._shell_snapshot_restore_samples(
+                log.replace("\n", "\r\n"), "shell-snapshot.log"
+            )[256],
+            STALLED_RESTORE_MS,
+        )
+        self.assertEqual(
+            performance._parse_shell_snapshot(log)["shell_snapshot_restore_256_mib"],
+            ("ms", "lower", 58.7),
+        )
+        self.assertEqual(
+            performance._shell_snapshot_restore_samples(
+                SHELL_SNAPSHOT_RESTORE_LOG, "shell-snapshot-restore.log"
+            ),
+            {512: [6.8, 6.9, 7.0, 7.1, 7.2]},
+        )
+
+    def test_validate_workload_rejects_restore_series_that_a_stall_split(self):
+        cases = (
+            (
+                "stalled-first-half",
+                "linux-mshv-virtual-machine",
+                "shell-snapshot.log",
+                STALLED_RESTORE_MS,
+                r"unstable shell-snapshot restore at \S*shell-snapshot\.log "
+                r"\(256 MiB\): p50 58\.651 ms is 58\.0% above p25 37\.112 ms "
+                r"\(limit 25\.0%\); rerun on an idle host",
+            ),
+            (
+                "late-recovery",
+                "windows-whp-virtual-machine",
+                "shell-snapshot-restore.log",
+                LATE_RECOVERY_RESTORE_MS,
+                r"unstable shell-snapshot restore at \S*shell-snapshot-restore\.log "
+                r"\(256 MiB\): samples split 2/8 between 44\.000 ms and "
+                r"62\.600 ms \(42\.3% gap, limit 25\.0%\)",
+            ),
+            (
+                "bimodal-on-mshv",
+                "linux-mshv-baremetal",
+                "shell-snapshot-restore.log",
+                BIMODAL_KVM_RESTORE_MS,
+                r"\(256 MiB\): p50 56\.550 ms is 96\.4% above p25 28\.800 ms",
+            ),
+            (
+                "stable",
+                "windows-whp-baremetal",
+                "shell-snapshot.log",
+                STABLE_RESTORE_MS,
+                None,
+            ),
+            # KVM's restore series aren't guarded, stalled or not.
+            (
+                "stalled-on-kvm",
+                "linux-kvm-virtual-machine",
+                "shell-snapshot.log",
+                STALLED_RESTORE_MS,
+                None,
+            ),
+            (
+                "bimodal-on-kvm",
+                "linux-kvm-virtual-machine",
+                "shell-snapshot-restore.log",
+                BIMODAL_KVM_RESTORE_MS,
+                None,
+            ),
+        )
+        for name, platform, filename, restored, error_pattern in cases:
+            with (
+                self.subTest(name=name),
+                tempfile.TemporaryDirectory() as temporary,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                logs = Path(temporary)
+                render = (
+                    shell_snapshot_log
+                    if filename == "shell-snapshot.log"
+                    else shell_snapshot_restore_log
+                )
+                (logs / filename).write_text(
+                    render({128: STABLE_RESTORE_MS, 256: restored}), encoding="utf-8"
+                )
+                if error_pattern is None:
+                    performance.validate_workload_stability(platform, logs)
+                    if platform.startswith("linux-kvm"):
+                        self.assertIn("SKIP:", stdout.getvalue())
+                    else:
+                        self.assertIn(
+                            "are stable (2 with at least 10 samples checked)",
+                            stdout.getvalue(),
+                        )
+                else:
+                    with self.assertRaisesRegex(
+                        performance.UnstablePerformanceError, error_pattern
+                    ):
+                        performance.validate_workload_stability(platform, logs)
+
+    def test_validate_workload_reports_every_unstable_restore_series(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            logs = Path(temporary)
+            (logs / "shell-snapshot.log").write_text(
+                shell_snapshot_log(
+                    {
+                        128: STABLE_RESTORE_MS,
+                        256: STALLED_RESTORE_MS,
+                        512: LATE_RECOVERY_RESTORE_MS,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(performance.UnstablePerformanceError) as context:
+                performance.validate_workload_stability(
+                    "linux-mshv-virtual-machine", logs
+                )
+
+        errors = str(context.exception).splitlines()
+        self.assertEqual(len(errors), 2)
+        self.assertIn("(256 MiB): p50 58.651 ms", errors[0])
+        self.assertIn("(512 MiB): samples split 2/8", errors[1])
+
+    def test_restore_guard_rejects_invalid_logs(self):
+        stable = shell_snapshot_restore_log({512: STABLE_RESTORE_MS})
+        samples_line = benchmark._format_restore_samples_line(STABLE_RESTORE_MS)
+        cases = (
+            (
+                "unlisted",
+                stable.replace(samples_line + "\n", ""),
+                r"missing restore samples in \S*shell-snapshot-restore\.log "
+                r"\(512 MiB\)",
+            ),
+            # A log cut off before its first section has no series to accept.
+            (
+                "sectionless",
+                stable.split("== 512 MiB ==", maxsplit=1)[0],
+                r"missing memory sections in \S*shell-snapshot-restore\.log",
+            ),
+            (
+                "zero",
+                shell_snapshot_restore_log({512: [0.0] * 10}),
+                r"non-positive restore sample in \S*shell-snapshot-restore\.log "
+                r"\(512 MiB\)",
+            ),
+            (
+                "short",
+                stable.replace(samples_line, samples_line.replace("37.200, ", "")),
+                r"lists 9 restore samples, but its summary counts 10",
+            ),
+            (
+                "other-series",
+                stable.replace(
+                    samples_line,
+                    benchmark._format_restore_samples_line(STALLED_RESTORE_MS),
+                ),
+                r"lists restore samples with median 58\.651 ms, but its summary "
+                r"reports 36\.5 ms",
+            ),
+            (
+                "malformed",
+                stable.replace(samples_line, samples_line.replace("37.100", "slow")),
+                r"malformed restore samples",
+            ),
+            (
+                "unsummarized",
+                stable.replace("snapshot restore    : median", "restore median"),
+                r"missing snapshot restore summary",
+            ),
+        )
+        for name, log, error_pattern in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                logs = Path(temporary)
+                (logs / "shell-snapshot-restore.log").write_text(log, encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    performance.PerformanceError, error_pattern
+                ) as context:
+                    performance.validate_workload_stability(
+                        "linux-mshv-virtual-machine", logs
+                    )
+                # Malformed input is invalid, never a reason to remeasure.
+                self.assertNotIsInstance(
+                    context.exception, performance.UnstablePerformanceError
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            logs = Path(temporary)
+            with self.assertRaisesRegex(
+                performance.PerformanceError, r"no shell-snapshot restore log found"
+            ):
+                performance.validate_workload_stability(
+                    "linux-mshv-virtual-machine", logs
+                )
+            (logs / "shell-snapshot.log").write_text(
+                SHELL_SNAPSHOT_LOG, encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                performance.PerformanceError, r"unsupported OpenVMM benchmark platform"
+            ):
+                performance.validate_workload_stability("linux-unknown", logs)
+            # Fewer samples than the guard needs may go unlisted.
+            unlisted = re.sub(r"(?m)^ *restore samples .*\n", "", SHELL_SNAPSHOT_LOG)
+            (logs / "shell-snapshot.log").write_text(unlisted, encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                performance.validate_workload_stability(
+                    "linux-mshv-virtual-machine", logs
+                )
+            self.assertIn("(0 with at least 10 samples checked)", stdout.getvalue())
+
+    def test_validate_workload_uses_temporary_failure_exit_code(self):
+        unlisted = re.sub(
+            r"(?m)^ *restore samples .*\n",
+            "",
+            shell_snapshot_restore_log({512: STABLE_RESTORE_MS}),
+        )
+        for name, log, expected_status, expected_output in (
+            (
+                "stable",
+                shell_snapshot_restore_log({512: STABLE_RESTORE_MS}),
+                0,
+                "are stable",
+            ),
+            (
+                "unstable",
+                shell_snapshot_restore_log({512: STALLED_RESTORE_MS}),
+                75,
+                "ERROR: unstable shell-snapshot restore",
+            ),
+            ("invalid", unlisted, 2, "ERROR: missing restore samples"),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                logs = Path(temporary)
+                (logs / "shell-snapshot-restore.log").write_text(log, encoding="utf-8")
+                stdout, stderr = io.StringIO(), io.StringIO()
+
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    status = nvx.main(
+                        [
+                            "performance",
+                            "validate-workload",
+                            "--platform",
+                            "windows-whp-virtual-machine",
+                            "--input-dir",
+                            str(logs),
+                        ]
+                    )
+
+                self.assertEqual(status, expected_status)
+                self.assertIn(expected_output, stdout.getvalue() + stderr.getvalue())
+
+    def test_collection_rejects_unstable_restore_series_on_guarded_backends(self):
+        for platform, guarded in (
+            ("linux-mshv-virtual-machine", True),
+            ("windows-whp-virtual-machine", True),
+            ("linux-kvm-virtual-machine", False),
+        ):
+            backend = performance.OPENVMM_BACKENDS[platform]
+            # The one-vCPU suite and the higher-vCPU restore-only suite.
+            for processors in (1, 8):
+                with (
+                    self.subTest(platform=platform, processors=processors),
+                    tempfile.TemporaryDirectory() as temporary,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    root = Path(temporary)
+                    logs = root / "logs"
+                    logs.mkdir()
+                    if processors == 1:
+                        (logs / "cold-start.log").write_text(
+                            COLD_START_LOG, encoding="utf-8"
+                        )
+                        (logs / "virtfs.log").write_text(VIRTFS_LOG, encoding="utf-8")
+                        (logs / "shell-snapshot.log").write_text(
+                            shell_snapshot_log(
+                                {
+                                    128: STABLE_RESTORE_MS,
+                                    256: STALLED_RESTORE_MS,
+                                    512: STABLE_RESTORE_MS,
+                                }
+                            ),
+                            encoding="utf-8",
+                        )
+                        options: dict[str, Any] = {"require_shell_snapshot": True}
+                    else:
+                        (logs / "shell-snapshot-restore.log").write_text(
+                            shell_snapshot_restore_log({512: STALLED_RESTORE_MS}),
+                            encoding="utf-8",
+                        )
+                        (logs / performance.BENCHMARK_METADATA_FILENAME).write_text(
+                            json.dumps(
+                                {
+                                    "platform": platform,
+                                    "backend": backend,
+                                    "microvm_abi_version": 2,
+                                    "processors": 8,
+                                    "warmups": 1,
+                                    "measured_runs": 10,
+                                    "shell_memories_mib": [512],
+                                }
+                            ),
+                            encoding="utf-8",
+                        )
+                        options = {"require_shell_snapshot_restore_512": True}
+                    results = root / "results"
+
+                    if guarded:
+                        with self.assertRaisesRegex(
+                            performance.UnstablePerformanceError,
+                            r"unstable shell-snapshot restore .* 58\.0% above p25",
+                        ):
+                            performance.collect_results(
+                                platform, "abc123", logs, results, **options
+                            )
+                        self.assertFalse(results.exists())
+                    else:
+                        result_path = performance.collect_results(
+                            platform, "abc123", logs, results, **options
+                        )
+                        stalled = (
+                            "shell_snapshot_restore_256_mib"
+                            if processors == 1
+                            else "shell_snapshot_restore_512_mib"
+                        )
+                        self.assertIn(
+                            (stalled, 58.7),
+                            [
+                                (result.metric, result.p50)
+                                for result in performance.read_results(result_path)
+                            ],
+                        )
 
     def test_validate_openvmm_records_every_attempt_outcome(self):
         invalid = lifecycle_document("whp")
@@ -2389,6 +2896,486 @@ class PerformanceTests(unittest.TestCase):
                     lifecycle_input=lifecycle_path,
                 )
 
+    def test_reset_check_ignores_side_branch_history_that_never_reset_a_row(self):
+        # A side branch forked before the measurement can hold fewer rows than the
+        # measurement without resetting them. Comparing it with the previous commit
+        # in log order would flag the throughput row, which it never removed.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def git(*args: str) -> str:
+                completed = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return completed.stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "test")
+            history_file = repo / "data" / "linux-kvm.csv"
+            performance.write_results(
+                history_file,
+                [performance.Result("s0", "latency", "ms", "lower", 10.0)],
+            )
+            git("add", "data")
+            git("commit", "-q", "-m", "seed")
+            main = git("rev-parse", "--abbrev-ref", "HEAD")
+            git("checkout", "-q", "-b", "side")
+            performance.write_results(
+                history_file,
+                [performance.Result("x", "latency", "ms", "lower", 11.0)],
+            )
+            git("commit", "-q", "-am", "side change")
+            git("checkout", "-q", main)
+            performance.write_results(
+                history_file,
+                [
+                    performance.Result("s0", "latency", "ms", "lower", 10.0),
+                    performance.Result("A", "throughput", "MB/s", "higher", 20.0),
+                ],
+            )
+            git("commit", "-q", "-am", "measured")
+            measured = git("rev-parse", "HEAD")
+            # The merge keeps the side branch's latency change and A's throughput row.
+            git("merge", "-q", "--no-commit", "--no-ff", "-X", "ours", "side")
+            performance.write_results(
+                history_file,
+                [
+                    performance.Result("x", "latency", "ms", "lower", 11.0),
+                    performance.Result("A", "throughput", "MB/s", "higher", 20.0),
+                ],
+            )
+            git("commit", "-q", "-am", "merge side")
+
+            self.assertEqual(
+                performance._reset_dimensions_since(repo, history_file, measured),
+                set(),
+            )
+
+    def test_reset_check_ignores_a_merged_branch_that_predates_an_earlier_reset(self):
+        # Dev resets latency before measurement A. A branch forked before that reset
+        # keeps the old latency rows and adds throughput; merging it into dev keeps the
+        # reset, so the merge drops latency relative to that branch. The reset preceded A,
+        # so A's latency row must not be discarded.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def git(*args: str) -> str:
+                completed = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return completed.stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "test")
+            history_file = repo / "data" / "linux-kvm.csv"
+            performance.write_results(
+                history_file,
+                [performance.Result("s0", "latency", "ms", "lower", 10.0)],
+            )
+            git("add", "data")
+            git("commit", "-q", "-m", "seed")
+            main = git("rev-parse", "--abbrev-ref", "HEAD")
+            git("checkout", "-q", "-b", "branch")
+            performance.write_results(
+                history_file,
+                [
+                    performance.Result("s0", "latency", "ms", "lower", 12.0),
+                    performance.Result("b", "throughput", "MB/s", "higher", 5.0),
+                ],
+            )
+            git("commit", "-q", "-am", "branch work")
+            git("checkout", "-q", main)
+            performance.write_results(history_file, [])
+            git("commit", "-q", "-am", "reset latency before the measurement")
+            git("commit", "-q", "--allow-empty", "-m", "measured")
+            measured = git("rev-parse", "HEAD")
+            git("merge", "-q", "--no-commit", "--no-ff", "-X", "ours", "branch")
+            performance.write_results(
+                history_file,
+                [performance.Result("b", "throughput", "MB/s", "higher", 5.0)],
+            )
+            git("commit", "-q", "-am", "merge branch")
+
+            self.assertEqual(
+                performance._reset_dimensions_since(repo, history_file, measured),
+                set(),
+            )
+
+    def test_reset_check_finds_a_reset_merged_from_before_the_measurement(self):
+        # A pull request that resets latency forks before measurement A and
+        # merges after it. Its reset commit isn't on the line from A to HEAD,
+        # but its merge is: the merge matches the branch, and drops the latency
+        # row that its first parent holds. A merge that matches both of its
+        # parents, and a commit that leaves the history alone, reset nothing.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def git(*args: str) -> str:
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "test")
+            history_file = repo / "data" / "linux-kvm.csv"
+            throughput = performance.Result("s0", "throughput", "MB/s", "higher", 20.0)
+            performance.write_results(
+                history_file,
+                [performance.Result("s0", "latency", "ms", "lower", 10.0), throughput],
+            )
+            git("add", "data")
+            git("commit", "-q", "-m", "seed")
+            main = git("rev-parse", "--abbrev-ref", "HEAD")
+            git("checkout", "-q", "-b", "reset")
+            performance.write_results(history_file, [throughput])
+            git("commit", "-q", "-am", "reset latency")
+            git("checkout", "-q", "-b", "alone", main)
+            git("commit", "-q", "--allow-empty", "-m", "leave the history alone")
+            git("checkout", "-q", main)
+            git("commit", "-q", "--allow-empty", "-m", "measured")
+            measured = git("rev-parse", "HEAD")
+            git("merge", "-q", "--no-ff", "alone", "-m", "merge a branch that matches")
+            git("commit", "-q", "--allow-empty", "-m", "leave the history alone")
+            git("merge", "-q", "--no-ff", "reset", "-m", "merge the reset")
+
+            self.assertEqual(
+                performance._reset_dimensions_since(repo, history_file, measured),
+                {("", 1, 1, "latency")},
+            )
+
+    def test_persist_drops_rows_measured_before_a_later_history_reset(self):
+        # A row measured before a commit that reset its metric must not refill the reset
+        # series, or nine post-reset rows would already gate the metric. Unaffected metrics
+        # measured at the same commit still persist.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def git(*args: str) -> str:
+                completed = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return completed.stdout.strip()
+
+            def commit(message: str) -> str:
+                git("add", "data")
+                git("commit", "-q", "--allow-empty", "-m", message)
+                return git("rev-parse", "HEAD")
+
+            git("init", "-q")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "test")
+            history = repo / "data"
+            source = repo / "source"
+            history_file = history / "linux-kvm.csv"
+            source_file = source / "linux-kvm.csv"
+            performance.write_results(
+                history_file,
+                [
+                    performance.Result("seed", "latency", "ms", "lower", 10.0),
+                    performance.Result("seed", "throughput", "MB/s", "higher", 20.0),
+                ],
+            )
+            measured = commit("seed")
+
+            # Commit B resets only the latency metric; throughput keeps its history.
+            performance.write_results(
+                history_file,
+                [performance.Result("seed", "throughput", "MB/s", "higher", 20.0)],
+            )
+            commit("reset latency")
+
+            for number in range(9):
+                sha = commit(f"post-reset {number}")
+                performance.write_results(
+                    source_file,
+                    [performance.Result(sha, "latency", "ms", "lower", 100.0)],
+                )
+                performance.persist_results(source, history, git_checkout=repo)
+
+            # The measurement of A arrives after the reset. It must not refill latency.
+            performance.write_results(
+                source_file,
+                [
+                    performance.Result(measured, "latency", "ms", "lower", 10.0),
+                    performance.Result(measured, "throughput", "MB/s", "higher", 20.0),
+                ],
+            )
+            performance.persist_results(source, history, git_checkout=repo)
+
+            rows = performance.read_results(history_file)
+            latency = [row for row in rows if row.metric == "latency"]
+            throughput = [row for row in rows if row.metric == "throughput"]
+            self.assertEqual(len(latency), 9)
+            self.assertNotIn(measured, {row.commit for row in latency})
+            self.assertEqual({row.commit for row in throughput}, {"seed", measured})
+
+    def test_persist_detects_merged_reset_and_ignores_reverted_side_reset(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def git(*args: str) -> str:
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+
+            def commit(message: str) -> str:
+                git("add", "data")
+                git("commit", "-q", "--allow-empty", "-m", message)
+                return git("rev-parse", "HEAD")
+
+            git("init", "-q")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "test")
+            history_file = repo / "data" / "linux-kvm.csv"
+            original = [performance.Result("seed", "latency", "ms", "lower", 10.0)]
+            performance.write_results(history_file, original)
+            commit("seed")
+            main = git("rev-parse", "--abbrev-ref", "HEAD")
+
+            # A side branch forked before the measurement resets and restores
+            # rows; its temporary reset is outside the measured ancestry.
+            git("checkout", "-q", "-b", "reverted")
+            unrelated = repo / "data" / "unrelated.txt"
+            unrelated.write_text("x", encoding="utf-8")
+            git("add", "data/unrelated.txt")
+            git("commit", "-q", "-m", "unrelated")
+            performance.write_results(history_file, [])
+            commit("temporary reset")
+            performance.write_results(history_file, original)
+            commit("restore rows")
+            git("checkout", "-q", main)
+            measured = commit("measurement")
+            git("merge", "-q", "--no-ff", "reverted", "-m", "merge restored branch")
+
+            source = repo / "source"
+            performance.write_results(
+                source / "linux-kvm.csv",
+                [performance.Result(measured, "latency", "ms", "lower", 11.0)],
+            )
+            performance.persist_results(source, repo / "data", git_checkout=repo)
+            rows = performance.read_results(history_file)
+            self.assertIn(measured, {row.commit for row in rows})
+
+            # A second branch performs a multi-commit reset. The integration
+            # merge must expose the loss even when git's path simplification
+            # would otherwise omit an intermediate commit.
+            git("checkout", "-q", "-b", "reset-branch")
+            performance.write_results(history_file, [])
+            commit("begin reset")
+            commit("continue reset")
+            git("checkout", "-q", main)
+            git("merge", "-q", "--no-ff", "reset-branch", "-m", "merge reset")
+            performance.write_results(
+                source / "linux-kvm.csv",
+                [performance.Result(measured, "latency", "ms", "lower", 12.0)],
+            )
+            performance.persist_results(source, repo / "data", git_checkout=repo)
+            self.assertEqual(performance.read_results(history_file), [])
+
+    def test_persist_filters_stale_metadata_before_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+
+            def git(*args: str) -> str:
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+
+            def commit(message: str) -> str:
+                git("add", "data")
+                git("commit", "-q", "-m", message)
+                return git("rev-parse", "HEAD")
+
+            git("init", "-q")
+            git("config", "user.email", "test@example.invalid")
+            git("config", "user.name", "test")
+            history_file = repo / "data" / "linux-kvm.csv"
+            performance.write_results(
+                history_file,
+                [
+                    performance.Result("seed", "latency", "ms", "lower", 10.0),
+                    performance.Result("seed", "throughput", "MB/s", "higher", 20.0),
+                ],
+            )
+            measured = commit("measurement")
+            performance.write_results(
+                history_file,
+                [
+                    performance.Result("seed", "throughput", "MB/s", "higher", 20.0),
+                ],
+            )
+            commit("reset latency")
+            source = repo / "source"
+            performance.write_results(
+                source / "linux-kvm.csv",
+                [
+                    performance.Result(measured, "latency", "seconds", "higher", 1.0),
+                    performance.Result(measured, "throughput", "MB/s", "higher", 21.0),
+                ],
+            )
+            performance.persist_results(source, repo / "data", git_checkout=repo)
+            rows = performance.read_results(history_file)
+            self.assertEqual(
+                [(row.metric, row.commit) for row in rows],
+                [("throughput", "seed"), ("throughput", measured)],
+            )
+
+    def test_resolve_commit_id_records_the_commit_that_a_revision_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git = git_repository(repo)
+            git("commit", "-q", "--allow-empty", "-m", "measured")
+            head = git("rev-parse", "HEAD")
+
+            self.assertEqual(performance._resolve_commit_id("HEAD", repo), head)
+            self.assertEqual(performance._resolve_commit_id(head[:12], repo), head)
+            # A full commit ID is already immutable, so it needs no checkout.
+            self.assertEqual(performance._resolve_commit_id(head, repo / "none"), head)
+            for revision in ("missing", "--verify"):
+                with (
+                    self.subTest(revision=revision),
+                    self.assertRaisesRegex(
+                        performance.PerformanceError, "does not name a commit"
+                    ),
+                ):
+                    performance._resolve_commit_id(revision, repo)
+
+    def test_collect_clis_record_the_commit_id_of_a_symbolic_revision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git = git_repository(repo)
+            git("commit", "-q", "--allow-empty", "-m", "measured")
+            head = git("rev-parse", "HEAD")
+
+            for command, collector, inputs in (
+                ("collect", "collect_results", ["--input-dir", "logs"]),
+                ("collect-openvmm", "collect_openvmm_results", ["--input", "e2e"]),
+            ):
+                args = nvx.parse_args(
+                    [
+                        "performance",
+                        command,
+                        "--platform",
+                        "linux-kvm",
+                        "--commit",
+                        "HEAD",
+                        *inputs,
+                        "--output-dir",
+                        "results",
+                    ]
+                )
+                with (
+                    self.subTest(command=command),
+                    patch.object(performance, "ROOT", repo),
+                    patch.object(performance, collector) as collect,
+                ):
+                    self.assertEqual(args.handler(args), 0)
+                    self.assertEqual(collect.call_args.args[1], head)
+
+    def test_persist_rejects_a_result_commit_that_is_not_a_commit_id(self):
+        # Results collected with --commit HEAD would compare the reset history with
+        # itself, find no reset, and refill the reset series.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git = git_repository(repo)
+            history_file = repo / "data" / "linux-kvm.csv"
+            performance.write_results(
+                history_file,
+                [performance.Result("seed", "latency", "ms", "lower", 10.0)],
+            )
+            git("add", "data")
+            git("commit", "-q", "-m", "measured")
+            performance.write_results(history_file, [])
+            git("commit", "-q", "-am", "reset latency")
+            source = repo / "source"
+            performance.write_results(
+                source / "linux-kvm.csv",
+                [performance.Result("HEAD", "latency", "ms", "lower", 11.0)],
+            )
+
+            with self.assertRaisesRegex(
+                performance.PerformanceError, "HEAD is not a full commit ID"
+            ):
+                performance.persist_results(source, repo / "data", git_checkout=repo)
+            self.assertEqual(performance.read_results(history_file), [])
+
+    def test_git_checkout_of_probes_the_nearest_existing_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            outside = Path(temporary) / "outside"
+            repo.mkdir()
+            outside.mkdir()
+            git_repository(repo)
+
+            self.assertEqual(
+                performance._git_checkout_of(repo / "data" / "new"), repo.resolve()
+            )
+            self.assertIsNone(performance._git_checkout_of(outside / "data"))
+
+    def test_persist_cli_checks_a_history_directory_that_does_not_exist(self):
+        # A reset can remove the history directory, and a new series has none yet;
+        # neither may skip the reset and ancestry checks.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            git = git_repository(repo)
+            history = repo / "data"
+            performance.write_results(
+                history / "linux-kvm.csv",
+                [performance.Result("seed", "latency", "ms", "lower", 10.0)],
+            )
+            git("add", "data")
+            git("commit", "-q", "-m", "measured")
+            measured = git("rev-parse", "HEAD")
+            git("rm", "-q", "-r", "data")
+            git("commit", "-q", "-m", "reset the series")
+            source = repo / "source"
+
+            def persist(commit: str, history_dir: Path) -> int:
+                performance.write_results(
+                    source / "linux-kvm.csv",
+                    [performance.Result(commit, "latency", "ms", "lower", 11.0)],
+                )
+                with (
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    return nvx.main(
+                        [
+                            "performance",
+                            "persist",
+                            "--source-dir",
+                            str(source),
+                            "--history-dir",
+                            str(history_dir),
+                        ]
+                    )
+
+            self.assertEqual(persist(measured, history), 0)
+            self.assertFalse((history / "linux-kvm.csv").exists())
+            self.assertEqual(persist("f" * 40, repo / "new"), 2)
+            self.assertFalse((repo / "new" / "linux-kvm.csv").exists())
+
     def test_persist_and_gate_isolate_processor_counts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2684,6 +3671,9 @@ class BenchmarkHostTests(unittest.TestCase):
                 )
                 if system["system"] == "Windows":
                     self.assertIsNotNone(system["revision"])
+                # Each Linux/MSHV series records its hypervisor's build.
+                if benchmark_host.records_hypervisor_build(platform):
+                    self.assertIsNotNone(host["hypervisor_build"])
 
     def test_identical_hosts_match_within_the_memory_tolerance(self):
         # Kernels reserve different amounts of a VM's memory: the same VM
@@ -2862,6 +3852,106 @@ class BenchmarkHostTests(unittest.TestCase):
             with self.subTest(release=release):
                 self.assertEqual(benchmark_host.kernel_series(release), series)
 
+    def test_mshv_hosts_record_the_hypervisor_build(self):
+        mshv = self.identity(MSHV_RUNNER_HOST, MSHV_SERIES)
+
+        self.assertEqual(mshv["hypervisor_build"], "10.0.26100.9444")
+        # The host file lists it after the operating system.
+        keys = list(mshv)
+        self.assertEqual(keys[keys.index("os") + 1], "hypervisor_build")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = benchmark_host.host_file(Path(temporary), MSHV_SERIES)
+            benchmark_host.write_host(path, mshv)
+            self.assertEqual(benchmark_host.read_host(path, MSHV_SERIES), mshv)
+        # A hypervisor that couldn't be read is unknown, while provenance that
+        # predates the build records none.
+        unreadable = changed_host(
+            MSHV_RUNNER_HOST, ("hypervisor",), {"error": "CPUID is unavailable: x"}
+        )
+        self.assertIsNone(self.identity(unreadable, MSHV_SERIES)["hypervisor_build"])
+        self.assertNotIn(
+            "hypervisor_build", self.identity(MSHV_RUNNER_HOST_BEFORE_980, MSHV_SERIES)
+        )
+        # A KVM VM's hypervisor is its cloud host's, and a Windows build and
+        # UBR identify Windows' own.
+        for platform in (KVM_SERIES, "linux-kvm-baremetal", WHP_SERIES):
+            with self.subTest(platform=platform):
+                self.assertNotIn(
+                    "hypervisor_build", self.identity(MSHV_RUNNER_HOST, platform)
+                )
+        for platform in ("linux-mshv", "linux-mshv-baremetal"):
+            with self.subTest(platform=platform):
+                self.assertTrue(benchmark_host.records_hypervisor_build(platform))
+
+    def test_another_hypervisor_build_is_another_host(self):
+        # The whole version counts: prometheus30's 10.0.26100.30000 is build
+        # 26100 too.
+        for build, result in (
+            ("10.0.26100.9444", benchmark_host.MATCH),
+            ("10.0.26100.30000", benchmark_host.MISMATCH),
+            ("10.0.26100.9445", benchmark_host.MISMATCH),
+            (None, benchmark_host.MISMATCH),
+        ):
+            with self.subTest(build=build):
+                fields = self.compare(
+                    MSHV_RUNNER_HOST,
+                    changed_host(MSHV_RUNNER_HOST, ("hypervisor", "build"), build),
+                    MSHV_SERIES,
+                )
+                labels = [field.label for field in fields]
+                self.assertEqual(
+                    labels[labels.index("Linux kernel") + 1], "Hypervisor build"
+                )
+                field = fields[labels.index("Hypervisor build")]
+                self.assertEqual(field.result, result)
+                self.assertEqual(
+                    benchmark_host.mismatches(fields),
+                    [] if result == benchmark_host.MATCH else [field],
+                )
+                self.assertEqual(benchmark_host.drift(fields), [])
+        unknown = self.compare(
+            MSHV_RUNNER_HOST,
+            changed_host(MSHV_RUNNER_HOST, ("hypervisor",), {"error": "x"}),
+            MSHV_SERIES,
+        )
+        self.assertEqual(
+            [field.describe() for field in benchmark_host.mismatches(unknown)],
+            ["Hypervisor build: expected 10.0.26100.9444, found unknown"],
+        )
+        # An unknown build matches none, not even another unknown one, so an
+        # expected host whose hypervisor couldn't be read never passes.
+        unreadable = changed_host(MSHV_RUNNER_HOST, ("hypervisor",), {"error": "x"})
+        self.assertEqual(
+            [
+                field.describe()
+                for field in benchmark_host.mismatches(
+                    self.compare(unreadable, unreadable, MSHV_SERIES)
+                )
+            ],
+            ["Hypervisor build: expected unknown, found unknown"],
+        )
+
+    def test_hosts_that_predate_the_hypervisor_build_only_drift(self):
+        # Adding the build to an expected host, or comparing it with results
+        # that a dev run in flight recorded before it, needs no history reset.
+        legacy = self.identity(MSHV_RUNNER_HOST_BEFORE_980, MSHV_SERIES)
+        current = self.identity(MSHV_RUNNER_HOST, MSHV_SERIES)
+        for expected, actual, description in (
+            (legacy, current, "expected not recorded, found 10.0.26100.9444"),
+            (current, legacy, "expected 10.0.26100.9444, found not recorded"),
+        ):
+            with self.subTest(description=description):
+                fields = benchmark_host.compare_hosts(expected, actual)
+                self.assertEqual(benchmark_host.mismatches(fields), [])
+                self.assertEqual(
+                    [field.describe() for field in benchmark_host.drift(fields)],
+                    [f"Hypervisor build: {description}"],
+                )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = benchmark_host.host_file(Path(temporary), MSHV_SERIES)
+            benchmark_host.write_host(path, legacy)
+            self.assertEqual(benchmark_host.read_host(path, MSHV_SERIES), legacy)
+
     def test_host_files_reject_unknown_and_malformed_fields(self):
         host = self.identity(KVM_RUNNER_HOST)
         cpu = cast(dict[str, object], host["cpu"])
@@ -2874,6 +3964,11 @@ class BenchmarkHostTests(unittest.TestCase):
                 "volumes is missing",
             ),
             ({**host, "platform": WHP_SERIES}, "describes platform"),
+            # Only Linux/MSHV hosts record the hypervisor build.
+            (
+                {**host, "hypervisor_build": "10.0.26102.3669"},
+                "hypervisor_build is missing",
+            ),
             ([host], "the document is missing"),
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -2885,6 +3980,17 @@ class BenchmarkHostTests(unittest.TestCase):
                         benchmark_host.HostFileError, re.escape(message)
                     ):
                         benchmark_host.read_host(path, KVM_SERIES)
+            mshv = self.identity(MSHV_RUNNER_HOST, MSHV_SERIES)
+            for build in (26100, ""):
+                with self.subTest(build=build):
+                    path.write_text(
+                        json.dumps({**mshv, "hypervisor_build": build}),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        benchmark_host.HostFileError, "hypervisor_build is missing"
+                    ):
+                        benchmark_host.read_host(path, MSHV_SERIES)
             path.write_text("{", encoding="utf-8")
             with self.assertRaisesRegex(benchmark_host.HostFileError, "cannot read"):
                 benchmark_host.read_host(path, KVM_SERIES)
@@ -2892,17 +3998,23 @@ class BenchmarkHostTests(unittest.TestCase):
                 benchmark_host.read_host(path.with_name("missing.json"), KVM_SERIES)
 
     def check_host(
-        self, root: Path, provenance: dict[str, object], *, expected: bool = True
+        self,
+        root: Path,
+        provenance: dict[str, object],
+        *,
+        expected: bool = True,
+        platform: str = KVM_SERIES,
+        expected_host: dict[str, object] = KVM_RUNNER_HOST,
     ) -> tuple[int, str, str, dict[str, object]]:
         history = root / "data"
         if expected:
             benchmark_host.write_host(
-                benchmark_host.host_file(history, KVM_SERIES),
-                self.identity(KVM_RUNNER_HOST),
+                benchmark_host.host_file(history, platform),
+                self.identity(expected_host, platform),
             )
         scratch = root / "scratch"
         scratch.mkdir()
-        output = root / "runs" / f"{KVM_SERIES}-host.json"
+        output = root / "runs" / f"{platform}-host.json"
         summary = root / "summary.md"
         stdout = io.StringIO()
         with (
@@ -2914,7 +4026,7 @@ class BenchmarkHostTests(unittest.TestCase):
             contextlib.redirect_stdout(stdout),
         ):
             status = performance.check_host(
-                KVM_SERIES,
+                platform,
                 history,
                 scratch_dir=scratch,
                 output=output,
@@ -3011,6 +4123,69 @@ class BenchmarkHostTests(unittest.TestCase):
         )
         self.assertIn("`: match.", summary)
         self.assertEqual(actual, self.identity(KVM_RUNNER_HOST))
+
+    def test_check_host_requires_the_mshv_hypervisor_build(self):
+        # A reimage of azure-mshv-4 that brings another hypervisor but keeps
+        # the kernel (#980).
+        provenance = changed_host(
+            MSHV_RUNNER_HOST, ("hypervisor", "build"), "10.0.26100.30000"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            status, output, summary, actual = self.check_host(
+                Path(temporary),
+                provenance,
+                platform=MSHV_SERIES,
+                expected_host=MSHV_RUNNER_HOST,
+            )
+
+        self.assertEqual(status, 1)
+        errors = [line for line in output.splitlines() if line.startswith("::error")]
+        self.assertEqual(len(errors), 1)
+        self.assertIn(
+            "in 1 required field(s): Hypervisor build: expected 10.0.26100.9444, "
+            "found 10.0.26100.30000.",
+            errors[0],
+        )
+        self.assertEqual(actual["hypervisor_build"], "10.0.26100.30000")
+        self.assertIn(
+            "| Hypervisor build | 10.0.26100.9444 | 10.0.26100.30000 | **mismatch** |",
+            summary,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            status, output, _, actual = self.check_host(
+                Path(temporary),
+                MSHV_RUNNER_HOST,
+                platform=MSHV_SERIES,
+                expected_host=MSHV_RUNNER_HOST,
+            )
+
+        self.assertEqual(status, 0)
+        self.assertNotIn("::", output)
+        self.assertIn(
+            "MATCH: Hypervisor build: expected 10.0.26100.9444, found 10.0.26100.9444",
+            output,
+        )
+        self.assertEqual(actual, self.identity(MSHV_RUNNER_HOST, MSHV_SERIES))
+
+    def test_check_host_warns_about_an_expected_host_without_the_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            status, output, summary, actual = self.check_host(
+                Path(temporary),
+                MSHV_RUNNER_HOST,
+                platform=MSHV_SERIES,
+                expected_host=MSHV_RUNNER_HOST_BEFORE_980,
+            )
+
+        self.assertEqual(status, 0)
+        self.assertNotIn("::error", output)
+        self.assertIn(
+            "Hypervisor build: expected not recorded, found 10.0.26100.9444. "
+            "Update the file",
+            output,
+        )
+        self.assertIn("needs no history reset", summary)
+        self.assertEqual(actual["hypervisor_build"], "10.0.26100.9444")
 
     def test_check_host_requires_an_expected_host(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3245,22 +4420,57 @@ class BenchmarkHostTests(unittest.TestCase):
         commits: Sequence[str],
         host: dict[str, object] | None,
         p50: float = 10.0,
+        platform: str = KVM_SERIES,
     ) -> Path:
-        path = directory / f"{KVM_SERIES}-microvm-v2-1vcpu.csv"
+        path = directory / f"{platform}-microvm-v2-1vcpu.csv"
         performance.write_results(
             path,
             [
                 performance.Result(
-                    commit, "openvmm_cold_start", "ms", "lower", p50, KVM_SERIES, 2, 1
+                    commit, "openvmm_cold_start", "ms", "lower", p50, platform, 2, 1
                 )
                 for commit in commits
             ],
         )
         if host is not None:
             benchmark_host.write_host(
-                benchmark_host.host_file(directory, KVM_SERIES), self.identity(host)
+                benchmark_host.host_file(directory, platform),
+                self.identity(host, platform),
             )
         return path
+
+    def test_persist_checks_the_hosts_of_the_given_directory(self):
+        # The nightly persistence checks each run's results against the hosts
+        # that the history expected at the run's commit, which a later host
+        # change may have replaced in data/ (#1053).
+        new_host = changed_host(KVM_RUNNER_HOST, ("cpu", "model"), 207)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            history = self.write_series(root / "data", ["base"], new_host)
+            self.write_series(root / "results", ["old"], KVM_RUNNER_HOST)
+            hosts = root / "hosts"
+            hosts.mkdir()
+            benchmark_host.write_host(
+                benchmark_host.host_file(hosts, KVM_SERIES),
+                self.identity(KVM_RUNNER_HOST),
+            )
+
+            performance.persist_results(
+                root / "results", root / "data", require_host=True, host_dir=hosts
+            )
+
+            self.assertEqual(
+                [row.commit for row in performance.read_results(history)],
+                ["base", "old"],
+            )
+            # Without it, the history's own hosts are the expected ones.
+            with self.assertRaisesRegex(
+                performance.PerformanceError,
+                "refusing to persist the linux-kvm-virtual-machine results",
+            ):
+                performance.persist_results(
+                    root / "results", root / "data", require_host=True
+                )
 
     def test_persist_refuses_results_of_another_host(self):
         new_host = changed_host(KVM_RUNNER_HOST, ("cpu", "model"), 207)
@@ -3313,6 +4523,67 @@ class BenchmarkHostTests(unittest.TestCase):
                 ["base", "new"],
             )
 
+    def test_persist_accepts_hosts_that_predate_the_hypervisor_build(self):
+        # A history whose expected host predates the build accepts results
+        # that record it, and a history whose host records it accepts the
+        # results of a dev run that was in flight when the build was added.
+        for history_host, result_host in (
+            (MSHV_RUNNER_HOST_BEFORE_980, MSHV_RUNNER_HOST),
+            (MSHV_RUNNER_HOST, MSHV_RUNNER_HOST_BEFORE_980),
+        ):
+            with (
+                self.subTest(history_records="hypervisor" in history_host),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                history = self.write_series(
+                    root / "data", ["base"], history_host, platform=MSHV_SERIES
+                )
+                self.write_series(
+                    root / "results", ["new"], result_host, platform=MSHV_SERIES
+                )
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    performance.persist_results(
+                        root / "results", root / "data", require_host=True
+                    )
+
+                self.assertIn(
+                    "::warning title=Benchmark host drift::", stdout.getvalue()
+                )
+                self.assertIn("Hypervisor build: expected ", stdout.getvalue())
+                self.assertEqual(
+                    [row.commit for row in performance.read_results(history)],
+                    ["base", "new"],
+                )
+
+    def test_persist_refuses_results_of_another_hypervisor_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            history = self.write_series(
+                root / "data", ["base"], MSHV_RUNNER_HOST, platform=MSHV_SERIES
+            )
+            self.write_series(
+                root / "results",
+                ["new"],
+                changed_host(
+                    MSHV_RUNNER_HOST, ("hypervisor", "build"), "10.0.26100.30000"
+                ),
+                platform=MSHV_SERIES,
+            )
+            with self.assertRaisesRegex(
+                performance.PerformanceError,
+                "refusing to persist the linux-mshv-virtual-machine results: "
+                "their host differs from .* in required fields: Hypervisor build: "
+                "expected 10.0.26100.9444, found 10.0.26100.30000$",
+            ):
+                performance.persist_results(
+                    root / "results", root / "data", require_host=True
+                )
+            self.assertEqual(
+                [row.commit for row in performance.read_results(history)], ["base"]
+            )
+
     def test_persist_requires_both_hosts_when_asked(self):
         for recorded, expected in ((False, True), (True, False)):
             with (
@@ -3355,12 +4626,20 @@ class BenchmarkHostTests(unittest.TestCase):
                     )
 
     def gate(
-        self, root: Path, candidate_host: dict[str, object], *, reset: bool
+        self,
+        root: Path,
+        candidate_host: dict[str, object],
+        *,
+        reset: bool,
+        platform: str = KVM_SERIES,
+        base_host: dict[str, object] = KVM_RUNNER_HOST,
     ) -> tuple[int, str, str]:
         commits = [f"base-{index}" for index in range(10)]
-        self.write_series(root / "baseline", commits, KVM_RUNNER_HOST)
-        self.write_series(root / "data", [] if reset else commits, candidate_host)
-        self.write_series(root / "results", ["pr"], candidate_host)
+        self.write_series(root / "baseline", commits, base_host, platform=platform)
+        self.write_series(
+            root / "data", [] if reset else commits, candidate_host, platform=platform
+        )
+        self.write_series(root / "results", ["pr"], candidate_host, platform=platform)
         summary = root / "summary.md"
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
@@ -3474,6 +4753,766 @@ class BenchmarkHostTests(unittest.TestCase):
         self.assertNotIn("::error", output)
         self.assertNotIn("accepts a new expected host", summary)
         self.assertIn("| OK |", summary)
+
+    def test_gate_needs_no_reset_to_add_the_hypervisor_build(self):
+        # The base branch's expected host predates the build, and the pull
+        # request's records the runner's (#980).
+        with tempfile.TemporaryDirectory() as temporary:
+            status, output, summary = self.gate(
+                Path(temporary),
+                MSHV_RUNNER_HOST,
+                reset=False,
+                platform=MSHV_SERIES,
+                base_host=MSHV_RUNNER_HOST_BEFORE_980,
+            )
+
+        self.assertEqual(status, 0)
+        self.assertNotIn("::error", output)
+        self.assertNotIn("accepts a new expected host", summary)
+        self.assertIn("| OK |", summary)
+
+    def test_gate_requires_a_new_hypervisor_build_to_reset_its_series(self):
+        new_build = changed_host(
+            MSHV_RUNNER_HOST, ("hypervisor", "build"), "10.0.26100.30000"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            status, output, summary = self.gate(
+                Path(temporary),
+                new_build,
+                reset=False,
+                platform=MSHV_SERIES,
+                base_host=MSHV_RUNNER_HOST,
+            )
+
+        self.assertEqual(status, 1)
+        self.assertIn(
+            "This change accepts a new expected host for linux-mshv-virtual-machine, "
+            "so each of its metrics must restart its warmup: Hypervisor build: "
+            "expected 10.0.26100.9444, found 10.0.26100.30000.",
+            summary,
+        )
+        self.assertIn(
+            "::error title=Benchmark host changed without a history reset::", output
+        )
+
+
+REPOSITORY = "microsoft/nvx"
+CI_WORKFLOW = ".github/workflows/ci.yml"
+SERIES_FILE = f"{KVM_SERIES}-microvm-v2-1vcpu.csv"
+
+
+class _RunsApi:
+    """Serves the CI runs of dev pushes, newest first and `page_size` to a
+    page, at most `limit` for a search of their creation times, as GitHub
+    does, their artifacts, and their archives."""
+
+    def __init__(self) -> None:
+        self.runs: list[dict[str, object]] = []
+        self.page_size = 100
+        self.limit = 1000
+        self.pages = 0
+        self.artifacts: dict[int, list[dict[str, object]]] = {}
+        self.archives: dict[int, bytes | BaseException] = {}
+        self.downloads: list[int] = []
+        self.listings: list[Mapping[str, str] | None] = []
+        self.artifact_listings: list[int] = []
+
+    def get_all(
+        self,
+        path: str,
+        params: Mapping[str, str] | None = None,
+        *,
+        key: str | None = None,
+        deadline: float | None = None,
+        until: Callable[[Sequence[object]], bool] | None = None,
+    ) -> list[object]:
+        if path == f"/repos/{REPOSITORY}/actions/workflows/ci.yml/runs":
+            self.listings.append(params)
+            # ">=SINCE" or "SINCE..UNTIL", both inclusive.
+            created = (params or {}).get("created", "")
+            since, _, until_time = created.removeprefix(">=").partition("..")
+            newest_first = sorted(
+                (
+                    run
+                    for run in self.runs
+                    if since <= cast(str, run["created_at"])
+                    and (not until_time or cast(str, run["created_at"]) <= until_time)
+                ),
+                key=lambda run: cast(int, run["id"]),
+                reverse=True,
+            )
+            runs: list[object] = [*newest_first[: self.limit]]
+            listed: list[object] = []
+            for start in range(0, len(runs), self.page_size):
+                page = runs[start : start + self.page_size]
+                self.pages += 1
+                listed.extend(page)
+                if until is not None and until(page):
+                    break
+            return listed
+        match = re.fullmatch(rf"/repos/{REPOSITORY}/actions/runs/(\d+)/artifacts", path)
+        assert match is not None, path
+        self.artifact_listings.append(int(match[1]))
+        return list(self.artifacts.get(int(match[1]), []))
+
+    def download(
+        self,
+        path: str,
+        destination: Path,
+        *,
+        limit: int,
+        deadline: float | None = None,
+    ) -> None:
+        match = re.fullmatch(rf"/repos/{REPOSITORY}/actions/artifacts/(\d+)/zip", path)
+        assert match is not None, path
+        self.downloads.append(int(match[1]))
+        payload = self.archives[int(match[1])]
+        if isinstance(payload, BaseException):
+            raise payload
+        destination.write_bytes(payload)
+
+
+class RecordedPerformanceTests(unittest.TestCase):
+    """nvx.py persist-recorded-performance, which a full run of dev runs to
+    persist the performance results that the dev pushes recorded (#1053)."""
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.repo = self.root / "dev"
+        self.history = self.repo / "data"
+        self.downloads = self.root / "downloads"
+        self.api = _RunsApi()
+        self.repo.mkdir()
+        self.git("init", "-q", "-b", "dev")
+        self.git("config", "user.email", "test@example.invalid")
+        self.git("config", "user.name", "test")
+        self.git("config", "commit.gpgsign", "false")
+        self.write(self.history, ["seed"], KVM_RUNNER_HOST)
+        self.commit("seed")
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def commit(self, message: str) -> str:
+        self.git("add", "--all")
+        self.git("commit", "-q", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def write(
+        self,
+        directory: Path,
+        commits: Sequence[str],
+        host: dict[str, object] | None,
+        unit: str = "ms",
+        processors: int = 1,
+        series: str = KVM_SERIES,
+    ) -> None:
+        """Write a series of `commits`' results, with their host, as data/
+        and a run's recorded results hold them."""
+        performance.write_results(
+            directory / f"{series}-microvm-v2-{processors}vcpu.csv",
+            [
+                performance.Result(
+                    commit,
+                    "openvmm_cold_start",
+                    unit,
+                    "lower",
+                    10.0,
+                    series,
+                    2,
+                    processors,
+                )
+                for commit in commits
+            ],
+        )
+        if host is not None:
+            benchmark_host.write_host(
+                benchmark_host.host_file(directory, series),
+                benchmark_host.host_identity(series, host),
+            )
+
+    def run_document(
+        self,
+        run_id: int,
+        sha: str,
+        updated: datetime | None = None,
+        created: datetime | None = None,
+    ) -> dict[str, object]:
+        updated = updated or datetime.now(timezone.utc)
+        created = created or updated
+        return {
+            "id": run_id,
+            "head_sha": sha,
+            "event": "push",
+            "head_branch": "dev",
+            "status": "completed",
+            "path": CI_WORKFLOW,
+            "repository": {"full_name": REPOSITORY},
+            "head_repository": {"full_name": REPOSITORY},
+            "html_url": f"https://github.com/{REPOSITORY}/actions/runs/{run_id}",
+            "created_at": f"{created:%Y-%m-%dT%H:%M:%SZ}",
+            "updated_at": f"{updated:%Y-%m-%dT%H:%M:%SZ}",
+        }
+
+    def record(
+        self,
+        run_id: int,
+        sha: str,
+        write: Callable[[Path], None] | None = None,
+        corrupt: bool = False,
+        updated: datetime | None = None,
+        expired: bool = False,
+        size: int | None = None,
+        created: datetime | None = None,
+        compression: int = zipfile.ZIP_STORED,
+        mangle: Callable[[bytes], bytes] | None = None,
+    ) -> bytes:
+        """Add a completed run of a push of `sha` whose artifact holds the
+        results that `write` writes, by default those of `sha`, and return the
+        artifact's archive."""
+        staging = self.root / f"staging-{run_id}"
+        staging.mkdir()
+        if write is None:
+            self.write(staging, [sha], KVM_RUNNER_HOST)
+        else:
+            write(staging)
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", compression) as bundle:
+            for path in sorted(staging.iterdir()):
+                bundle.write(path, path.name)
+        payload = archive.getvalue()
+        if mangle is not None:
+            payload = mangle(payload)
+        digest = hashlib.sha256(b"another archive" if corrupt else payload)
+        self.api.runs.append(self.run_document(run_id, sha, updated, created))
+        self.api.artifacts[run_id] = [
+            {
+                "id": 1000 + run_id,
+                "name": f"performance-results-{run_id}",
+                "expired": expired,
+                "digest": f"sha256:{digest.hexdigest()}",
+                "size_in_bytes": len(payload) if size is None else size,
+                "created_at": "2026-10-30T00:00:00Z",
+                "workflow_run": {"id": run_id},
+            }
+        ]
+        self.api.archives[1000 + run_id] = payload
+        return payload
+
+    def persist(self) -> performance_history.Persistence:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return performance_history.persist_recorded_performance(
+                self.api,
+                repository=REPOSITORY,
+                workflow=CI_WORKFLOW,
+                branch="dev",
+                checkout=self.repo,
+                history_dir=self.history,
+                download_dir=self.downloads,
+                require_host=True,
+                now=datetime.now(timezone.utc),
+                deadline=time.monotonic() + 60.0,
+            )
+
+    def commits(self, path: str = SERIES_FILE) -> list[str]:
+        return [row.commit for row in performance.read_results(self.history / path)]
+
+    def test_runs_newer_than_the_history_persist_oldest_first(self):
+        a = self.commit("a")
+        self.write(self.history, ["seed", a], KVM_RUNNER_HOST)
+        b = self.commit("b, which records a's results")
+        c = self.commit("c")
+        for run_id, sha in ((3, c), (1, a), (2, b)):
+            self.record(run_id, sha)
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [b, c])
+        self.assertEqual(outcome.recorded, 1)
+        self.assertFalse(outcome.failed)
+        self.assertEqual(self.commits(), ["seed", a, b, c])
+        # The run whose commit the history reaches is never downloaded.
+        self.assertEqual(self.api.downloads, [1002, 1003])
+        # Runs are read a day of their creation at a time, newest first.
+        params = self.api.listings[0]
+        assert params is not None
+        self.assertEqual(
+            {name: params[name] for name in ("branch", "event", "status")},
+            {"branch": "dev", "event": "push", "status": "completed"},
+        )
+        self.assertTrue(params["created"].startswith(">="))
+        self.assertRegex(
+            cast(Mapping[str, str], self.api.listings[1])["created"],
+            r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\.\.\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$",
+        )
+
+    def test_the_runs_end_with_the_first_page_that_the_history_reaches(self):
+        a = self.commit("a")
+        self.write(self.history, ["seed", a], KVM_RUNNER_HOST)
+        b = self.commit("b, which records a's results")
+        c = self.commit("c")
+        # Pages of two runs: c's and b's, then two of a's, then two more.
+        for run_id in (1, 2, 3, 4):
+            self.api.runs.append(self.run_document(run_id, a))
+        self.record(5, b)
+        self.record(6, c)
+        self.api.page_size = 2
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [b, c])
+        self.assertEqual(self.api.pages, 2)
+        self.assertEqual(len(self.api.listings), 1)
+        self.assertEqual(outcome.recorded, 2)
+
+    def test_a_rerun_persists_as_long_as_github_could_have_rerun_its_run(self):
+        # GitHub reruns a run up to 30 days after it first ran, and keeps the
+        # results that the rerun uploads for a week, so the runs are read back
+        # 38 days, a search a day.
+        b = self.commit("b")
+        c = self.commit("c")
+        now = datetime.now(timezone.utc)
+        self.record(1, b, created=now - timedelta(days=29))
+        self.record(2, c, created=now - timedelta(days=39))
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [b])
+        self.assertEqual(self.api.artifact_listings, [1])
+        self.assertEqual(len(self.api.listings), 38)
+
+    def test_a_day_of_more_runs_than_github_lists_stops_the_persistence(self):
+        b = self.commit("b")
+        for run_id in (1, 2, 3):
+            self.record(run_id, b)
+        self.api.limit = 2
+
+        with patch.object(performance_history, "_SEARCH_LIMIT", 2):
+            outcome = self.persist()
+
+        self.assertEqual(outcome.persisted, [])
+        assert outcome.stopped is not None
+        self.assertTrue(
+            outcome.stopped.startswith(
+                "could not list the runs of pushes to dev: GitHub lists no more "
+                "than 2 of the runs created since "
+            ),
+            outcome.stopped,
+        )
+        self.assertTrue(outcome.failed)
+        self.assertEqual(self.commits(), ["seed"])
+
+    def test_runs_whose_results_expired_are_skipped(self):
+        # The history went a week without a full run of dev.
+        b = self.commit("b")
+        c = self.commit("c")
+        d = self.commit("d")
+        self.record(1, b, updated=datetime.now(timezone.utc) - timedelta(days=9))
+        self.record(2, c, expired=True)
+        self.record(3, d)
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [d])
+        self.assertEqual(
+            outcome.skipped,
+            [
+                f"run 1 of {b[:12]} last ran over 8 days ago, so any results that "
+                "it recorded expired",
+                f"run 2 of {c[:12]}: its recorded results expired",
+            ],
+        )
+        self.assertFalse(outcome.failed)
+        # The first run's results can't remain, so nothing asks for them.
+        self.assertEqual(self.api.artifact_listings, [2, 3])
+        self.assertEqual(self.api.downloads, [1003])
+
+    def test_another_attempt_reuses_the_downloaded_results(self):
+        b = self.commit("b")
+        self.record(1, b)
+        before = (self.history / SERIES_FILE).read_bytes()
+        self.persist()
+
+        # The push of the first attempt failed, so the next starts again from
+        # dev's history.
+        (self.history / SERIES_FILE).write_bytes(before)
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [b])
+        self.assertEqual(self.api.downloads, [1001])
+        self.assertEqual(self.commits(), ["seed", b])
+
+    def test_a_later_run_persists_the_same_results_no_more(self):
+        b = self.commit("b")
+        self.record(1, b)
+        self.persist()
+        self.commit("data: update performance baselines")
+
+        outcome = self.persist()
+
+        self.assertEqual(outcome.persisted, [])
+        self.assertEqual(outcome.recorded, 1)
+        self.assertEqual(self.commits(), ["seed", b])
+
+    def test_only_completed_push_runs_of_the_first_parent_history_count(self):
+        b = self.commit("b")
+        self.git("checkout", "-q", "-b", "topic")
+        topic = self.commit("topic")
+        self.git("checkout", "-q", "dev")
+        self.git("merge", "-q", "--no-ff", "topic", "-m", "merge topic")
+        merge = self.git("rev-parse", "HEAD")
+        # A commit that dev merged in a second parent was never a push to dev.
+        self.record(1, topic)
+        self.record(2, merge)
+        for run_id, change in (
+            (3, {"event": "workflow_dispatch"}),
+            (4, {"head_branch": "topic"}),
+            (5, {"status": "in_progress"}),
+            (6, {"path": ".github/workflows/module-diagrams.yml"}),
+            (7, {"head_repository": {"full_name": "fork/nvx"}}),
+        ):
+            self.api.runs.append({**self.run_document(run_id, b), **change})
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [merge])
+        self.assertEqual(self.api.downloads, [1002])
+
+    def test_refused_results_are_skipped_and_the_later_runs_persist(self):
+        b = self.commit("b")
+        c = self.commit("c")
+        d = self.commit("d")
+        self.record(
+            1, b, write=lambda staging: self.write(staging, [c], KVM_RUNNER_HOST)
+        )
+        self.record(2, c, corrupt=True)
+        self.record(3, d)
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [d])
+        self.assertTrue(outcome.failed)
+        self.assertEqual(
+            outcome.refused,
+            [
+                f"run 1 of {b[:12]}: {SERIES_FILE} holds the results of {c[:12]}",
+                f"run 2 of {c[:12]}: artifact 1002 doesn't match its digest",
+            ],
+        )
+        self.assertEqual(self.commits(), ["seed", d])
+
+    def test_results_that_are_no_text_are_refused(self):
+        b = self.commit("b")
+        c = self.commit("c")
+
+        def write(staging: Path) -> None:
+            (staging / SERIES_FILE).write_bytes(b"\xff\xfe no UTF-8\n")
+
+        self.record(1, b, write=write)
+        self.record(2, c)
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [c])
+        [refused] = outcome.refused
+        self.assertTrue(
+            refused.startswith(
+                f"run 1 of {b[:12]}: {SERIES_FILE}: 'utf-8' codec can't decode"
+            ),
+            refused,
+        )
+        self.assertEqual(self.commits(), ["seed", c])
+
+    def test_artifacts_too_large_for_results_are_refused_unread(self):
+        b = self.commit("b")
+        c = self.commit("c")
+        self.record(1, b, size=performance_history._ARCHIVE_LIMIT_BYTES + 1)
+        self.record(2, c)
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [c])
+        self.assertEqual(
+            outcome.refused,
+            [
+                f"run 1 of {b[:12]}: artifact 1001 holds 16777217 bytes, more "
+                "than the 16777216 that recorded results may"
+            ],
+        )
+        self.assertEqual(self.api.downloads, [1002])
+
+    def test_archives_whose_members_do_not_decompress_are_refused(self):
+        def corrupt(offset: int, length: int) -> Callable[[bytes], bytes]:
+            """Overwrite the data of the archive's first member at `offset`."""
+
+            def mangle(payload: bytes) -> bytes:
+                names, extras = struct.unpack_from("<HH", payload, 26)
+                start = 30 + names + extras + offset
+                return payload[:start] + b"\xff" * length + payload[start + length :]
+
+            return mangle
+
+        # Data that each decompressor that zipfile uses can't decode.
+        cases = (
+            (zipfile.ZIP_DEFLATED, corrupt(0, 1)),
+            (zipfile.ZIP_BZIP2, corrupt(0, 1)),
+            (zipfile.ZIP_LZMA, corrupt(9, 16)),
+        )
+        commits = [self.commit(f"commit {number}") for number in range(4)]
+        for run_id, (compression, mangle) in enumerate(cases, 1):
+            self.record(
+                run_id, commits[run_id - 1], compression=compression, mangle=mangle
+            )
+        self.record(4, commits[3])
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [commits[3]])
+        self.assertEqual(len(outcome.refused), 3, outcome.refused)
+        for refused in outcome.refused:
+            self.assertIn(": its artifact is no valid ZIP archive: ", refused)
+        self.assertEqual(self.commits(), ["seed", commits[3]])
+
+    def test_a_run_that_cannot_be_fetched_stops_the_persistence(self):
+        b = self.commit("b")
+        c = self.commit("c")
+        payload = self.record(1, b)
+        self.record(2, c)
+        self.api.archives[1001] = GitHubApiError(502, "HTTP 502")
+
+        outcome = self.persist()
+
+        self.assertEqual(outcome.persisted, [])
+        self.assertEqual(outcome.stopped, f"stopped at run 1 of {b[:12]}: HTTP 502")
+        self.assertTrue(outcome.failed)
+        self.assertEqual(self.commits(), ["seed"])
+
+        # The next run persists both, in order.
+        self.api.archives[1001] = payload
+        outcome = self.persist()
+        self.assertEqual([run.sha for run in outcome.persisted], [b, c])
+        self.assertEqual(self.commits(), ["seed", b, c])
+
+    def test_results_that_github_deleted_are_refused(self):
+        b = self.commit("b")
+        c = self.commit("c")
+        self.record(1, b)
+        self.record(2, c)
+        self.api.archives[1001] = GitHubApiError(410, "HTTP 410")
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [c])
+        self.assertEqual(
+            outcome.refused, [f"run 1 of {b[:12]}: its recorded results are gone"]
+        )
+
+    def test_runs_that_recorded_no_results_are_skipped(self):
+        # A documentation change runs no platform jobs, for instance.
+        b = self.commit("b")
+        c = self.commit("c")
+        self.api.runs.append(self.run_document(1, b))
+        self.record(2, c)
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [c])
+        self.assertEqual(outcome.skipped, [f"run 1 of {b[:12]} recorded no results"])
+        self.assertFalse(outcome.failed)
+
+    def test_results_meet_the_host_that_the_history_expected_at_their_commit(self):
+        # dev accepted a new host after b, and reset the series with it, as it
+        # must. b's results come from the old host, which the history expected
+        # at b, so they aren't refused, but they stay out of the reset series;
+        # c's come from the new host.
+        new_host = changed_host(KVM_RUNNER_HOST, ("cpu", "model"), 207)
+        b = self.commit("b")
+        self.write(self.history, [], new_host)
+        c = self.commit("accept a new host")
+        self.record(1, b)
+        self.record(2, c, write=lambda staging: self.write(staging, [c], new_host))
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [c])
+        self.assertEqual(
+            outcome.skipped,
+            [
+                f"run 1 of {b[:12]}: the history expects another host of "
+                f"{KVM_SERIES} since its commit"
+            ],
+        )
+        self.assertFalse(outcome.failed)
+        self.assertEqual(self.commits(), [c])
+
+    def test_results_of_a_host_that_the_history_replaced_stay_out(self):
+        # dev accepted a second host, and a third while the series that it
+        # reset for the second was still empty, as a nightly batch can find it.
+        # The third reset removed no rows, but the second host's results must
+        # stay out of the third's series all the same.
+        second = changed_host(KVM_RUNNER_HOST, ("cpu", "model"), 207)
+        third = changed_host(KVM_RUNNER_HOST, ("cpu", "model"), 208)
+        b = self.commit("b")
+        self.write(self.history, [], second)
+        c = self.commit("accept the second host")
+        self.write(self.history, [], third)
+        d = self.commit("accept the third host")
+        e = self.commit("e")
+        self.record(1, b)
+        self.record(2, c, write=lambda staging: self.write(staging, [c], second))
+        self.record(3, d, write=lambda staging: self.write(staging, [d], third))
+        self.record(4, e, write=lambda staging: self.write(staging, [e], third))
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [d, e])
+        self.assertEqual(
+            outcome.skipped,
+            [
+                f"run {run_id} of {sha[:12]}: the history expects another host of "
+                f"{KVM_SERIES} since its commit"
+                for run_id, sha in ((1, b), (2, c))
+            ],
+        )
+        self.assertFalse(outcome.failed)
+        self.assertEqual(self.commits(), [d, e])
+
+    def test_advisory_host_edits_keep_the_results_of_the_host(self):
+        # dev records new microcode without a reset.
+        b = self.commit("b")
+        self.write(
+            self.history,
+            ["seed"],
+            changed_host(KVM_RUNNER_HOST, ("cpu", "microcode"), "0xd0003e7"),
+        )
+        self.commit("record the host's new microcode")
+        self.record(1, b)
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [b])
+        self.assertEqual(outcome.skipped, [])
+        self.assertEqual(self.commits(), ["seed", b])
+
+    def test_only_the_platform_whose_host_changed_loses_its_results(self):
+        mshv_series = f"{MSHV_SERIES}-microvm-v2-1vcpu.csv"
+        self.write(self.history, ["seed"], MSHV_RUNNER_HOST, series=MSHV_SERIES)
+        self.commit("track linux-mshv")
+        b = self.commit("b")
+        self.write(
+            self.history, [], changed_host(KVM_RUNNER_HOST, ("cpu", "model"), 207)
+        )
+        self.commit("accept a new linux-kvm host")
+
+        def write(staging: Path) -> None:
+            self.write(staging, [b], KVM_RUNNER_HOST)
+            self.write(staging, [b], MSHV_RUNNER_HOST, series=MSHV_SERIES)
+
+        self.record(1, b, write=write)
+
+        outcome = self.persist()
+
+        self.assertEqual([run.sha for run in outcome.persisted], [b])
+        self.assertEqual(
+            outcome.skipped,
+            [
+                f"run 1 of {b[:12]}: the history expects another host of "
+                f"{KVM_SERIES} since its commit"
+            ],
+        )
+        self.assertEqual(self.commits(), [])
+        self.assertEqual(self.commits(mshv_series), ["seed", b])
+
+    def test_a_run_persists_whole_or_not_at_all(self):
+        # The history's 2-processor series has another unit than the results,
+        # which persisting finds only after it took the 1-processor series.
+        self.write(self.history, ["seed"], KVM_RUNNER_HOST, unit="s", processors=2)
+        b = self.commit("b")
+
+        def write(staging: Path) -> None:
+            self.write(staging, [b], KVM_RUNNER_HOST)
+            self.write(staging, [b], KVM_RUNNER_HOST, processors=2)
+
+        self.record(1, b, write=write)
+
+        outcome = self.persist()
+
+        self.assertEqual(outcome.persisted, [])
+        [refused] = outcome.refused
+        self.assertIn("metric metadata changed for openvmm_cold_start", refused)
+        self.assertEqual(self.commits(), ["seed"])
+
+    def test_the_command_commits_what_it_persisted_and_fails_on_a_refusal(self):
+        b = self.commit("b")
+        c = self.commit("c")
+        self.record(
+            1, b, write=lambda staging: self.write(staging, [c], KVM_RUNNER_HOST)
+        )
+        self.record(2, c)
+        summary = self.root / "summary.md"
+        message = self.root / "message.txt"
+        args = nvx.parse_args(
+            [
+                "persist-recorded-performance",
+                "--repository",
+                REPOSITORY,
+                "--workflow-ref",
+                f"{REPOSITORY}/{CI_WORKFLOW}@refs/heads/dev",
+                "--history-dir",
+                str(self.history),
+                "--download-dir",
+                str(self.downloads),
+                "--require-host",
+                "--summary",
+                str(summary),
+                "--message",
+                str(message),
+            ]
+        )
+        stdout = io.StringIO()
+        with (
+            patch.dict(os.environ, {"GH_TOKEN": "token"}),
+            patch.object(performance_history, "GitHubClient", return_value=self.api),
+            contextlib.redirect_stdout(stdout),
+        ):
+            status = args.handler(args)
+
+        self.assertEqual(status, 1)
+        self.assertEqual(self.commits(), ["seed", c])
+        self.assertEqual(
+            message.read_text(encoding="utf-8"),
+            f"data: update performance baselines ({c}) [skip ci]\n\n"
+            "Persist the performance results that these dev push runs recorded:\n\n"
+            f"- {c} https://github.com/{REPOSITORY}/actions/runs/2\n",
+        )
+        self.assertIn(
+            f"- [run 2](https://github.com/{REPOSITORY}/actions/runs/2)",
+            summary.read_text(encoding="utf-8"),
+        )
+        self.assertIn(f"::error::run 1 of {b[:12]}: ", stdout.getvalue())
+
+    def test_annotations_escape_the_reasons(self):
+        outcome = performance_history.Persistence(
+            refused=["run 6 of 0123456789ab: 100% gone\nfor good"],
+            stopped="stopped at run 7: GitHub failed",
+        )
+        lines, summary = performance_history.report(outcome)
+        self.assertEqual(
+            lines,
+            [
+                "::error::run 6 of 0123456789ab: 100%25 gone%0Afor good",
+                "::error::stopped at run 7: GitHub failed",
+            ],
+        )
+        self.assertIn("Persisted no recorded results.", summary)
+        self.assertIn("- Stopped: stopped at run 7: GitHub failed", summary)
 
 
 if __name__ == "__main__":

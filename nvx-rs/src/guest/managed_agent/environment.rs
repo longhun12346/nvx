@@ -1,0 +1,80 @@
+//! Environments that the agent and its helper build in memory and pass to `execve`.
+//!
+//! An environment changes as C's own did under musl's environment functions: setting a variable,
+//! as `setenv` and `putenv` do, replaces its first entry in place or appends one.
+
+use std::ffi::CString;
+use std::os::unix::ffi::OsStringExt;
+
+use crate::guest::sys::{Errno, c_string};
+
+/// Copies the current process environment as `NAME=value` entries.
+pub(super) fn inherited() -> Result<Vec<CString>, Errno> {
+    std::env::vars_os()
+        .map(|(name, value)| {
+            let mut entry = name.into_vec();
+            entry.push(b'=');
+            entry.extend(value.into_vec());
+            c_string(&entry)
+        })
+        .collect()
+}
+
+/// Sets `name` to `value`, or `EINVAL` if either contains a NUL.
+pub(super) fn set(environment: &mut Vec<CString>, name: &[u8], value: &[u8]) -> Result<(), Errno> {
+    let mut entry = Vec::with_capacity(name.len() + value.len() + 1);
+    entry.extend_from_slice(name);
+    entry.push(b'=');
+    entry.extend_from_slice(value);
+    let entry = c_string(&entry)?;
+    match environment.iter_mut().find(|current| names(current, name)) {
+        Some(current) => *current = entry,
+        None => environment.push(entry),
+    }
+    Ok(())
+}
+
+/// Returns whether `entry` sets the variable `name`.
+fn names(entry: &CString, name: &[u8]) -> bool {
+    entry
+        .as_bytes()
+        .strip_prefix(name)
+        .is_some_and(|rest| rest.first() == Some(&b'='))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries(environment: &[CString]) -> Vec<&[u8]> {
+        environment.iter().map(|entry| entry.as_bytes()).collect()
+    }
+
+    #[test]
+    fn setting_replaces_the_first_entry_in_place_or_appends_one() {
+        let mut environment = vec![
+            c"A=1".to_owned(),
+            c"AB=2".to_owned(),
+            c"B=3".to_owned(),
+            c"A=4".to_owned(),
+        ];
+        set(&mut environment, b"A", b"5").unwrap();
+        set(&mut environment, b"C", b"").unwrap();
+        assert_eq!(
+            entries(&environment),
+            [b"A=5".as_slice(), b"AB=2", b"B=3", b"A=4", b"C="]
+        );
+        assert_eq!(set(&mut environment, b"D", b"\0"), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn the_inherited_environment_has_every_variable() {
+        let environment = inherited().unwrap();
+        assert_eq!(environment.len(), std::env::vars_os().count());
+        assert!(
+            environment
+                .iter()
+                .all(|entry| entry.as_bytes().contains(&b'='))
+        );
+    }
+}

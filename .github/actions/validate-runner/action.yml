@@ -42,7 +42,7 @@ runs:
         test -n "${toolchain}"
         if ! rustup toolchain list | awk -v name="${toolchain}" \
           'index($1, name "-") == 1 { found = 1 } END { exit !found }'; then
-          echo "::error::Rust ${toolchain}, which rust-toolchain.toml pins, is not installed; rerun scripts/setup/setup-linux-runner.sh" >&2
+          echo "::error::Rust ${toolchain}, which rust-toolchain.toml pins, is not installed; rerun scripts/setup/setup-linux.sh --runner-only" >&2
           exit 1
         fi
         rust_version=$(rustc --version)
@@ -167,15 +167,82 @@ runs:
           throw "Hyper-V SVGA firmware was not found: $svgaFirmware"
         }
 
+    # A cancelled job's harness can start OpenVMM after the runner's orphan
+    # cleanup has listed the job's processes, and then die without stopping
+    # it, which leaves the VM loading a CPU for days (#768). A runner runs one
+    # job at a time and no step before this one starts OpenVMM, so any
+    # OpenVMM process of the runner's account is left from an earlier job.
+    - name: Terminate OpenVMM left by earlier jobs
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        name=openvmm
+        user=$(id -u)
+        # Lists the account's OpenVMM processes; a zombie has already exited.
+        live() {
+          ps -u "${user}" -o pid=,stat=,comm= |
+            awk -v name="${name}" '$3 == name && $2 !~ /^Z/ { print $1 }'
+        }
+        leaked=$(live)
+        if [ -z "${leaked}" ]; then
+          exit 0
+        fi
+        for pid in ${leaked}; do
+          started=$(ps -o lstart= -p "${pid}" || true)
+          echo "::warning::Terminating OpenVMM process ${pid}, started ${started:-at an unknown time}, which an earlier job left running"
+          echo "  command: $(ps -o args= -p "${pid}" || true)"
+        done
+        # shellcheck disable=SC2086
+        kill -TERM ${leaked} 2>/dev/null || true
+        for _ in $(seq 50); do
+          remaining=$(live)
+          if [ -z "${remaining}" ]; then
+            exit 0
+          fi
+          sleep 0.1
+        done
+        # shellcheck disable=SC2086
+        kill -KILL ${remaining} 2>/dev/null || true
+        sleep 1
+        remaining=$(live)
+        if [ -n "${remaining}" ]; then
+          echo "::error::OpenVMM processes that an earlier job left running did not exit: ${remaining//$'\n'/ }" >&2
+          exit 1
+        fi
+
+    # A harness that something killed outright, as the runner's orphan
+    # cleanup killed those of cancelled jobs, leaves its scenarios' scratch
+    # directories in the temporary directory (#946). As with OpenVMM, no step
+    # before this one runs the harness, so the account's harness directories
+    # there are left from earlier jobs.
+    - name: Remove scratch left by earlier jobs
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        temporary=$(python3 -c 'import tempfile; print(tempfile.gettempdir())')
+        find "${temporary}" -mindepth 1 -maxdepth 1 -type d -user "$(id -u)" \
+          \( -name 'nvx-*' -o -name 'openvmm-*' \) -print0 |
+          while IFS= read -r -d '' directory; do
+            modified=$(stat -c %y "${directory}" || true)
+            echo "::notice::Removing ${directory}, last modified ${modified:-at an unknown time}, which an earlier job left behind"
+            # A scenario can leave a directory that even its owner can't write.
+            chmod -R u+rwX -- "${directory}" 2>/dev/null || true
+            if ! rm -rf --one-file-system -- "${directory}"; then
+              echo "::warning::Could not remove ${directory}, which an earlier job left behind"
+            fi
+          done
+
     # Host time. The time ABI host qualification (doc/ci.md,
     # "Host qualification") checks the backend, the CPU fingerprint and
-    # generation, and the TSC rate stability on its short CI schedule, and,
-    # in jobs that downloaded OpenVMM, its CPU profile check (H2) and
-    # preflight (H3); other jobs qualify without OpenVMM. Jobs whose guests
-    # run without the microVM scenarios' warp probes add the guest warp probe
-    # (H6). The host's invariant-TSC flags are evidence only: the guest warp
-    # probe measures the cross-vCPU skew that a host without one can cause
-    # (#265).
+    # generation, and the TSC rate stability and the host's synchronized clock
+    # correction on its short CI schedule, and, in jobs that downloaded
+    # OpenVMM, its CPU profile check (H2) and preflight (H3); other jobs
+    # qualify without OpenVMM. Jobs whose guests run without the microVM
+    # scenarios' warp probes add the guest warp probe (H6). The host's
+    # invariant-TSC flags are evidence only: the guest warp probe measures the
+    # cross-vCPU skew that a host without one can cause (#265).
     - name: Report host TSC
       if: runner.os != 'Windows'
       shell: bash

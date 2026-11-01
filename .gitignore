@@ -7,9 +7,9 @@
 /.venv/
 /.ruff_cache/
 /.nvx-hosts.json
-/aci_edge_sandboxes/target/
 /nvx-rs/target/
 /tools/nvxd/target/
+/tests/runtime-adapter/target/
 __pycache__/
 *.py[cod]
 *.log

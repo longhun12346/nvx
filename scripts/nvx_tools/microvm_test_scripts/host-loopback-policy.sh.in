@@ -68,6 +68,15 @@ allow)
     general=$(wget -T 5 -qO- http://@GATEWAY_IPV4@:@GENERAL_PORT@/general) ||
         fail 93
     [ "$general" = NVX-HOST-LOOPBACK-GENERAL ] || fail 94
+    # A connected UDP socket, as nc's, receives the answers of host services
+    # on IPv4 and IPv6 loopback only from the gateway address and port that it
+    # sent its datagram to (#560).
+    udp_echo=$(printf 'NVX-HOST-LOOPBACK-UDP-ECHO\n' |
+        nc -u -w 2 @GATEWAY_IPV4@ @UDP_ECHO_PORT@ 2>/dev/null) || true
+    [ "$udp_echo" = NVX-HOST-LOOPBACK-UDP-ECHO-REPLY ] || fail 84
+    udp_echo=$(printf 'NVX-HOST-LOOPBACK-UDP-ECHO\n' |
+        nc -u -w 2 @GATEWAY_IPV6@ @UDP_ECHO_IPV6_PORT@ 2>/dev/null) || true
+    [ "$udp_echo" = NVX-HOST-LOOPBACK-UDP-ECHO-REPLY ] || fail 85
     rm -f /tmp/nvx-host-loopback-tcp-ipv4 /tmp/nvx-host-loopback-tcp-ipv6 \
         /tmp/nvx-host-loopback-tcp-forward /tmp/nvx-host-loopback-udp \
         /tmp/nvx-host-loopback-udp-ipv6 \
@@ -107,6 +116,8 @@ allow)
     wait_for_socket "^0100007F:$private_hex\$" 0A /proc/net/tcp || fail 96
     wait_for_socket "^00000000000000000000000001000000:$private_hex\$" 0A \
         /proc/net/tcp6 || fail 96
+    # The terminal would echo the host's release into the lines after it.
+    stty -echo || fail 78
     echo NVX-HOST-LOOPBACK-INGRESS-READY
 
     read -r release || fail 76

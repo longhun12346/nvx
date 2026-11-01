@@ -4,22 +4,27 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
+import functools
 import json
 import math
 import os
 import re
 import statistics
+import subprocess
 import sys
 import tempfile
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
-from . import benchmark_host, host_telemetry
+from . import benchmark_host, host_telemetry, storage_events
+from .build_constants import BuildConstants
 from .common import bytes_to_mib, positive_int, sha256_file
 
+ROOT = BuildConstants.REPO_ROOT
 LEGACY_CSV_FIELDS = ["commit", "metric", "unit", "direction", "p50"]
 CSV_FIELDS = [
     "platform",
@@ -73,15 +78,16 @@ LIFECYCLE_MEMORY_MIB = 128
 LIFECYCLE_BOOT_MARKER = "ALPINE-MICROVM-BOOT-OK"
 LIFECYCLE_RESTORE_MARKER = "OPENVMM-SNAPSHOT-RESTORE-OK"
 LIFECYCLE_CAPTURE_TIMING = "openvmm-input-gate-to-publication"
-LIFECYCLE_STABILITY_MINIMUM_SAMPLES = 10
-LIFECYCLE_STABILITY_MINIMUM_CLUSTER_SAMPLES = 2
-LIFECYCLE_SNAPSHOT_MAX_P50_OVER_P25 = 1.25
-LIFECYCLE_SNAPSHOT_MAX_CLUSTER_GAP = 1.25
-UNSTABLE_LIFECYCLE_EXIT_CODE = 75
+STABILITY_MINIMUM_SAMPLES = 10
+STABILITY_MINIMUM_CLUSTER_SAMPLES = 2
+STABILITY_MAX_P50_OVER_P25 = 1.25
+STABILITY_MAX_CLUSTER_GAP = 1.25
+UNSTABLE_EXIT_CODE = 75
 LIFECYCLE_ATTEMPT_LOG_SCHEMA_VERSION = 1
-LIFECYCLE_ATTEMPT_STATUSES = {0: "valid", UNSTABLE_LIFECYCLE_EXIT_CODE: "unstable"}
+LIFECYCLE_ATTEMPT_STATUSES = {0: "valid", UNSTABLE_EXIT_CODE: "unstable"}
 """Validation statuses by exit status; any other status is ``invalid``."""
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+COMMIT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 NUMBER = r"[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?"
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SHELL_SNAPSHOT_MEMORIES_MIB = (128, 256, 512)
@@ -105,6 +111,21 @@ SHELL_SNAPSHOT_SECTION = re.compile(
     r"(?P<body>.*?)(?=^==\s*[0-9]+\s+MiB\s*==\s*$|\Z)",
     re.IGNORECASE | re.MULTILINE | re.DOTALL,
 )
+SHELL_SNAPSHOT_RESTORE_LOGS = ("shell-snapshot.log", "shell-snapshot-restore.log")
+SHELL_SNAPSHOT_RESTORE_SUMMARY = re.compile(
+    rf"^\s*snapshot restore\s*:\s*median\s+(?P<median>{NUMBER})\s*ms\b"
+    r"[^\n]*\bn=(?P<count>[0-9]+)\)",
+    re.IGNORECASE | re.MULTILINE,
+)
+SHELL_SNAPSHOT_RESTORE_SAMPLES = re.compile(
+    r"^\s*restore samples\s*:[ \t]*(?P<samples>[^\r\n]*?)[ \t]*ms[ \t]*\r?$",
+    re.IGNORECASE | re.MULTILINE,
+)
+SAMPLE_VALUE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+# The KVM CI runners restore a shell snapshot in two modes about twice apart,
+# so about a third of their restore series exceed the stability limits without
+# a host stall, against fewer than 0.1% on MSHV and WHP (#345).
+RESTORE_STABILITY_BACKENDS = frozenset({"mshv", "whp"})
 
 
 class PerformanceError(RuntimeError):
@@ -364,6 +385,57 @@ def _parse_shell_snapshot_restore(text: str) -> dict[str, MetricValue]:
             )
         )
     return metrics
+
+
+def _shell_snapshot_restore_samples(text: str, source: str) -> dict[int, list[float]]:
+    """Return the restore samples that each memory section of a shell-snapshot
+    log lists, by memory size.
+
+    A section whose summary counts at least ``STABILITY_MINIMUM_SAMPLES``
+    restores must list them, so that a log can't evade the stability guard by
+    omitting them. The listed samples must be positive and match the summary's
+    count and median.
+    """
+    sections = _shell_snapshot_sections(text, source)
+    if not sections:
+        raise PerformanceError(f"missing memory sections in {source}")
+    series: dict[int, list[float]] = {}
+    for memory_mib, body in sorted(sections.items()):
+        location = f"{source} ({memory_mib} MiB)"
+        summary = SHELL_SNAPSHOT_RESTORE_SUMMARY.search(body)
+        if summary is None:
+            raise PerformanceError(f"missing snapshot restore summary in {location}")
+        count = int(summary.group("count"))
+        listed = SHELL_SNAPSHOT_RESTORE_SAMPLES.search(body)
+        if listed is None:
+            if count >= STABILITY_MINIMUM_SAMPLES:
+                raise PerformanceError(f"missing restore samples in {location}")
+            continue
+        values = [value.strip() for value in listed.group("samples").split(",")]
+        if not all(SAMPLE_VALUE.fullmatch(value) for value in values):
+            raise PerformanceError(
+                f"malformed restore samples in {location}: {listed.group('samples')!r}"
+            )
+        samples = [float(value) for value in values]
+        # The stability guard divides by samples.
+        if not all(sample > 0 for sample in samples):
+            raise PerformanceError(f"non-positive restore sample in {location}")
+        if len(samples) != count:
+            raise PerformanceError(
+                f"{location} lists {len(samples)} restore samples, but its "
+                f"summary counts {count}"
+            )
+        median = statistics.median(samples)
+        reported = _number(summary.group("median"))
+        # The summary rounds the median to 0.1 ms, and the list rounds each
+        # sample to 0.001 ms.
+        if abs(median - reported) > 0.051:
+            raise PerformanceError(
+                f"{location} lists restore samples with median {median:.3f} ms, "
+                f"but its summary reports {reported:g} ms"
+            )
+        series[memory_mib] = samples
+    return series
 
 
 def _parse_network(text: str) -> dict[str, MetricValue]:
@@ -953,25 +1025,27 @@ def _openvmm_statistics(
     return p50, minimum, maximum, len(samples)
 
 
-def _validate_snapshot_generation_stability(
-    document: dict[str, object], backend: str, source: Path
-) -> None:
-    samples = _openvmm_samples(
-        document, "snapshot_capture", backend, "samples_ms", source
-    )
-    if len(samples) < LIFECYCLE_STABILITY_MINIMUM_SAMPLES:
+def _validate_sample_stability(samples: Sequence[float], series: str) -> None:
+    """Reject a millisecond series that a transient host stall split.
+
+    With at least ``STABILITY_MINIMUM_SAMPLES`` samples, a p50 more than 25%
+    above p25, or a gap of more than 25% between adjacent sorted samples with
+    at least two samples on each side, raises ``UnstablePerformanceError``.
+    A single outlier and a uniformly slower series both pass. Callers must
+    pass positive samples.
+    """
+    if len(samples) < STABILITY_MINIMUM_SAMPLES:
         return
 
     ordered = sorted(samples)
     p25 = ordered[math.ceil(len(ordered) * 0.25) - 1]
     p50 = statistics.median(ordered)
     ratio = p50 / p25
-    if ratio > LIFECYCLE_SNAPSHOT_MAX_P50_OVER_P25:
+    if ratio > STABILITY_MAX_P50_OVER_P25:
         raise UnstablePerformanceError(
-            f"unstable snapshot generation at {source}:snapshot_capture."
-            f"{backend}.samples_ms: p50 {p50:.3f} ms is "
+            f"unstable {series}: p50 {p50:.3f} ms is "
             f"{(ratio - 1) * 100:.1f}% above p25 {p25:.3f} ms "
-            f"(limit {(LIFECYCLE_SNAPSHOT_MAX_P50_OVER_P25 - 1) * 100:.1f}%); "
+            f"(limit {(STABILITY_MAX_P50_OVER_P25 - 1) * 100:.1f}%); "
             "rerun on an idle host"
         )
 
@@ -983,20 +1057,84 @@ def _validate_snapshot_generation_stability(
             ordered[split_index],
         )
         for split_index in range(
-            LIFECYCLE_STABILITY_MINIMUM_CLUSTER_SAMPLES,
-            len(ordered) - LIFECYCLE_STABILITY_MINIMUM_CLUSTER_SAMPLES + 1,
+            STABILITY_MINIMUM_CLUSTER_SAMPLES,
+            len(ordered) - STABILITY_MINIMUM_CLUSTER_SAMPLES + 1,
         )
     )
     gap_ratio, split_index, lower, upper = max(cluster_gaps)
-    if gap_ratio > LIFECYCLE_SNAPSHOT_MAX_CLUSTER_GAP:
+    if gap_ratio > STABILITY_MAX_CLUSTER_GAP:
         raise UnstablePerformanceError(
-            f"unstable snapshot generation at {source}:snapshot_capture."
-            f"{backend}.samples_ms: samples split {split_index}/"
+            f"unstable {series}: samples split {split_index}/"
             f"{len(ordered) - split_index} between {lower:.3f} ms and "
             f"{upper:.3f} ms ({(gap_ratio - 1) * 100:.1f}% gap, "
-            f"limit {(LIFECYCLE_SNAPSHOT_MAX_CLUSTER_GAP - 1) * 100:.1f}%); "
+            f"limit {(STABILITY_MAX_CLUSTER_GAP - 1) * 100:.1f}%); "
             "rerun on an idle host"
         )
+
+
+def _validate_snapshot_generation_stability(
+    document: dict[str, object], backend: str, source: Path
+) -> None:
+    _validate_sample_stability(
+        _openvmm_samples(document, "snapshot_capture", backend, "samples_ms", source),
+        f"snapshot generation at {source}:snapshot_capture.{backend}.samples_ms",
+    )
+
+
+def _shell_snapshot_restore_logs(input_dir: Path) -> list[Path]:
+    return [
+        input_dir / filename
+        for filename in SHELL_SNAPSHOT_RESTORE_LOGS
+        if (input_dir / filename).is_file()
+    ]
+
+
+def _validate_restore_stability(logs: Sequence[Path]) -> int:
+    """Reject the shell-snapshot restore series in ``logs`` that a transient
+    host stall split, reporting every such series, and return how many series
+    had enough samples to check."""
+    checked = 0
+    unstable: list[str] = []
+    for path in logs:
+        series = _shell_snapshot_restore_samples(_read_log(path), str(path))
+        for memory_mib, samples in series.items():
+            if len(samples) < STABILITY_MINIMUM_SAMPLES:
+                continue
+            checked += 1
+            try:
+                _validate_sample_stability(
+                    samples, f"shell-snapshot restore at {path} ({memory_mib} MiB)"
+                )
+            except UnstablePerformanceError as error:
+                unstable.append(str(error))
+    if unstable:
+        raise UnstablePerformanceError("\n".join(unstable))
+    return checked
+
+
+def validate_workload_stability(platform: str, input_dir: Path) -> None:
+    """Check the workload logs in ``input_dir`` for series that a transient
+    host stall split, so that the caller can remeasure them before collection.
+
+    Only the shell-snapshot restore series have a guard, and only on the
+    backends in ``RESTORE_STABILITY_BACKENDS``.
+    """
+    backend = OPENVMM_BACKENDS.get(platform)
+    if backend is None:
+        raise PerformanceError(f"unsupported OpenVMM benchmark platform: {platform!r}")
+    logs = _shell_snapshot_restore_logs(input_dir)
+    if not logs:
+        raise PerformanceError(f"no shell-snapshot restore log found in {input_dir}")
+    if backend not in RESTORE_STABILITY_BACKENDS:
+        print(
+            f"SKIP: shell-snapshot restore series have no stability guard on {backend}"
+        )
+        return
+    checked = _validate_restore_stability(logs)
+    print(
+        f"Shell-snapshot restore series in {input_dir} are stable "
+        f"({checked} with at least {STABILITY_MINIMUM_SAMPLES} samples checked)"
+    )
 
 
 def read_lifecycle_data(platform: str, input_path: Path) -> LifecycleData:
@@ -1912,6 +2050,8 @@ def collect_results(
             if metric in collected:
                 raise PerformanceError(f"duplicate collected metric: {metric}")
             collected[metric] = value
+    if OPENVMM_BACKENDS.get(platform) in RESTORE_STABILITY_BACKENDS:
+        _validate_restore_stability(_shell_snapshot_restore_logs(input_dir))
 
     lifecycle = (
         read_lifecycle_data(platform, lifecycle_input)
@@ -2248,12 +2388,197 @@ def _verify_result_hosts(
             )
 
 
+def _git(checkout: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(checkout), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise PerformanceError(
+            f"git {' '.join(args)} failed: {completed.stderr.strip()}"
+        )
+    return completed.stdout
+
+
+def _resolve_commit_id(revision: str, checkout: Path) -> str:
+    """Return the full ID of the commit that ``revision`` names in ``checkout``.
+
+    A symbolic revision such as ``HEAD`` names another commit by the time its
+    results are persisted, so results record the commit ID instead.
+    """
+    if COMMIT_ID.fullmatch(revision):
+        return revision
+    if not revision.startswith("-"):
+        try:
+            commit = _git(
+                checkout, "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"
+            ).strip()
+        except PerformanceError:
+            commit = ""
+        if COMMIT_ID.fullmatch(commit):
+            return commit
+    raise PerformanceError(f"--commit {revision} does not name a commit in {checkout}")
+
+
+def _committed_results(top: Path, revision: str, relative: str) -> list[Result]:
+    shown = subprocess.run(
+        ["git", "-C", str(top), "show", f"{revision}:{relative}"],
+        check=False,
+        capture_output=True,
+    )
+    if shown.returncode != 0:
+        return []
+    with tempfile.TemporaryDirectory() as temporary:
+        # Keep the basename: a legacy CSV takes its platform from the file name.
+        path = Path(temporary) / Path(relative).name
+        path.write_bytes(shown.stdout)
+        return read_results(path)
+
+
+# A commit ID names the same file forever, so a batch that checks the results of
+# many commits against one history reads each of its versions once.
+@functools.cache
+def _dimension_counts(
+    top: Path,
+    revision: str,
+    relative: str,
+) -> Counter[tuple[str, int, int, str]]:
+    """Return the rows of each dimension of ``relative`` at the commit ID
+    ``revision``. Callers must not modify the cached counts."""
+    return Counter(
+        _dimension_key(result, "")
+        for result in _committed_results(top, revision, relative)
+    )
+
+
+@functools.cache
+def _measurement_line(top: Path, measured: str, head: str) -> frozenset[str]:
+    """Return the commits on the path from the commit ID ``measured`` to the
+    commit ID ``head``: those that descend from ``measured``, itself included,
+    and lead to ``head``."""
+    ancestor = subprocess.run(
+        ["git", "-C", str(top), "merge-base", "--is-ancestor", measured, head],
+        check=False,
+        capture_output=True,
+    )
+    if ancestor.returncode != 0:
+        raise PerformanceError(
+            f"result commit {measured} is not an ancestor of the target history"
+        )
+    later = _git(top, "rev-list", "--ancestry-path", f"{measured}..{head}").split()
+    return frozenset([measured, *later])
+
+
+def _reset_dimensions_since(
+    git_checkout: Path,
+    history_path: Path,
+    commit: str,
+) -> set[tuple[str, int, int, str]]:
+    """Return the dimensions whose committed history lost rows after ``commit``.
+
+    A result measured at ``commit`` predates any later commit that removes the
+    dimension's rows, so it must not be appended onto the reset series.
+    """
+    # A mutable reference such as HEAD would compare the history with itself.
+    if not COMMIT_ID.fullmatch(commit):
+        raise PerformanceError(f"result commit {commit} is not a full commit ID")
+    top = Path(_git(git_checkout, "rev-parse", "--show-toplevel").strip()).resolve()
+    try:
+        relative = history_path.resolve().relative_to(top).as_posix()
+    except ValueError as error:
+        raise PerformanceError(f"{history_path} is outside the git checkout") from error
+    head = _git(top, "rev-parse", "--verify", "HEAD^{commit}").strip()
+    line = _measurement_line(top, commit, head)
+    # Compare each commit with its own parents: a side branch forked before
+    # ``commit`` can hold fewer rows than ``commit`` without having reset them.
+    # Only a commit whose history differs from a parent's can drop rows, and
+    # --full-history lists each such commit, merges included, however few
+    # of the other commits change the history.
+    later = _git(
+        top,
+        "log",
+        "--reverse",
+        "--full-history",
+        "--format=%H %P",
+        f"{commit}..{head}",
+        "--",
+        relative,
+    ).splitlines()
+    resets: set[tuple[str, int, int, str]] = set()
+    for entry in later:
+        revision, *parents = entry.split()
+        # Ignore commits on side branches that are not part of the history
+        # leading from the measurement to HEAD, even if later merged/reverted.
+        if revision not in line:
+            continue
+        current = _dimension_counts(top, revision, relative)
+        for parent in parents:
+            # A branch that neither predates nor follows the measurement can drop rows
+            # that were already reset before it, so only the measurement's line counts.
+            if parent not in line:
+                continue
+            before = _dimension_counts(top, parent, relative)
+            resets.update(key for key, count in before.items() if current[key] < count)
+    return resets
+
+
+def _without_reset_rows(
+    git_checkout: Path,
+    history_path: Path,
+    results: Sequence[Result],
+) -> list[Result]:
+    resets: dict[str, set[tuple[str, int, int, str]]] = {}
+    kept: list[Result] = []
+    for result in results:
+        if result.commit not in resets:
+            resets[result.commit] = _reset_dimensions_since(
+                git_checkout, history_path, result.commit
+            )
+        if _dimension_key(result, "") in resets[result.commit]:
+            print(
+                f"Skipped {result.metric} measured at {result.commit[:12]}: "
+                f"{history_path.name} was reset after that commit"
+            )
+            continue
+        kept.append(result)
+    return kept
+
+
+def _git_checkout_of(path: Path) -> Path | None:
+    """Return the nearest existing directory of ``path`` when it is in a git checkout.
+
+    ``path`` need not exist, as for a new history directory or one that a reset
+    removed; neither may skip the reset and ancestry checks. CI's history is
+    always in a checkout.
+    """
+    directory = path.resolve()
+    while not directory.is_dir():
+        if directory.parent == directory:
+            return None
+        directory = directory.parent
+    probe = subprocess.run(
+        ["git", "-C", str(directory), "rev-parse", "--is-inside-work-tree"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    inside = probe.returncode == 0 and probe.stdout.strip() == "true"
+    return directory if inside else None
+
+
 def persist_results(
     source_dir: Path,
     history_dir: Path,
     excluded_metrics: Iterable[str] = (),
     require_host: bool = False,
+    git_checkout: Path | None = None,
+    host_dir: Path | None = None,
 ) -> None:
+    """Append the results in ``source_dir`` that ``history_dir`` lacks to its
+    history, once their hosts match the expected hosts of ``host_dir``, by
+    default ``history_dir``'s own."""
     source_files = sorted(source_dir.glob("*.csv"))
     if not source_files:
         raise PerformanceError(f"no result CSV files found in {source_dir}")
@@ -2265,7 +2590,7 @@ def persist_results(
     _validate_result_files(source_files, loaded)
     _verify_result_hosts(
         source_dir,
-        history_dir,
+        history_dir if host_dir is None else host_dir,
         {result.platform for results in loaded.values() for result in results},
         require_host,
     )
@@ -2275,6 +2600,14 @@ def persist_results(
         current = [result for result in source_results if result.metric not in excluded]
         history_path = history_dir / source_path.name
         existing = read_results(history_path) if history_path.exists() else []
+        existing_keys = {_result_identity(result) for result in existing}
+        current = [
+            result
+            for result in current
+            if _result_identity(result) not in existing_keys
+        ]
+        if git_checkout is not None:
+            current = _without_reset_rows(git_checkout, history_path, current)
         metadata = {
             (
                 result.platform,
@@ -2300,12 +2633,7 @@ def persist_results(
                     f"{expected} -> {actual}"
                 )
 
-        existing_keys = {_result_identity(result) for result in existing}
-        new_results = [
-            result
-            for result in current
-            if _result_identity(result) not in existing_keys
-        ]
+        new_results = current
         if not new_results:
             print(f"No new performance rows to persist for {source_path.name}")
             continue
@@ -2702,6 +3030,38 @@ def check_host(
     return 1 if changed else 0
 
 
+def save_storage_events(
+    since: dt.datetime, output_dir: Path, scratch_dir: Path | None = None
+) -> int:
+    """Save the storage events of a Windows job's window, from ``since`` to
+    now, in ``output_dir``, print their summary, and warn of slow I/O and of
+    an unreadable log. A failed job saves them as diagnostics, so an
+    unreadable log doesn't fail the save; other hosts have no such events."""
+    if sys.platform != "win32":
+        print("ERROR: storage events are recorded only on Windows", file=sys.stderr)
+        return 2
+
+    def volumes() -> dict[str, Path]:
+        # Resolving a path on a stalled volume can wait for it, so this runs
+        # only after the export, and within its bound.
+        volumes = benchmark_host.benchmark_volumes(scratch_dir)
+        system_root = os.environ.get("SystemRoot")
+        if system_root:
+            volumes["system"] = Path(system_root)
+        return volumes
+
+    report = storage_events.save_storage_events(since, output_dir, volumes)
+    for line in report.lines():
+        print(line)
+    if report.unsaved:
+        print(f"Saved only part of the storage events in {output_dir}")
+    else:
+        print(f"Saved the storage events in {output_dir}")
+    for title, message in report.warnings():
+        print(_annotation("warning", title, message))
+    return 0
+
+
 def _non_negative_float(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed < 0:
@@ -2750,6 +3110,13 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help="append the validation outcome to this lifecycle attempt log",
     )
+
+    validate_workload = commands.add_parser(
+        "validate-workload",
+        help="check workload logs for series that a transient host stall split",
+    )
+    validate_workload.add_argument("--platform", required=True)
+    validate_workload.add_argument("--input-dir", type=Path, required=True)
 
     collect_openvmm = commands.add_parser(
         "collect-openvmm", help="convert an OpenVMM benchmark JSON result to p50 CSV"
@@ -2842,6 +3209,26 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         "--output", type=Path, help="write this host as a host file to this path"
     )
     check.add_argument("--summary", type=Path)
+
+    events = commands.add_parser(
+        "storage-events",
+        help=("save the Windows storage events of a job's window and warn of slow I/O"),
+    )
+    events.add_argument(
+        "--since",
+        type=storage_events.parse_utc,
+        required=True,
+        help="start of the window, an ISO 8601 time with a UTC offset or Z",
+    )
+    events.add_argument("--output-dir", type=Path, required=True)
+    events.add_argument(
+        "--scratch-dir",
+        type=Path,
+        help=(
+            "benchmark scratch directory, whose volume the summary names "
+            "(default: the system temporary directory)"
+        ),
+    )
     parser.set_defaults(handler=command_performance)
 
 
@@ -2850,7 +3237,7 @@ def command_performance(args: argparse.Namespace) -> int:
         if args.performance_command == "collect":
             collect_results(
                 args.platform,
-                args.commit,
+                _resolve_commit_id(args.commit, ROOT),
                 args.input_dir,
                 args.output_dir,
                 require_network=args.require_network,
@@ -2869,7 +3256,7 @@ def command_performance(args: argparse.Namespace) -> int:
             try:
                 read_lifecycle_data(args.platform, args.input)
             except UnstablePerformanceError as error:
-                status, message = UNSTABLE_LIFECYCLE_EXIT_CODE, str(error)
+                status, message = UNSTABLE_EXIT_CODE, str(error)
             except PerformanceError as error:
                 status, message = 2, str(error)
             if message is not None:
@@ -2883,10 +3270,18 @@ def command_performance(args: argparse.Namespace) -> int:
                     f"({attempt.status}) in {args.attempt_log}"
                 )
             return status
+        if args.performance_command == "validate-workload":
+            try:
+                validate_workload_stability(args.platform, args.input_dir)
+            except UnstablePerformanceError as error:
+                for line in str(error).splitlines():
+                    print(f"ERROR: {line}", file=sys.stderr)
+                return UNSTABLE_EXIT_CODE
+            return 0
         if args.performance_command == "collect-openvmm":
             collect_openvmm_results(
                 args.platform,
-                args.commit,
+                _resolve_commit_id(args.commit, ROOT),
                 args.input,
                 args.output_dir,
                 args.summary,
@@ -2911,11 +3306,14 @@ def command_performance(args: argparse.Namespace) -> int:
                 output=args.output,
                 summary_path=args.summary,
             )
+        if args.performance_command == "storage-events":
+            return save_storage_events(args.since, args.output_dir, args.scratch_dir)
         persist_results(
             args.source_dir,
             args.history_dir,
             args.exclude_metric,
             require_host=args.require_host,
+            git_checkout=_git_checkout_of(args.history_dir),
         )
         return 0
     except (PerformanceError, OSError, csv.Error) as error:

@@ -1,12 +1,15 @@
-//! Exit statuses and failures shared by the guest programs.
+//! Exit statuses and failures shared by the guest programs, and the entry point of their `main`.
 
+use std::ffi::CString;
 use std::process::ExitCode;
+
+use super::sys;
 
 /// Process exit statuses of the guest programs.
 ///
 /// A program exits with [`Success`](Self::Success), or with the status that its
-/// [`CommandError`] selects. Only `nvx-device-io` exits with the benchmark statuses 3, 4, and
-/// 255.
+/// [`CommandError`] selects. Only `nvx-device-io` and `nvx-time-probe` exit with 3, only
+/// `nvx-device-io` with the benchmark statuses 4 and 255, and only `nvx-managed-agent` with 125.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum ExitStatus {
@@ -16,10 +19,13 @@ pub(crate) enum ExitStatus {
     Failure = 1,
     /// The command line was invalid.
     Usage = 2,
-    /// A benchmark could not open, connect, size, or time its device.
+    /// A benchmark could not open, connect, size, or time its device, or a diagnostic could not
+    /// prepare or run its measurement.
     SetupFailure = 3,
     /// A benchmark transfer or send was incomplete.
     TransferFailure = 4,
+    /// The managed agent, or its execution helper before it executed the workload, failed.
+    AgentFailure = 125,
     /// A benchmark could not write its result.
     OutputFailure = 255,
 }
@@ -31,12 +37,16 @@ pub(crate) enum CommandError {
     Usage,
     /// An operation failed. A program that reports failures has printed why.
     Operation,
-    /// A benchmark could not open, connect, size, or time its device.
+    /// A benchmark could not open, connect, size, or time its device, or a diagnostic could not
+    /// prepare or run its measurement.
     Setup,
     /// A benchmark transfer or send was incomplete.
     Transfer,
     /// A benchmark could not write its result.
     Output,
+    /// The managed agent or its execution helper failed for any reason, including an invalid
+    /// command line. It has reported why where its C program did.
+    Agent,
 }
 
 impl From<Result<(), CommandError>> for ExitStatus {
@@ -48,6 +58,7 @@ impl From<Result<(), CommandError>> for ExitStatus {
             Err(CommandError::Setup) => Self::SetupFailure,
             Err(CommandError::Transfer) => Self::TransferFailure,
             Err(CommandError::Output) => Self::OutputFailure,
+            Err(CommandError::Agent) => Self::AgentFailure,
         }
     }
 }
@@ -56,6 +67,25 @@ impl From<ExitStatus> for ExitCode {
     fn from(status: ExitStatus) -> Self {
         Self::from(status as u8)
     }
+}
+
+/// Runs a guest program as its `main` does: restores the `SIGPIPE` disposition that the process
+/// inherited, passes `run` the process's arguments, program name first, and returns the exit code
+/// that its outcome selects.
+pub(crate) fn run_main(run: impl FnOnce(&[CString]) -> Result<(), CommandError>) -> ExitCode {
+    sys::restore_sigpipe();
+    ExitStatus::from(run(&sys::args())).into()
+}
+
+/// Returns the command line of `program` with `arguments`, as the C strings that [`run_main`]
+/// passes a guest program's `run`: the program's name, then each argument. It panics on an
+/// argument that holds a NUL byte, which no command line can.
+#[cfg(test)]
+pub(crate) fn command_line<A: AsRef<[u8]>>(program: &str, arguments: &[A]) -> Vec<CString> {
+    std::iter::once(program.as_bytes())
+        .chain(arguments.iter().map(AsRef::as_ref))
+        .map(|argument| CString::new(argument).unwrap())
+        .collect()
 }
 
 #[cfg(test)]
@@ -70,6 +100,7 @@ mod tests {
             (Err(CommandError::Usage), 2),
             (Err(CommandError::Setup), 3),
             (Err(CommandError::Transfer), 4),
+            (Err(CommandError::Agent), 125),
             (Err(CommandError::Output), 255),
         ];
         for (result, code) in cases {

@@ -5,13 +5,16 @@ import argparse
 import ast
 import errno
 import functools
+import hashlib
 import inspect
 import io
 import ipaddress
+import itertools
 import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -20,29 +23,52 @@ import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Callable, Collection
-from contextlib import ExitStack, nullcontext, redirect_stdout
+from collections.abc import Callable, Collection, Sequence
+from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
+from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import nvx  # noqa: E402
 from nvx_tools import (  # noqa: E402
+    adversarial_executor,
     benchmark,
     common,
-    control_session,
-    egress_policy,
     managed_exec_tests,
+    microvm_durations,
+    microvm_shards,
     microvm_tests,
+    nvx_rs,
     openvmm_process,
-    sandbox_lifecycle,
     sandbox_lifecycle_tests,
+    sandbox_proxy_tests,
+    sandbox_ram_upper_tests,
     time_abi,
 )
 from nvx_tools.build_constants import (  # noqa: E402
     BuildConstants,
 )
+
+# When this process loaded the tests, on the monotonic clock.
+_LOADED = time.monotonic()
+
+
+def _compile(policy: dict[str, object]) -> nvx_rs.EgressRules:
+    """Compiles an egress policy with nvx-rs, as nvx-rs run compiles its
+    --network-egress-policy-file."""
+    with tempfile.TemporaryDirectory(prefix="nvx-egress-policy-") as temporary:
+        path = Path(temporary) / "policy.json"
+        path.write_text(json.dumps(policy), encoding="utf-8")
+        return nvx_rs.compile_egress_policy(path)
+
+
+# The nvx-rs that a scenario runs, in place of the one that nvx_rs finds or
+# builds, where the test compiles no egress policy, and the start of the
+# command line of the scenario's public runs.
+_FAKE_NVX_RS = Path("nvx-rs")
+_FAKE_PUBLIC_RUN = [os.fspath(_FAKE_NVX_RS), "--root", os.fspath(nvx_rs.ROOT), "run"]
 
 
 def _posix_shell() -> str | None:
@@ -53,6 +79,41 @@ def _posix_shell() -> str | None:
         if git_shell is not None and git_shell.is_file():
             shell = str(git_shell)
     return shell
+
+
+def _probe_environment(probe_dir: Path) -> dict[str, str]:
+    """Return the environment of a run of an egress script in the host's
+    shell, which then keeps its probes' results in `probe_dir`.
+
+    The scripts keep the results in TMPDIR, or else in /tmp, which is private
+    to a guest but shared on the host: runs there at once would delete and
+    overwrite each other's results (#1007)."""
+    return {**os.environ, "TMPDIR": str(probe_dir)}
+
+
+def _bdi_stats(dirty: int, io: int = 0, more_io: int = 0) -> str:
+    """Return a backing device's debugfs statistics whose writeback lists hold
+    `dirty`, `io`, and `more_io` inodes, in the kernel's layout."""
+    return (
+        "BdiWriteback:                0 kB\n"
+        f"BdiReclaimable:     {4 * (dirty + io + more_io):10d} kB\n"
+        f"b_dirty:            {dirty:10d}\n"
+        f"b_io:               {io:10d}\n"
+        f"b_more_io:          {more_io:10d}\n"
+        "b_dirty_time:                0\n"
+    )
+
+
+# A mount table with one host share, bound below its root and mounted whole,
+# and a block device's mount, which is no host share.
+_ONE_SHARE_MOUNTINFO = (
+    "22 1 0:20 / /proc rw,nosuid shared:5 - proc proc rw\n"
+    "30 25 0:42 /0 /work\\040space rw,nosuid,nodev - virtiofs microvm rw\n"
+    "31 25 0:42 / /mnt/share rw,nosuid,nodev shared:9 - virtiofs microvm rw\n"
+    "60 25 8:1 / /data rw - ext4 /dev/vda rw\n"
+)
+# The debugfs statistics of the share of _ONE_SHARE_MOUNTINFO.
+_ONE_SHARE_STATS = "/sys/kernel/debug/bdi/0:42/stats"
 
 
 # The line that releases the private-network ingress guest after the host's
@@ -101,6 +162,21 @@ def _restore_target(command: list[str]) -> int | None:
     return int(command[command.index("--restore-processors") + 1])
 
 
+def _scenario_runners() -> list[str]:
+    """Return the names of the microVM test module's run_* functions, among
+    them every scenario function that its runner calls."""
+    return [
+        name
+        for name, value in vars(microvm_tests).items()
+        if name.startswith("run_") and callable(value)
+    ]
+
+
+def _read_report(path: Path) -> list[dict[str, Any]]:
+    """Return the records of a scenario duration report, in order."""
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 # OpenVMM's warning of a cold boot whose --cpu-profile auto falls back to a
 # host profile (openvmm_core's time_abi host_profile_warning), on stderr.
 FALLBACK_WARNING = (
@@ -142,6 +218,20 @@ def _warp_probe_output(cpus: int, *, offset_ns: int = 40) -> bytes:
         "tsc_hz=2793437000 tsc_hz_source=cpuid conclusive=1\r\n"
     )
     return (probe_round * time_abi.warp_rounds(cpus) + "NVX-WARP-PROBE-OK\r\n").encode()
+
+
+def _guest_script_result(
+    output: str, *, transcript: str = ""
+) -> microvm_tests.GuestScriptResult:
+    """Return what run_guest_script returns for a staged script that printed
+    ``output``, after the console printed ``transcript`` and the start line."""
+    start = microvm_tests.GUEST_SCRIPT_START_MARKER.decode()
+    return microvm_tests.GuestScriptResult(
+        text=f"{transcript}{start}\r\n{output}",
+        wall_ms=0.0,
+        peak_rss_bytes=0,
+        output=output,
+    )
 
 
 def _restore_status_output(
@@ -204,17 +294,20 @@ def _restore_processors_measure(
     *,
     mshv_prefix: bool = True,
     warp_offset_ns: int = 40,
+    capacity: int = 8,
+    prefix: bytes = b"",
 ) -> MagicMock:
     def measure(command: list[str], **kwargs: object) -> None:
         target = _restore_target(command)
         online = 1 if target is None else target
-        vp_count = 8
+        vp_count = capacity
         if mshv_prefix and backend == "mshv" and target is not None:
             vp_count = target
         log_path = cast(Path, kwargs["log_path"])
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_bytes(
-            f"NVX-RESTORE-PROCESSORS-OK count={online}\r\n".encode()
+            prefix
+            + f"NVX-RESTORE-PROCESSORS-OK count={online}\r\n".encode()
             + _warp_probe_output(online, offset_ns=warp_offset_ns)
             # The snapshot's guest booted with one online CPU.
             + _restore_status_output(backend, online, boot_cpus=1)
@@ -229,6 +322,46 @@ def _restore_processors_measure(
 def _fresh_openvmm_command(*_args: object, **_kwargs: object) -> list[str]:
     # A new list for every call, which the scenario extends with its policy.
     return ["openvmm"]
+
+
+class HostLoopbackHttpFixtureTests(unittest.TestCase):
+    def _exchange(self, pieces: list[bytes]) -> tuple[bytes, list[Exception]]:
+        """Send the request in pieces with a gap, and return the reply and fixture errors."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        errors: list[Exception] = []
+        server = threading.Thread(
+            target=microvm_tests._http_server,
+            args=(listener, b"/proxy", b"NVX-BODY", 2.0, errors),
+            daemon=True,
+        )
+        server.start()
+        response = b""
+        with socket.create_connection(listener.getsockname(), timeout=5) as client:
+            for index, piece in enumerate(pieces):
+                if index:
+                    time.sleep(0.25)
+                client.sendall(piece)
+            while chunk := client.recv(4096):
+                response += chunk
+        server.join(5)
+        return response, errors
+
+    def test_a_single_send_request_is_answered(self) -> None:
+        response, errors = self._exchange(
+            [b"GET /proxy HTTP/1.1\r\nHost: localhost\r\n\r\n"]
+        )
+        self.assertTrue(response.startswith(b"HTTP/1.1 200 OK"), response)
+        self.assertEqual(errors, [])
+
+    def test_a_request_split_across_reads_is_answered(self) -> None:
+        response, errors = self._exchange(
+            [b"GET ", b"/proxy HTTP/1.1\r\nHost: localhost\r\n\r\n"]
+        )
+        self.assertTrue(response.startswith(b"HTTP/1.1 200 OK"), response)
+        self.assertEqual(errors, [])
 
 
 class MicrovmTestParserTests(unittest.TestCase):
@@ -330,7 +463,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
         ) -> subprocess.CompletedProcess[bytes]:
             commands.append(command)
             options.append(kwargs)
-            operation = command[3]
+            operation = command[4]
             state = Path(command[command.index("--state-dir") + 1])
             if operation == "provision":
                 state.mkdir(parents=True, exist_ok=True)
@@ -351,7 +484,8 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                         command,
                         1,
                         b"",
-                        b"sandbox must be stopped before deprovision",
+                        b"error[sandbox-running]: sandbox must be stopped before "
+                        b"deprovision\n",
                     )
                 shutil.rmtree(state)
             if operation != "exec":
@@ -368,14 +502,19 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     command,
                     1,
                     b"",
-                    b"managed exec working directory must be an absolute path\n",
+                    b"error[unsupported]: managed exec working directory must be an "
+                    b"absolute path of at most 4096 bytes\n",
                 )
             if int(timeout_ms) < 0 or int(timeout_ms) > 0xFFFFFFFF:
                 return subprocess.CompletedProcess(
                     command,
-                    1,
+                    2,
                     b"",
-                    b"managed exec timeout must be 0 through 4294967295 ms\n",
+                    b"usage: nvx-rs sandbox [{run,provision,start,exec,stop,"
+                    b"deprovision}] [OPTIONS]\n"
+                    b"nvx-rs sandbox: error[argument-invalid]: argument "
+                    b"--exec-timeout-ms: expected an ASCII decimal integer between 0 "
+                    b"and 4294967295, not " + f'"{timeout_ms}"'.encode() + b"\n",
                 )
 
             entrypoint = command[command.index("--entrypoint") + 1]
@@ -473,6 +612,9 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
             patch.object(managed_exec_tests, "require_file", side_effect=require),
             patch.object(managed_exec_tests.subprocess, "run", side_effect=run),
             patch.object(managed_exec_tests.shutil, "copyfile", side_effect=copyfile),
+            patch.object(
+                managed_exec_tests.nvx_rs, "require_binary", return_value=Path("nvx-rs")
+            ),
         ):
             managed_exec_tests.run_managed_exec_configuration(
                 "whp", timeout=2, output_dir=output_dir
@@ -499,15 +641,10 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                 )
             )
 
-        exec_commands = [command for command in commands if command[3] == "exec"]
+        exec_commands = [command for command in commands if command[4] == "exec"]
         self.assertTrue(
             all(
-                command[:3]
-                == [
-                    sys.executable,
-                    str(BuildConstants.REPO_ROOT / "scripts" / "nvx.py"),
-                    "sandbox",
-                ]
+                command[:4] == ["nvx-rs", "--root", str(nvx_rs.ROOT), "sandbox"]
                 for command in commands
             )
         )
@@ -687,7 +824,6 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     "SECOND",
                     "ORDER",
                     "LAYERED",
-                    "NVX_EXEC_CONFIG_FD",
                 )
             ],
         ]
@@ -780,7 +916,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                 )
             )
 
-        self.assertIn("deprovision", [command[3] for command in commands])
+        self.assertIn("deprovision", [command[4] for command in commands])
         self.assertEqual(records[-1]["operation"], "deprovision")
         fixture_root = Path(commands[0][commands[0].index("--state-dir") + 1]).parent
         self.assertFalse(fixture_root.exists())
@@ -795,7 +931,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     command_log=commands,
                 )
 
-        self.assertIn("deprovision", [command[3] for command in commands])
+        self.assertIn("deprovision", [command[4] for command in commands])
         fixture_root = Path(commands[0][commands[0].index("--state-dir") + 1]).parent
         self.assertFalse(fixture_root.exists())
 
@@ -813,7 +949,7 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
                     command_log=commands,
                 )
 
-        self.assertIn("deprovision", [command[3] for command in commands])
+        self.assertIn("deprovision", [command[4] for command in commands])
         fixture_root = Path(commands[0][commands[0].index("--state-dir") + 1]).parent
         self.assertIn(str(fixture_root), str(raised.exception))
         self.assertTrue((fixture_root / "state" / "openvmm.log").is_file())
@@ -824,10 +960,17 @@ class PublicManagedExecAcceptanceTests(unittest.TestCase):
 
 _LIFECYCLE_STATE_SCRIPT = 'printf \'%s\\n\' "$@" >"$0"'
 _CliResult = tuple[int, bytes, bytes]
+# Each part of a runtime identity, as nvx-rs names it, its key in the runtime
+# record, and the build provenance that names its digest, by its field.
+_RUNTIME_PROVENANCE = (
+    ("OpenVMM", "openvmm", "openvmm.provenance.json", "executable_sha256"),
+    ("kernel", "kernel", "vmlinux.provenance.json", "kernel_sha256"),
+    ("initramfs", "initramfs", "initramfs.provenance.json", "initramfs_sha256"),
+)
 
 
 class _FakeSandboxCli:
-    """Emulates `nvx.py sandbox` and the OpenVMM processes that it starts.
+    """Emulates `nvx-rs sandbox` and the OpenVMM processes that it starts.
 
     Each fault names one regression of the public lifecycle that the
     acceptance must detect.
@@ -858,11 +1001,18 @@ class _FakeSandboxCli:
             return self._dispatch(command)
 
     def _dispatch(self, command: list[str]) -> subprocess.CompletedProcess[bytes]:
-        operation = command[3]
+        # The acceptance runs `nvx-rs --root ROOT sandbox OPERATION`, under this
+        # checkout, or under another artifact root, whose runtime identity may
+        # differ from that of the sandbox's VM.
+        position = command.index("sandbox")
+        operation = command[position + 1]
         self.operations.append(operation)
-        values: dict[str, str] = {}
+        root = command[command.index("--root") + 1]
+        values: dict[str, str] = (
+            {} if root == os.fspath(nvx_rs.ROOT) else {"--root": root}
+        )
         arguments: list[str] = []
-        index = 4
+        index = position + 2
         while index < len(command):
             if command[index].startswith("--arg="):
                 arguments.append(command[index].removeprefix("--arg="))
@@ -886,12 +1036,15 @@ class _FakeSandboxCli:
         return subprocess.CompletedProcess(command, returncode, stdout, stderr)
 
     @staticmethod
-    def _error(message: str) -> _CliResult:
-        return 1, b"", f"error: {message}\n".encode()
+    def _error(code: str, message: str) -> _CliResult:
+        return 1, b"", f"error[{code}]: {message}\n".encode()
 
     def _missing(self, state: Path) -> _CliResult | None:
         if not state.is_dir():
-            return self._error(f"sandbox state path is not a plain directory: {state}")
+            return self._error(
+                "sandbox-not-provisioned",
+                f"sandbox state path is not a plain directory: {state}",
+            )
         return None
 
     def _running(self, state: Path) -> tuple[dict[str, object], _CliResult | None]:
@@ -899,14 +1052,51 @@ class _FakeSandboxCli:
         if refusal is not None:
             return {}, refusal
         if not (state / "runtime.json").is_file():
-            return {}, self._error("sandbox is not running")
+            return {}, self._error("sandbox-not-running", "sandbox is not running")
         runtime = json.loads((state / "runtime.json").read_text(encoding="utf-8"))
-        if not self.running.get(runtime["pid"], False):
+        if not self.running.get(runtime["process"]["pid"], False):
+            # The transition that finds that OpenVMM exited clears its record.
+            if "crash-keeps-runtime" not in self.faults:
+                self._clear_runtime(state)
             return {}, self._error(
+                "sandbox-exited",
                 "sandbox runtime state is stale because the OpenVMM process is "
-                "not running"
+                "not running",
             )
         return runtime, None
+
+    @staticmethod
+    def _clear_runtime(state: Path) -> None:
+        for name in ("control.capability", "control.sock", "runtime.json"):
+            (state / name).unlink(missing_ok=True)
+
+    def _differences(
+        self, values: dict[str, str], runtime: dict[str, object]
+    ) -> list[str]:
+        """Returns the parts in which the runtime identity of the VM differs
+        from that of the artifacts of the command's root, which nvx-rs reads
+        from their build provenance."""
+        if "--root" not in values or "other-runtime-driven" in self.faults:
+            return []
+        recorded = cast(dict[str, str], runtime["runtime"])
+        build = Path(values["--root"]) / "build"
+        return [
+            part
+            for part, key, name, field in _RUNTIME_PROVENANCE
+            if recorded[key]
+            != "sha256:" + json.loads((build / name).read_text(encoding="utf-8"))[field]
+        ]
+
+    def _other_runtime(
+        self, runtime: dict[str, object], parts: list[str]
+    ) -> _CliResult:
+        pid = cast(dict[str, object], runtime["process"])["pid"]
+        return self._error(
+            "runtime-mismatch",
+            "sandbox runs under another runtime identity than these artifacts, "
+            f"which differ in {', '.join(parts)}, so it is not driven: stop it to "
+            f"terminate its OpenVMM process {pid} without a guest shutdown",
+        )
 
     def _run(
         self, state: Path | None, values: dict[str, str], _: list[str]
@@ -929,28 +1119,43 @@ class _FakeSandboxCli:
             return (
                 2,
                 b"",
-                b"nvx.py sandbox: error: argument --workload-user: "
-                b"--workload-user UID must be between 1 and 4294967295\n",
+                b"nvx-rs sandbox: error[argument-invalid]: argument --workload-user: "
+                b"--workload-user UID must be between 1 and 4294967294\n",
             )
         if (state / "config.json").exists():
-            return self._error("sandbox is already provisioned")
+            return self._error("sandbox-provisioned", "sandbox is already provisioned")
         state.mkdir(parents=True, exist_ok=True)
-        (state / "lifecycle.lock").touch()
+        (state / "sandbox.lock").touch()
         (state / "config.json").write_text(
-            json.dumps({"user": values.get("--workload-user", "65534:65534")}),
+            json.dumps(
+                {
+                    "user": values.get("--workload-user", "65534:65534"),
+                    "hypervisor": values["--hypervisor"],
+                }
+            ),
             encoding="utf-8",
         )
         return 0, b"", b""
 
     def _start(
-        self, state: Path | None, _: dict[str, str], __: list[str]
+        self, state: Path | None, values: dict[str, str], _: list[str]
     ) -> _CliResult:
         assert state is not None
         refusal = self._missing(state)
         if refusal is not None:
             return refusal
-        if (state / "runtime.json").exists() and "duplicate-start" not in self.faults:
-            return self._error("sandbox is already running or has stale runtime state")
+        runtime_path = state / "runtime.json"
+        if runtime_path.exists() and "duplicate-start" not in self.faults:
+            runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+            if self.running.get(runtime["process"]["pid"], False):
+                if parts := self._differences(values, runtime):
+                    return self._other_runtime(runtime, parts)
+                return self._error(
+                    "sandbox-running",
+                    "sandbox is already running or has stale runtime state",
+                )
+            # A start replaces the record of an OpenVMM that exited.
+            self._clear_runtime(state)
         if "unserialized-starts" in self.faults:
             # Without the lock, both overlapping starts pass the check above
             # before either records its OpenVMM, and both launch one (#464).
@@ -992,8 +1197,10 @@ class _FakeSandboxCli:
             if "failed-start-keeps-runtime" in self.faults:
                 (state / "runtime.json").write_text("{}", encoding="utf-8")
             if "failed-start-hides-status" in self.faults:
-                return self._error("managed control endpoint closed")
-            return self._error("OpenVMM exited during startup: guest-exit status 125")
+                return self._error("endpoint-closed", "managed control endpoint closed")
+            return self._error(
+                "exited", "OpenVMM exited during startup: guest-exit status 125"
+            )
         pid = self.next_pid
         self.next_pid += 1
         self.running[pid] = True
@@ -1011,10 +1218,18 @@ class _FakeSandboxCli:
         (state / "runtime.json").write_text(
             json.dumps(
                 {
-                    "format": 1,
-                    "pid": pid,
-                    "start_time": pid * 7,
-                    "control_endpoint": endpoint,
+                    "format": 4,
+                    "launch": f"{pid:032x}",
+                    "process": {"pid": pid, "startTime": pid * 7, "boot": "b" * 32},
+                    "endpoint": endpoint,
+                    "runtime": {
+                        "openvmm": "sha256:" + "1" * 64,
+                        "kernel": "sha256:" + "2" * 64,
+                        "initramfs": "sha256:" + "3" * 64,
+                        "bootContract": 3,
+                        "controlContract": "nvx-microvm-v2-control-v2",
+                        "controlSession": 1,
+                    },
                 }
             ),
             encoding="utf-8",
@@ -1027,9 +1242,11 @@ class _FakeSandboxCli:
         self, state: Path | None, values: dict[str, str], arguments: list[str]
     ) -> _CliResult:
         assert state is not None
-        _, refusal = self._running(state)
+        runtime, refusal = self._running(state)
         if refusal is not None:
             return refusal
+        if parts := self._differences(values, runtime):
+            return self._other_runtime(runtime, parts)
         report = (
             Path(values["--outcome-report"]) if "--outcome-report" in values else None
         )
@@ -1038,7 +1255,9 @@ class _FakeSandboxCli:
             and report.exists()
             and "overwrite-report" not in self.faults
         ):
-            return self._error(f"outcome report already exists: {report}")
+            return self._error(
+                "outcome-report-exists", f"outcome report already exists: {report}"
+            )
         files = self.guest_files.setdefault(state, {})
         entrypoint = values["--entrypoint"]
         returncode, category, stdout, stderr = 0, "exit", b"", b""
@@ -1058,14 +1277,20 @@ class _FakeSandboxCli:
             files[arguments[0]] = b""
         elif entrypoint == sandbox_lifecycle_tests.PROBE:
             self.probed = True
+            if "probe-interrupted" in self.faults:
+                # SIGINT reaches the harness while it waits for the probe.
+                raise KeyboardInterrupt
             if "probe-fails" in self.faults:
                 returncode = 1
                 stderr = b"NVX-UBUNTU-SANDBOX-FAIL: the workload shares a namespace\n"
             else:
+                if arguments[:2] != ["entry", "limits"]:
+                    raise AssertionError(f"unexpected probe arguments {arguments}")
                 stdout = (
                     b"NVX-UBUNTU-SANDBOX-PROFILE-OK uid=65534 gid=65534\n"
-                    + f"NVX-UBUNTU-SANDBOX-LIMITS-OK memory_max={arguments[1]} "
-                    f"pids_max={arguments[2]}\n".encode()
+                    + b"NVX-UBUNTU-SANDBOX-ENTRY-OK\n"
+                    + f"NVX-UBUNTU-SANDBOX-LIMITS-OK memory_max={arguments[2]} "
+                    f"pids_max={arguments[3]}\n".encode()
                     + b"NVX-UBUNTU-SANDBOX-OK uid=65534 gid=65534\n"
                 )
         elif entrypoint == "/usr/bin/head":
@@ -1094,30 +1319,75 @@ class _FakeSandboxCli:
             )
         return returncode, stdout, stderr
 
-    def _stop(self, state: Path | None, _: dict[str, str], __: list[str]) -> _CliResult:
+    def _stop(
+        self, state: Path | None, values: dict[str, str], _: list[str]
+    ) -> _CliResult:
         assert state is not None
         runtime, refusal = self._running(state)
         if refusal is not None:
             return refusal
-        pid = cast(int, runtime["pid"])
+        if parts := self._differences(values, runtime):
+            return self._terminate_other_runtime(state, runtime, parts)
+        pid = cast(int, cast(dict[str, object], runtime["process"])["pid"])
         if "stop-leaks-process" not in self.faults:
             self.terminate(pid)
         (state / "runtime.json").unlink()
         if "stop-leaks-capability" not in self.faults:
             (state / "control.capability").unlink()
         (state / "control.sock").unlink(missing_ok=True)
+        config = json.loads((state / "config.json").read_text(encoding="utf-8"))
+        teardown = {name: True for name in microvm_tests.OUTCOME_TEARDOWN_FIELDS}
+        if "stop-reports-incomplete-teardown" in self.faults:
+            teardown["vm_stopped"] = False
+        if "stop-reports-partial-teardown" in self.faults:
+            # Every step that it names completed, but it names one of seven.
+            teardown = {"vm_stopped": True}
         (state / "outcome.json").write_text(
             json.dumps(
                 {
                     "schema_version": 1,
+                    "instance_id": "22" * 16,
+                    "backend": (
+                        "auto"
+                        if "stop-reports-another-backend" in self.faults
+                        else config["hypervisor"]
+                    ),
                     "outcome": sandbox_lifecycle_tests.MANAGED_SUCCESS,
-                    "network_policy": {},
-                    "teardown": {},
+                    "network_policy": {
+                        "status": (
+                            "applied"
+                            if "stop-reports-a-network-policy" in self.faults
+                            else "not-requested"
+                        )
+                    },
+                    "teardown": teardown,
                 }
             ),
             encoding="utf-8",
         )
         return 0, b"", b""
+
+    def _terminate_other_runtime(
+        self, state: Path, runtime: dict[str, object], parts: list[str]
+    ) -> _CliResult:
+        # A VM of another runtime identity is asked nothing: its OpenVMM is
+        # terminated, and publishes no outcome report.
+        if "other-runtime-stop-refused" in self.faults:
+            return self._other_runtime(runtime, parts)
+        pid = cast(int, cast(dict[str, object], runtime["process"])["pid"])
+        if "other-runtime-stop-leaks-process" not in self.faults:
+            self.terminate(pid)
+        if "other-runtime-stop-keeps-record" not in self.faults:
+            self._clear_runtime(state)
+        if "other-runtime-stop-is-silent" in self.faults:
+            return 0, b"", b""
+        return (
+            0,
+            b"",
+            "warning: sandbox ran under another runtime identity than these "
+            f"artifacts, which differ in {', '.join(parts)}: its OpenVMM process "
+            f"{pid} was terminated without a guest shutdown\n".encode(),
+        )
 
     def _deprovision(
         self, state: Path | None, _: dict[str, str], __: list[str]
@@ -1129,25 +1399,33 @@ class _FakeSandboxCli:
         runtime_path = state / "runtime.json"
         if runtime_path.is_file():
             runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
-            if self.running.get(runtime.get("pid"), False):
-                return self._error("sandbox must be stopped before deprovision")
+            if self.running.get(runtime.get("process", {}).get("pid"), False):
+                return self._error(
+                    "sandbox-running", "sandbox must be stopped before deprovision"
+                )
         if "cleanup-deprovision-fails" in self.faults and self.probed:
-            return self._error("injected deprovision failure")
+            return self._error("other", "injected deprovision failure")
         for name in (
+            "launch.json",
             "runtime.json",
             "control.capability",
             "control.sock",
             "outcome.json",
             "openvmm.log",
             "config.json",
-            "lifecycle.lock",
+            "sandbox.lock",
         ):
             (state / name).unlink(missing_ok=True)
+        # The store owns the file in which OpenVMM stages its outcome report.
+        for path in state.iterdir():
+            if re.fullmatch(r"\.tmp[A-Za-z0-9]{6}", path.name):
+                path.unlink(missing_ok=True)
         unknown = sorted(path.name for path in state.iterdir())
         if unknown and "deprovision-removes-foreign" not in self.faults:
             return self._error(
+                "foreign-files",
                 "sandbox state directory contains files not owned by NVX: "
-                + ", ".join(unknown)
+                + ", ".join(unknown),
             )
         shutil.rmtree(state)
         self.guest_files.pop(state, None)
@@ -1156,11 +1434,8 @@ class _FakeSandboxCli:
     def processes(self, _: str) -> tuple[int, ...]:
         return tuple(sorted(pid for pid, running in self.running.items() if running))
 
-    def process_running(self, runtime: dict[str, object]) -> bool:
-        return self.running.get(cast(int, runtime["pid"]), False)
-
     def endpoint_present(self, runtime: dict[str, object]) -> bool:
-        return runtime["control_endpoint"] in self.endpoints.values()
+        return runtime["endpoint"] in self.endpoints.values()
 
     def terminate(self, pid: int) -> None:
         self.running[pid] = False
@@ -1200,18 +1475,34 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
         "stop",
         "exec",
         "stop",
-        # Restart with overlapping starts, crash, and stale runtime state.
+        # Restart with overlapping starts.
         "start",
         "start",
         "exec",
+        # The CLI of another runtime identity refuses to drive the VM, which
+        # the CLI that started it still drives, and its stop terminates it.
+        "exec",
+        "start",
+        "deprovision",
         "exec",
         "stop",
+        "stop",
+        # Start again, then a crash, which the next transition reports.
         "start",
+        "exec",
+        "stop",
         # Deprovision.
         "deprovision",
         "deprovision",
         "exec",
     ]
+
+    # The checkout's build provenance, which names the identities that the
+    # fake CLI records for the VMs that it starts.
+    PROVENANCE = {
+        name: {"format": 1, field: digit * 64}
+        for (_, _, name, field), digit in zip(_RUNTIME_PROVENANCE, "123", strict=True)
+    }
 
     def _run(self, root: Path, fake: _FakeSandboxCli) -> Path:
         distro = root / "ubuntu-distro.erofs"
@@ -1239,6 +1530,16 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
             patch.object(sandbox_lifecycle_tests.subprocess, "run", side_effect=fake),
             patch.object(
                 sandbox_lifecycle_tests,
+                "read_build_provenance",
+                return_value=self.PROVENANCE,
+            ),
+            patch.object(
+                sandbox_lifecycle_tests.nvx_rs,
+                "require_binary",
+                return_value=Path("nvx-rs"),
+            ),
+            patch.object(
+                sandbox_lifecycle_tests,
                 "openvmm_processes",
                 side_effect=fake.processes,
             ),
@@ -1252,10 +1553,9 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                 "terminate_process",
                 side_effect=fake.terminate,
             ),
+            # The fake's processes end at once, and name no process of this host.
             patch.object(
-                sandbox_lifecycle,
-                "runtime_process_running",
-                side_effect=fake.process_running,
+                sandbox_lifecycle_tests, "openvmm_threads_remain", return_value=False
             ),
         ):
             sandbox_lifecycle_tests.run_sandbox_lifecycle(
@@ -1304,6 +1604,7 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                     "argv",
                     "expected_returncode",
                     "returncode",
+                    "error_code",
                     "stdout_bytes",
                     "stderr_bytes",
                     "state_entries",
@@ -1337,12 +1638,16 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
             "run-starts-workload": "run returned 0, expected 125",
             "failed-start-keeps-runtime": (
                 "after a refused managed start: the state directory holds "
-                "['config.json', 'lifecycle.lock', 'openvmm.log', 'outcome.json', "
-                "'runtime.json']"
+                "['config.json', 'openvmm.log', 'outcome.json', 'runtime.json', "
+                "'sandbox.lock']"
             ),
             "failed-start-hides-status": (
-                "start returned 1, expected 1 with 'error: OpenVMM exited during "
-                "startup: guest-exit status 125'"
+                "start returned 1, expected 1 with error 'exited' naming 'guest-exit'"
+            ),
+            # OpenVMM ended while it published its report (#438), which left
+            # only the report's staging file.
+            "failed-start-kills-reporter": (
+                "the refused managed start published no outcome report"
             ),
             "duplicate-start": "start returned 0, expected 1",
             "exec-loses-state": "the state-reading request returned status 1",
@@ -1352,8 +1657,32 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
             "overwrite-report": "exec returned 0, expected 1",
             "stop-leaks-capability": "after stop: the state directory holds",
             "stop-leaks-process": "OpenVMM still runs after stop",
+            "stop-reports-another-backend": "the managed report names backend 'auto'",
+            "stop-reports-a-network-policy": (
+                "the managed report has network policy status 'applied'"
+            ),
+            "stop-reports-incomplete-teardown": (
+                "the managed report has incomplete teardown"
+            ),
+            "stop-reports-partial-teardown": (
+                "the managed report has incomplete teardown: {'vm_stopped': True}"
+            ),
             "restart-loses-state": "the restarted sandbox's state returned status 1",
             "unserialized-starts": "overlapping public starts returned status 0",
+            "other-runtime-driven": "exec returned 0, expected 1",
+            "other-runtime-stop-refused": "stop returned 1, expected 0",
+            "other-runtime-stop-is-silent": (
+                "the stop of another runtime printed stdout='', stderr=''"
+            ),
+            "other-runtime-stop-leaks-process": (
+                "OpenVMM still runs after the stop of another runtime"
+            ),
+            "other-runtime-stop-keeps-record": (
+                "after the stop of another runtime: the state directory holds"
+            ),
+            "crash-keeps-runtime": (
+                "after exec of a crashed sandbox: the state directory holds"
+            ),
             "deprovision-removes-foreign": "deprovision returned 0, expected 1",
         }
         for fault, message in regressions.items():
@@ -1371,28 +1700,6 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                 self.assertTrue(
                     (root / "results" / "sandbox-lifecycle-checks.json").is_file()
                 )
-
-    def test_acceptance_detects_a_leaked_report_staging_file(self):
-        # A start that ends OpenVMM while it publishes its outcome report leaves
-        # the report's staging file, which deprovision refuses to remove, so the
-        # acceptance preserves its fixture, as on the WHP runners in issue #438.
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            fake = _FakeSandboxCli("failed-start-kills-reporter")
-            with self.assertRaises(RuntimeError) as raised:
-                self._run(root, fake)
-            fixtures = list(root.glob("nvx-public-lifecycle-*"))
-
-        message = str(raised.exception)
-        for fragment in (
-            "after a refused managed start: the state directory holds "
-            "['.tmpAbC123', 'config.json', 'lifecycle.lock', 'openvmm.log']",
-            "sandbox state directory contains files not owned by NVX: .tmpAbC123",
-            "fixture preserved for recovery",
-        ):
-            self.assertIn(fragment, message)
-        self.assertEqual(len(fixtures), 1)
-        self.assertFalse(any(fake.running.values()))
 
     def test_evidence_keeps_the_end_of_long_logs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1435,6 +1742,45 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                 (root / "results" / "sandbox-lifecycle-openvmm.log").is_file()
             )
 
+    def test_an_interrupted_acceptance_stops_its_sandboxes(self):
+        # A cancelled CI job interrupts the harness (#946), which stops the
+        # sandboxes that the acceptance started, as a failure does, and still
+        # reports the interruption, not a failure.
+        for faults, preserved in (
+            (("probe-interrupted",), False),
+            (("probe-interrupted", "cleanup-deprovision-fails"), True),
+        ):
+            with (
+                self.subTest(faults=faults),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                fake = _FakeSandboxCli(*faults)
+                stderr = io.StringIO()
+                with (
+                    redirect_stderr(stderr),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    self._run(root, fake)
+                fixtures = list(root.glob("nvx-public-lifecycle-*"))
+
+                # The cleanup stopped and deprovisioned the running sandbox.
+                self.assertEqual(fake.operations[-3:], ["exec", "stop", "deprovision"])
+                self.assertFalse(any(fake.running.values()))
+                self.assertEqual(len(fixtures), int(preserved))
+                self.assertTrue(
+                    (root / "results" / "sandbox-lifecycle-checks.json").is_file()
+                )
+                if preserved:
+                    self.assertIn(str(fixtures[0]), stderr.getvalue())
+                    self.assertRegex(
+                        stderr.getvalue(),
+                        "^warning: cleanup after the interruption: .*"
+                        "fixture preserved for recovery",
+                    )
+                else:
+                    self.assertEqual(stderr.getvalue(), "")
+
     def test_scratch_journal_check_reads_the_ext4_recovery_flag(self):
         with tempfile.TemporaryDirectory() as temporary:
             image = Path(temporary) / "scratch.ext4"
@@ -1449,31 +1795,87 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                 sandbox_lifecycle_tests.scratch_journal_clean(image)
 
     def test_kill_ends_the_recorded_process(self):
-        if os.name != "nt" and sys.platform != "linux":
-            self.skipTest("process identity requires a Linux or Windows host")
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+        def processes(marker: str) -> tuple[int, ...]:
+            # The scan finds the child under its fixture's name while it runs.
+            self.assertEqual(marker, "nvx-public-lifecycle-kill")
+            return (child.pid,) if child.poll() is None else ()
+
+        start_time = 1
+        if sys.platform != "win32":
+            stat = Path(f"/proc/{child.pid}/stat").read_bytes()
+            start_time = int(stat[stat.rindex(b")") + 1 :].split()[19])
+        runtime: dict[str, object] = {
+            "format": 4,
+            "process": {"pid": child.pid, "startTime": start_time, "boot": "b" * 32},
+            "endpoint": "unused",
+        }
         try:
-            runtime: dict[str, object] = {
-                "format": 1,
-                "pid": child.pid,
-                "start_time": sandbox_lifecycle._process_start_time(child.pid),
-                "control_endpoint": "unused",
-            }
-            self.assertTrue(sandbox_lifecycle.runtime_process_running(runtime))
-            sandbox_lifecycle_tests.kill_openvmm(runtime, 30)
-            self.assertFalse(sandbox_lifecycle.runtime_process_running(runtime))
+            with patch.object(
+                sandbox_lifecycle_tests, "openvmm_processes", side_effect=processes
+            ):
+                self.assertTrue(
+                    sandbox_lifecycle_tests.openvmm_running(
+                        runtime, "nvx-public-lifecycle-kill"
+                    )
+                )
+                sandbox_lifecycle_tests.kill_openvmm(
+                    runtime, 30, "nvx-public-lifecycle-kill"
+                )
+                self.assertFalse(
+                    sandbox_lifecycle_tests.openvmm_running(
+                        runtime, "nvx-public-lifecycle-kill"
+                    )
+                )
+                self.assertFalse(
+                    sandbox_lifecycle_tests.openvmm_threads_remain(runtime)
+                )
             self.assertNotEqual(child.wait(timeout=30), 0)
         finally:
             if child.poll() is None:
                 child.kill()
                 child.wait(timeout=30)
 
+    @unittest.skipIf(sys.platform == "win32", "Windows has no /proc")
+    def test_a_killed_openvmm_runs_until_its_last_thread_exits(self):
+        # As nvx-rs tells, a process runs while a thread of it remains, even
+        # once its main thread is a zombie, whose command line is empty.
+        runtime: dict[str, object] = {
+            "process": {"pid": 4242, "startTime": 99, "boot": "b" * 32}
+        }
+
+        def stat(state: str, start_time: int) -> bytes:
+            fields = [state, *["0"] * 18, str(start_time), *["0"] * 30]
+            return b"4242 (open vmm) " + " ".join(fields).encode()
+
+        for line, threads, remain in (
+            (stat("S", 99), 40, True),
+            (stat("Z", 99), 3, True),
+            (stat("Z", 99), 1, False),
+            (stat("X", 99), 1, False),
+            # Another process has the ID.
+            (stat("S", 100), 40, False),
+        ):
+            with (
+                self.subTest(line=line, threads=threads),
+                patch.object(Path, "read_bytes", return_value=line),
+                patch.object(
+                    sandbox_lifecycle_tests.os, "listdir", return_value=["t"] * threads
+                ),
+            ):
+                self.assertEqual(
+                    sandbox_lifecycle_tests.openvmm_threads_remain(runtime), remain
+                )
+        with patch.object(Path, "read_bytes", side_effect=FileNotFoundError):
+            self.assertFalse(sandbox_lifecycle_tests.openvmm_threads_remain(runtime))
+
     def test_control_endpoint_presence_follows_the_endpoint(self):
         if sys.platform == "win32":
             from multiprocessing.connection import Listener
 
             name = f"openvmm-microvm-test-{os.getpid()}"
-            runtime: dict[str, object] = {"control_endpoint": f"//./pipe/{name}"}
+            runtime: dict[str, object] = {"endpoint": f"//./pipe/{name}"}
             listener = Listener(rf"\\.\pipe\{name}", family="AF_PIPE")
             try:
                 self.assertTrue(
@@ -1485,7 +1887,7 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
             return
         with tempfile.TemporaryDirectory() as temporary:
             endpoint = Path(temporary) / "control.sock"
-            runtime = {"control_endpoint": str(endpoint)}
+            runtime = {"endpoint": str(endpoint)}
             self.assertFalse(sandbox_lifecycle_tests.control_endpoint_present(runtime))
             endpoint.touch()
             self.assertTrue(sandbox_lifecycle_tests.control_endpoint_present(runtime))
@@ -1519,6 +1921,1017 @@ class PublicSandboxLifecycleTests(unittest.TestCase):
                 child.wait(timeout=30)
                 if child.stdin is not None:
                     child.stdin.close()
+
+
+class _FakeProxySandboxCli(_FakeSandboxCli):
+    """Emulates `nvx-rs sandbox` with the scenario's open and proxy-only
+    networks, and the guest's probes, whose traffic reaches the host's
+    listeners as OpenVMM would carry it: from the gateway to host loopback,
+    and elsewhere unchanged.
+
+    The open network lets every probe through unless an `open-blocks-NAME`
+    fault names it, and the proxy-only network lets none through unless a
+    fault names it: `leaks-NAME` connects and reports the connection, and
+    `hides-NAME` connects or sends but reports what a denied probe reports.
+    Each other fault names a regression of the planner or of the proxy that
+    the acceptance must detect.
+    """
+
+    def __init__(self, *faults: str) -> None:
+        super().__init__(*faults)
+        # The network of each guest that probed, and the names of its probes.
+        self.probe_runs: list[tuple[str, list[str]]] = []
+
+    def _provision(
+        self, state: Path | None, values: dict[str, str], _: list[str]
+    ) -> _CliResult:
+        gateway = sandbox_proxy_tests.GATEWAY
+        proxy = values.get("--network-proxy")
+        if proxy is None:
+            assert values["--network-egress"] == "allow"
+            assert values["--host-loopback"] == "allow"
+            network = "open"
+        elif (
+            values["--network-egress"] != "deny" and "accepts-egress" not in self.faults
+        ):
+            return self._error(
+                "unsupported",
+                "a network proxy needs egress denied by default, since the proxy "
+                "is the guest's only way out",
+            )
+        elif (
+            not proxy.startswith(f"{gateway}:")
+            and "accepts-other-address" not in self.faults
+        ):
+            return self._error(
+                "unsupported",
+                f"--network-proxy {proxy}: the address must be the guest's "
+                f"gateway, {gateway}",
+            )
+        else:
+            network = "proxy-only"
+        result = super()._provision(state, values, _)
+        if result[0] == 0:
+            assert state is not None
+            path = state / "config.json"
+            config = json.loads(path.read_text(encoding="utf-8"))
+            config["network"] = network
+            path.write_text(json.dumps(config), encoding="utf-8")
+        return result
+
+    @staticmethod
+    def _network(state: Path) -> str:
+        config = json.loads((state / "config.json").read_text(encoding="utf-8"))
+        return cast(str, config["network"])
+
+    def _exec(
+        self, state: Path | None, values: dict[str, str], arguments: list[str]
+    ) -> _CliResult:
+        assert state is not None
+        _, refusal = self._running(state)
+        if refusal is not None:
+            return refusal
+        assert values["--entrypoint"] == "/bin/sh"
+        assert arguments[:3] == ["-c", sandbox_proxy_tests.PROBE_SCRIPT, "probe"]
+        network = self._network(state)
+        probes = arguments[5:]
+        self.probe_runs.append((network, probes[1::4]))
+        lines = [self._request(network, arguments[3], arguments[4])]
+        for index in range(0, len(probes), 4):
+            protocol, name, host, port = probes[index : index + 4]
+            status = self._probe(network, protocol, name, host, int(port))
+            lines.append(f"{name} {status}")
+        return 0, "".join(f"{line}\n" for line in lines).encode(), b""
+
+    def _request(self, network: str, proxy: str, target: str) -> str:
+        if network == "proxy-only" and "proxy-unreachable" in self.faults:
+            return "proxy 1 wget: can't connect to remote host: Connection refused"
+        gateway, _, port = proxy.removeprefix("http://").rpartition(":")
+        assert gateway == sandbox_proxy_tests.GATEWAY
+        if "direct-request" in self.faults:
+            target = "/probe"
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=2) as client:
+            client.sendall(
+                f"GET {target} HTTP/1.1\r\nHost: nvx-proxy-only.invalid\r\n"
+                "Connection: close\r\n\r\n".encode()
+            )
+            response = b""
+            while chunk := client.recv(4096):
+                response += chunk
+        body = response.partition(b"\r\n\r\n")[2].decode()
+        return f"proxy 0 {body}"
+
+    def _probe(
+        self, network: str, protocol: str, name: str, host: str, port: int
+    ) -> int:
+        denied = 1 if protocol == "tcp" else 0
+        hidden = network == "proxy-only" and f"hides-{name}" in self.faults
+        if network == "open":
+            reached = f"open-blocks-{name}" not in self.faults
+        else:
+            reached = hidden or f"leaks-{name}" in self.faults
+        if not reached:
+            return denied
+        destination = {
+            sandbox_proxy_tests.GATEWAY: "127.0.0.1",
+            sandbox_proxy_tests.GATEWAY_IPV6: "::1",
+        }.get(host, host)
+        family = socket.AF_INET6 if ":" in destination else socket.AF_INET
+        if protocol == "udp":
+            with socket.socket(family, socket.SOCK_DGRAM) as sender:
+                sender.sendto(f"{name}\n".encode(), (destination, port))
+        else:
+            with socket.create_connection((destination, port), timeout=2):
+                pass
+        return denied if hidden else 0
+
+    def _stop(
+        self, state: Path | None, values: dict[str, str], _: list[str]
+    ) -> _CliResult:
+        result = super()._stop(state, values, _)
+        if result[0] == 0:
+            assert state is not None
+            network = self._network(state)
+            path = state / "outcome.json"
+            report = json.loads(path.read_text(encoding="utf-8"))
+            policy = dict(
+                sandbox_proxy_tests.OPEN_NETWORK_POLICY
+                if network == "open"
+                else sandbox_proxy_tests.NETWORK_POLICY
+            )
+            if network == "proxy-only" and "stop-reports-allowed-egress" in self.faults:
+                policy["mode"] = "allow-all"
+            report["network_policy"] = policy
+            path.write_text(json.dumps(report), encoding="utf-8")
+        return result
+
+
+class PublicSandboxProxyOnlyTests(unittest.TestCase):
+    # A loopback address stands in for the host's own address, which a test
+    # cannot rely on.
+    HOST_ADDRESS = "127.0.0.2"
+    PROBES = ["gateway-port", "gateway-udp", "host-address"]
+    EXPECTED_OPERATIONS = [
+        # The planner refuses a proxy beside allowed egress, and one at an
+        # address other than the gateway.
+        "provision",
+        "provision",
+        # The open network, whose guest reaches every destination.
+        "provision",
+        "start",
+        "exec",
+        "stop",
+        "deprovision",
+        # The proxy-only network, whose guest reaches only the proxy.
+        "provision",
+        "start",
+        "exec",
+        "stop",
+        "deprovision",
+    ]
+
+    def _run(
+        self, root: Path, fake: _FakeProxySandboxCli, *, ipv6: bool = False
+    ) -> Path:
+        distro = root / "ubuntu-distro.erofs"
+        distro.write_bytes(b"distro")
+        template = root / "ubuntu-smoke-scratch.ext4"
+        template.write_bytes(bytes(4096))
+        artifacts = managed_exec_tests.WorkloadArtifacts(
+            distro, "12345678-1234-1234-1234-123456789abc", template
+        )
+        output_dir = root / "results"
+        mkdtemp = tempfile.mkdtemp
+
+        def fixture(prefix: str) -> str:
+            return mkdtemp(prefix=prefix, dir=root)
+
+        with (
+            patch.object(
+                sandbox_proxy_tests, "load_workload_artifacts", return_value=artifacts
+            ),
+            patch.object(sandbox_proxy_tests.tempfile, "mkdtemp", side_effect=fixture),
+            patch.object(sandbox_lifecycle_tests.subprocess, "run", side_effect=fake),
+            patch.object(
+                sandbox_lifecycle_tests,
+                "openvmm_processes",
+                side_effect=fake.processes,
+            ),
+            patch.object(
+                sandbox_lifecycle_tests,
+                "control_endpoint_present",
+                side_effect=fake.endpoint_present,
+            ),
+            patch.object(
+                sandbox_lifecycle_tests,
+                "terminate_process",
+                side_effect=fake.terminate,
+            ),
+            patch.object(
+                sandbox_proxy_tests, "host_address", return_value=self.HOST_ADDRESS
+            ),
+            patch.object(sandbox_proxy_tests, "ipv6_loopback", return_value=ipv6),
+            patch.object(
+                sandbox_lifecycle_tests.nvx_rs,
+                "require_binary",
+                return_value=Path("nvx-rs"),
+            ),
+        ):
+            sandbox_proxy_tests.run_sandbox_proxy_only(
+                "kvm", timeout=2, output_dir=output_dir
+            )
+        return output_dir
+
+    def test_acceptance_reaches_only_the_proxy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = _FakeProxySandboxCli()
+            output_dir = self._run(root, fake)
+            checks = json.loads(
+                (output_dir / "sandbox-proxy-only-checks.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            evidence = {path.name: path.read_bytes() for path in output_dir.iterdir()}
+            fixtures = list(root.glob("nvx-public-proxy-*"))
+
+        self.assertEqual(fake.operations, self.EXPECTED_OPERATIONS)
+        self.assertEqual(fixtures, [])
+        self.assertFalse(any(fake.running.values()))
+        self.assertEqual(
+            fake.probe_runs, [("open", self.PROBES), ("proxy-only", self.PROBES)]
+        )
+        self.assertEqual(
+            set(evidence),
+            {
+                "sandbox-proxy-only-checks.json",
+                "sandbox-proxy-only-runtime.json",
+                *(
+                    f"sandbox-proxy-only-{network}-{name}"
+                    for network in ("open", "proxy-only")
+                    for name in (
+                        "probe.log",
+                        "proxy.log",
+                        "outcome.json",
+                        "openvmm.log",
+                    )
+                ),
+            },
+        )
+        self.assertEqual(
+            [record["operation"] for record in checks], self.EXPECTED_OPERATIONS
+        )
+        egress, address, open_network, proxy_only = (
+            record["argv"][record["argv"].index("--net") :]
+            for record in (checks[0], checks[1], checks[2], checks[7])
+        )
+        port = proxy_only[-1].rpartition(":")[2]
+        network = [
+            "--net",
+            "192.0.2.2/24",
+            "--network-profile",
+            "portable",
+            "--network-egress",
+            "deny",
+            "--host-loopback",
+            "deny",
+            "--network-proxy",
+            f"192.0.2.1:{port}",
+        ]
+        self.assertEqual(proxy_only, network)
+        self.assertEqual(open_network[:8], [*network[:5], "allow", network[6], "allow"])
+        self.assertEqual(len(open_network), 8)
+        self.assertEqual(egress, [*network[:5], "allow", *network[6:]])
+        self.assertEqual(address, [*network[:9], f"198.51.100.1:{port}"])
+        for name in ("open", "proxy-only"):
+            self.assertEqual(
+                evidence[f"sandbox-proxy-only-{name}-proxy.log"],
+                b"GET http://nvx-proxy-only.invalid/probe HTTP/1.1\n",
+            )
+        self.assertEqual(
+            evidence["sandbox-proxy-only-open-probe.log"],
+            b"proxy 0 NVX-PROXY-ONLY-RESPONSE\n"
+            b"gateway-port 0\ngateway-udp 0\nhost-address 0\n",
+        )
+        self.assertEqual(
+            evidence["sandbox-proxy-only-proxy-only-probe.log"],
+            b"proxy 0 NVX-PROXY-ONLY-RESPONSE\n"
+            b"gateway-port 1\ngateway-udp 0\nhost-address 1\n",
+        )
+
+    @unittest.skipUnless(
+        sandbox_proxy_tests.ipv6_loopback(), "IPv6 loopback is unavailable"
+    )
+    def test_acceptance_probes_the_gateway_over_ipv6(self):
+        for faults, message in (
+            ((), None),
+            (
+                ("open-blocks-gateway-ipv6",),
+                "the gateway-ipv6 probe to fd00::c000:201 port",
+            ),
+            (("hides-gateway-ipv6",), "the gateway-ipv6 probe reached the host"),
+        ):
+            with (
+                self.subTest(faults=faults),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                fake = _FakeProxySandboxCli(*faults)
+                if message is None:
+                    self._run(Path(temporary), fake, ipv6=True)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, re.escape(message)):
+                        self._run(Path(temporary), fake, ipv6=True)
+                self.assertEqual(fake.probe_runs[-1][1][-1], "gateway-ipv6")
+                self.assertFalse(any(fake.running.values()))
+
+    def test_acceptance_detects_proxy_regressions(self):
+        regressions = {
+            "accepts-egress": "provision returned 0, expected 1",
+            "accepts-other-address": "provision returned 0, expected 1",
+            "open-blocks-gateway-udp": (
+                "the gateway-udp probe did not reach the host at port"
+            ),
+            "open-blocks-host-address": "the host-address probe to 127.0.0.2 port",
+            "proxy-unreachable": (
+                "the guest of the proxy-only network did not reach the proxy"
+            ),
+            "direct-request": (
+                "the test proxy received [b'GET /probe HTTP/1.1'] in the open network"
+            ),
+            "leaks-gateway-port": "the gateway-port probe to 192.0.2.1 port",
+            "hides-gateway-port": "the gateway-port probe reached the host",
+            "hides-gateway-udp": "the gateway-udp probe reached the host at port",
+            "hides-host-address": "the host-address probe reached the host",
+            "stop-reports-allowed-egress": "the managed report has network policy",
+        }
+        for fault, message in regressions.items():
+            with (
+                self.subTest(fault=fault),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                fake = _FakeProxySandboxCli(fault)
+                with self.assertRaisesRegex(RuntimeError, re.escape(message)):
+                    self._run(root, fake)
+                # Cleanup ends every OpenVMM process and removes the fixture.
+                self.assertFalse(any(fake.running.values()))
+                self.assertEqual(list(root.glob("nvx-public-proxy-*")), [])
+                self.assertTrue(
+                    (root / "results" / "sandbox-proxy-only-checks.json").is_file()
+                )
+
+    def test_probe_script_reports_each_status(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        result = subprocess.run(
+            [
+                shell,
+                "-c",
+                'wget() { [ "$http_proxy" = http://192.0.2.1:8443 ] && '
+                '[ "$*" = "-T 5 -qO- http://nvx-proxy-only.invalid/probe" ] && '
+                "printf NVX-PROXY-ONLY-RESPONSE; }\n"
+                'nc() { case "$*" in\n'
+                '"-z -w 2 192.0.2.1 8444") return 1 ;;\n'
+                '"-u -w 1 192.0.2.1 8443") read -r datagram; '
+                '[ "$datagram" = gateway-udp ] ;;\n'
+                "*) return 127 ;;\n"
+                "esac; }\n" + sandbox_proxy_tests.PROBE_SCRIPT,
+                "probe",
+                "http://192.0.2.1:8443",
+                sandbox_proxy_tests.PROXY_TARGET,
+                *("tcp", "gateway-port", "192.0.2.1", "8444"),
+                *("udp", "gateway-udp", "192.0.2.1", "8443"),
+                *("tcp", "host-address", "198.51.100.7", "8443"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            "proxy 0 NVX-PROXY-ONLY-RESPONSE\n"
+            "gateway-port 1\n"
+            "gateway-udp 0\n"
+            "host-address 127\n",
+        )
+
+
+class _ExitingProcess:
+    """An OpenVMM process that exits with status 0 once its console ends."""
+
+    pid = 123
+
+    def __init__(self) -> None:
+        self.exited = False
+
+    def poll(self) -> int | None:
+        return 0 if self.exited else None
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        self.exited = True
+        return 0
+
+
+class _EchoingGuestConsole:
+    """A guest console whose input arrives in pieces of ``piece`` characters
+    while commands run, as a slow guest's did in #785. The terminal echoes
+    each piece as it arrives, into what the running command prints, before
+    the newline of its line.
+
+    The shell reads one line at a time and echoes it after its prompt, and it
+    waits for the rest of a line that has not arrived. It runs ``echo``,
+    ``cat >PATH <<'DELIMITER'``, ``. PATH``, and ``nvx-exit``, with ``; ``
+    between commands, and ignores other commands.
+    """
+
+    def __init__(self, piece: int) -> None:
+        self.process = _ExitingProcess()
+        self.containment = None
+        self._piece = piece
+        self._input: queue.Queue[bytes] = queue.Queue()
+
+    def write_input(self, data: bytes) -> None:
+        self._input.put(data)
+
+    def close(self) -> None:
+        pass
+
+    def read_output(self, chunks: queue.Queue[bytes | None]) -> None:
+        chunks.put(b"NVX-GUEST-BOOT-OK: alpine\r\n")
+        typed = self._input.get(timeout=5).decode()
+        files: dict[str, list[str]] = {}
+        arrived = 0
+        consumed = 0
+
+        def emit(text: str) -> None:
+            if text:
+                chunks.put(text.encode())
+
+        def read_line(prompt: str) -> str:
+            nonlocal arrived, consumed
+            end = typed.index("\n", consumed)
+            arrived = max(arrived, end + 1)
+            line = typed[consumed:end]
+            consumed = end + 1
+            emit(f"{prompt}{line}\r\n")
+            return line
+
+        def run(line: str) -> bool:
+            """Run the commands of ``line``, and return whether the guest
+            still runs."""
+            nonlocal arrived
+            for command in line.split("; "):
+                heredoc = re.fullmatch(r"cat >(\S+) <<'(\w+)'", command)
+                if heredoc is not None:
+                    # The shell reads the here-document before cat runs.
+                    path, delimiter = heredoc.groups()
+                    files[path] = []
+                    while (body := read_line("> ")) != delimiter:
+                        files[path].append(body)
+                piece = typed[arrived : arrived + self._piece]
+                arrived += len(piece)
+                echo = piece.replace("\n", "\r\n")
+                words = shlex.split(command, comments=True)
+                if words[:1] == ["echo"]:
+                    emit(" ".join(words[1:]) + echo + "\r\n")
+                    continue
+                emit(echo)
+                if words[:1] == ["."]:
+                    if not all(run(stored) for stored in files[words[1]]):
+                        return False
+                elif words[:1] == ["nvx-exit"]:
+                    return False
+            return True
+
+        while consumed < len(typed) and run(read_line("/ # ")):
+            pass
+        self.process.exited = True
+        chunks.put(None)
+
+
+class GuestConsoleEchoTests(unittest.TestCase):
+    """The guest's terminal echoes console input that arrives while a command
+    runs into what the command prints (#785); no scenario may parse it."""
+
+    # Typed line by line, this script printed its DNS marker while the guest
+    # was still receiving the UDP probe's line, as in CI.
+    ECHOED_SCRIPT = (
+        "set -eu\n"
+        "echo NVX-IPV6-EGRESS-DNS none\n"
+        "probe_udp udp6-named fd00::c000:201 20000 &\n"
+        "probe_icmp icmp6 fd00::c000:201 &\n"
+        "echo NVX-IPV6-EGRESS-OK\n"
+        "nvx-exit 0\n"
+    )
+    # The piece that arrives while the script's first line runs ends where
+    # CI's did, inside the UDP probe's port.
+    ECHOED_PIECE = ECHOED_SCRIPT.index("0000 &") - len("set -eu\n")
+
+    def test_typed_script_lets_the_echo_cut_into_its_dns_marker(self):
+        console = _EchoingGuestConsole(self.ECHOED_PIECE)
+        with patch.object(benchmark, "InteractiveProcess", return_value=console):
+            result = benchmark.run_guest_script(
+                ["nvx-rs", "run"],
+                self.ECHOED_SCRIPT,
+                microvm_tests.IPV6_EGRESS_COMPLETION_MARKER,
+                timeout=5,
+                boot_marker=microvm_tests.BOOT_MARKER,
+            )
+        self.assertIn("NVX-IPV6-EGRESS-DNS none0000 &\r\n", result["text"])
+        self.assertEqual(
+            microvm_tests._ipv6_egress_dns_report(result["text"]), "none0000 &"
+        )
+
+    def test_staged_script_keeps_the_echo_out_of_its_output(self):
+        console = _EchoingGuestConsole(self.ECHOED_PIECE)
+        with patch.object(benchmark, "InteractiveProcess", return_value=console):
+            result = microvm_tests.run_guest_script(
+                ["nvx-rs", "run"],
+                self.ECHOED_SCRIPT,
+                microvm_tests.IPV6_EGRESS_COMPLETION_MARKER,
+                timeout=5,
+            )
+        self.assertEqual(
+            result["output"], "NVX-IPV6-EGRESS-DNS none\r\nNVX-IPV6-EGRESS-OK\r\n"
+        )
+        self.assertEqual(
+            microvm_tests._ipv6_egress_dns_report(result["output"]), "none"
+        )
+        # The terminal still echoed the input that arrived while cat ran, but
+        # before the start line.
+        before, _, _ = result["text"].partition("NVX-GUEST-SCRIPT-START\r\n")
+        self.assertIn('\r\necho NVX-GUEST-SCRIPT-"START"; . /tmp/', before)
+
+    def test_scripts_run_once_the_guest_has_consumed_them(self):
+        script = 'echo "NVX-OUT ${value:-none}"\necho NVX-DONE\nnvx-exit 0\n'
+        transcript = (
+            "NVX-GUEST-BOOT-OK: alpine\r\n"
+            # An echoed fragment of the staged script, cut before a marker.
+            "NVX-DONE\r\n"
+            '/ # echo NVX-GUEST-SCRIPT-"START"; . /tmp/nvx-guest-script\r\n'
+            "NVX-GUEST-SCRIPT-START\r\n"
+            "NVX-OUT none\r\n"
+            "NVX-DONE\r\n"
+        )
+        with patch.object(
+            microvm_tests,
+            "_run_guest_script",
+            return_value={"text": transcript, "wall_ms": 5.0, "peak_rss_bytes": 7},
+        ) as run:
+            result = microvm_tests.run_guest_script(
+                ["openvmm"],
+                script,
+                b"NVX-DONE",
+                timeout=30,
+                log_path=Path("guest.log"),
+                contain_process_tree=True,
+            )
+        run.assert_called_once_with(
+            ["openvmm"],
+            "cat >/tmp/nvx-guest-script <<'NVX_GUEST_SCRIPT'\n"
+            + script
+            + "NVX_GUEST_SCRIPT\n"
+            + 'echo NVX-GUEST-SCRIPT-"START"; . /tmp/nvx-guest-script\n',
+            b"NVX-DONE",
+            timeout=30,
+            windows_cpus=None,
+            teardown_mode="guest-exit",
+            log_path=Path("guest.log"),
+            boot_marker=microvm_tests.BOOT_MARKER,
+            contain_process_tree=True,
+            time_abi_status=True,
+        )
+        self.assertEqual(result["output"], "NVX-OUT none\r\nNVX-DONE\r\n")
+        self.assertEqual(result["text"], transcript)
+        self.assertEqual((result["wall_ms"], result["peak_rss_bytes"]), (5.0, 7))
+
+    def test_staged_input_sources_the_script_in_the_console_shell(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        script = 'value=staged\necho "NVX-OUT $value"\n'
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(
+                microvm_tests,
+                "_run_guest_script",
+                return_value={
+                    "text": "NVX-GUEST-SCRIPT-START\nNVX-OUT staged\n",
+                    "wall_ms": 0.0,
+                    "peak_rss_bytes": 0,
+                },
+            ) as run,
+        ):
+            microvm_tests.run_guest_script(
+                ["openvmm"], script, b"NVX-OUT staged", timeout=1
+            )
+            staged = run.call_args.args[1].replace(
+                microvm_tests.GUEST_SCRIPT_PATH,
+                (Path(temporary) / "script").as_posix(),
+            )
+            # The shell that reads the input keeps the script's variables.
+            result = subprocess.run(
+                [shell],
+                input=(staged + 'echo "NVX-AFTER $value"\n').encode(),
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.decode().replace("\r\n", "\n"),
+            "NVX-GUEST-SCRIPT-START\nNVX-OUT staged\nNVX-AFTER staged\n",
+        )
+
+    def test_scripts_cannot_end_their_staging_early(self):
+        for script, message in (
+            ("echo NVX-DONE", "must end with a newline"),
+            ("echo one\nNVX_GUEST_SCRIPT\necho NVX-DONE\n", "cannot hold the line"),
+        ):
+            with (
+                self.subTest(message=message),
+                patch.object(microvm_tests, "_run_guest_script") as run,
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                microvm_tests.run_guest_script(
+                    ["openvmm"], script, b"NVX-DONE", timeout=1
+                )
+            run.assert_not_called()
+
+    def test_markers_count_only_after_the_start_line(self):
+        for text, message in (
+            (
+                "NVX-DONE\r\nNVX-GUEST-SCRIPT-START\r\nNVX-OTHER\r\n",
+                "did not print 'NVX-DONE' after its start line",
+            ),
+            ('NVX-GUEST-SCRIPT-"START"\r\nNVX-DONE\r\n', "never printed the start"),
+        ):
+            with (
+                self.subTest(message=message),
+                patch.object(
+                    microvm_tests,
+                    "_run_guest_script",
+                    return_value={"text": text, "wall_ms": 0.0, "peak_rss_bytes": 0},
+                ),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                microvm_tests.run_guest_script(
+                    ["openvmm"], "echo NVX-DONE\n", b"NVX-DONE", timeout=1
+                )
+
+    def test_scripts_awaiting_a_release_turn_the_echo_off_first(self):
+        # The host's release arrives while the script runs.
+        for name, ready, release in (
+            (
+                "directional-network-policy.sh.in",
+                'echo NVX-DIRECTIONAL-INGRESS-"READY"',
+                "read -r ingress_release",
+            ),
+            (
+                "host-loopback-policy.sh.in",
+                f"echo {microvm_tests.HOST_LOOPBACK_INGRESS_READY_MARKER.decode()}",
+                "read -r release",
+            ),
+            (
+                "private-network-ingress.sh.in",
+                f"echo {microvm_tests.PRIVATE_INGRESS_LISTENING_MARKER.decode()}",
+                "read -r release",
+            ),
+            (
+                "platform-network-policy.sh.in",
+                f"echo {microvm_tests.PLATFORM_NETWORK_LISTENING_MARKER.decode()}",
+                "read -r release exchange",
+            ),
+            (
+                "untiered-network-policy.sh.in",
+                f"echo {microvm_tests.UNTIERED_NETWORK_LISTENING_MARKER.decode()}",
+                "read -r release exchanges",
+            ),
+        ):
+            with self.subTest(name=name):
+                script = microvm_tests._read_script(name)
+                self.assertEqual(script.count("stty -echo"), 1)
+                self.assertLess(script.index("stty -echo"), script.index(ready))
+                self.assertLess(script.index(ready), script.index(release))
+
+
+class _FakeRamUpperSandboxCli(_FakeSandboxCli):
+    """Emulates `nvx-rs sandbox --upper ram` and its guest: no scratch image,
+    a distro layer alone, the RAM upper's token, and an upper that each start
+    begins empty.
+
+    Each fault names a regression of the planner, the guest, or the record
+    that the acceptance must detect.
+    """
+
+    SMOKE_RUN = (
+        b"NVX-UBUNTU-SANDBOX-PROFILE-OK uid=65534 gid=65534\n"
+        + f"NVX-UBUNTU-SANDBOX-LIMITS-OK "
+        f"memory_max={sandbox_ram_upper_tests.MEMORY_MAX} "
+        f"pids_max={sandbox_ram_upper_tests.PIDS_MAX}\n".encode()
+        + b"NVX-UBUNTU-SANDBOX-OK uid=65534 gid=65534\n"
+    )
+
+    def _command_line(self) -> str:
+        upper = (
+            "nvx_scratch=0xd0006000,ext4"
+            if "declares-scratch" in self.faults
+            else sandbox_ram_upper_tests.RAM_UPPER_TOKEN
+        )
+        return f"nvx_sandbox=1 nvx_layer=distro,0xd0003000,erofs {upper}"
+
+    def _run(
+        self, state: Path | None, values: dict[str, str], _: list[str]
+    ) -> _CliResult:
+        assert state is None
+        assert values["--upper"] == "ram"
+        assert values["--entrypoint"] == sandbox_lifecycle_tests.PROBE
+        assert _ == [
+            "limits",
+            str(sandbox_ram_upper_tests.MEMORY_MAX),
+            str(sandbox_ram_upper_tests.PIDS_MAX),
+        ]
+        blocks = f"--microvm-sandbox-block distro:file:{values['--layer']},ro"
+        if "attaches-scratch" in self.faults:
+            blocks += " --microvm-sandbox-block scratch:file:scratch.ext4"
+        command = f">> openvmm {blocks}"
+        if "drops-report" not in self.faults:
+            report = Path(values["--outcome-report"])
+            command += f" --microvm-report {report}"
+            outcome = (
+                {"operation": "run", "category": "guest-exit", "status_code": 1}
+                if "run-reports-failure" in self.faults
+                else sandbox_ram_upper_tests.RUN_SUCCESS
+            )
+            teardown = dict.fromkeys(microvm_tests.OUTCOME_TEARDOWN_FIELDS, True)
+            if "partial-teardown" in self.faults:
+                del teardown["virtiofs_released"]
+            if "incomplete-teardown" in self.faults:
+                teardown["openvmm_process_terminated"] = False
+            report.write_text(
+                json.dumps(
+                    {
+                        "backend": values["--hypervisor"],
+                        "outcome": outcome,
+                        "teardown": teardown,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        command += f" --cmdline '{self._command_line()}'\n"
+        output = b"" if "probe-fails" in self.faults else self.SMOKE_RUN
+        return 0, command.encode() + output, b""
+
+    def _provision(
+        self, state: Path | None, values: dict[str, str], _: list[str]
+    ) -> _CliResult:
+        if "--scratch" in values and "accepts-scratch" not in self.faults:
+            return self._error(
+                "unsupported",
+                "--upper ram and --scratch are mutually exclusive: an upper in RAM "
+                "has no scratch image",
+            )
+        result = super()._provision(state, values, _)
+        if result[0] == 0:
+            assert state is not None
+            path = state / "config.json"
+            config = json.loads(path.read_text(encoding="utf-8"))
+            config.update(format=8, upper="ram", scratch=None, scratch_binding=None)
+            if "records-scratch" in self.faults:
+                config.update(upper="scratch", scratch="scratch.ext4")
+            path.write_text(json.dumps(config), encoding="utf-8")
+        return result
+
+    def _start(
+        self, state: Path | None, values: dict[str, str], _: list[str]
+    ) -> _CliResult:
+        if "--upper" in values and "start-takes-upper" not in self.faults:
+            return self._error(
+                "unsupported", "--upper is only valid for sandbox run or provision"
+            )
+        result = super()._start(state, values, _)
+        # A RAM upper begins empty at each start.
+        if result[0] == 0 and state is not None and "keeps-state" not in self.faults:
+            self.guest_files.pop(state, None)
+        return result
+
+    def _exec(
+        self, state: Path | None, values: dict[str, str], arguments: list[str]
+    ) -> _CliResult:
+        assert state is not None
+        state_path = sandbox_ram_upper_tests.STATE_PATH
+        if values["--entrypoint"] != "/bin/sh" or arguments[1].startswith("test ! -e "):
+            return super()._exec(state, values, arguments)
+        _, refusal = self._running(state)
+        if refusal is not None:
+            return refusal
+        script = arguments[1]
+        if script == sandbox_ram_upper_tests.VIEW_SCRIPT:
+            devices = "vda\nvdb\n" if "has-scratch-device" in self.faults else "vda\n"
+            return 0, f"loop0\n{devices}{self._command_line()}\n".encode(), b""
+        if script == f"printf 'kept in RAM\\n' >{state_path}":
+            self.guest_files.setdefault(state, {})[state_path] = (
+                sandbox_ram_upper_tests.STATE_CONTENT
+            )
+            return 0, b"", b""
+        if script == sandbox_ram_upper_tests.CHARGE_SCRIPT:
+            if "uncharged" in self.faults:
+                return 11, b"", b""
+            return 0, sandbox_ram_upper_tests.CHARGE_MARKER + b"\n", b""
+        raise AssertionError(f"unexpected script {script!r}")
+
+
+class PublicSandboxRamUpperTests(unittest.TestCase):
+    EXPECTED_OPERATIONS = [
+        # The planner refuses a scratch image beside a RAM upper, and an upper
+        # outside run and provision.
+        "provision",
+        "start",
+        # A one-shot run.
+        "run",
+        # A managed sandbox: the probe, the guest's view, a written and a read
+        # file, and the memory charge of a file in the upper.
+        "provision",
+        "start",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "exec",
+        "stop",
+        # Its next start begins with an empty upper.
+        "start",
+        "exec",
+        "stop",
+        "deprovision",
+    ]
+
+    def _run(self, root: Path, fake: _FakeRamUpperSandboxCli) -> Path:
+        distro = root / "ubuntu-distro.erofs"
+        distro.write_bytes(b"distro")
+        template = root / "ubuntu-smoke-scratch.ext4"
+        template.write_bytes(bytes(4096))
+        artifacts = managed_exec_tests.WorkloadArtifacts(
+            distro, "12345678-1234-1234-1234-123456789abc", template
+        )
+        output_dir = root / "results"
+        mkdtemp = tempfile.mkdtemp
+
+        def fixture(prefix: str) -> str:
+            return mkdtemp(prefix=prefix, dir=root)
+
+        with (
+            patch.object(
+                sandbox_ram_upper_tests,
+                "load_workload_artifacts",
+                return_value=artifacts,
+            ),
+            patch.object(
+                sandbox_ram_upper_tests.tempfile, "mkdtemp", side_effect=fixture
+            ),
+            patch.object(sandbox_lifecycle_tests.subprocess, "run", side_effect=fake),
+            patch.object(
+                sandbox_lifecycle_tests.nvx_rs,
+                "require_binary",
+                return_value=Path("nvx-rs"),
+            ),
+            patch.object(
+                sandbox_lifecycle_tests,
+                "openvmm_processes",
+                side_effect=fake.processes,
+            ),
+            patch.object(
+                sandbox_lifecycle_tests,
+                "control_endpoint_present",
+                side_effect=fake.endpoint_present,
+            ),
+            patch.object(
+                sandbox_lifecycle_tests,
+                "terminate_process",
+                side_effect=fake.terminate,
+            ),
+            patch.object(
+                sandbox_lifecycle_tests, "openvmm_threads_remain", return_value=False
+            ),
+        ):
+            sandbox_ram_upper_tests.run_sandbox_ram_upper(
+                "mshv", timeout=2, output_dir=output_dir
+            )
+        return output_dir
+
+    def test_acceptance_runs_sandboxes_whose_upper_is_in_ram(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = _FakeRamUpperSandboxCli()
+            output_dir = self._run(root, fake)
+            checks = json.loads(
+                (output_dir / "sandbox-ram-upper-checks.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            evidence = {path.name for path in output_dir.iterdir()}
+            fixtures = list(root.glob("nvx-public-ram-upper-*"))
+
+        self.assertEqual(fake.operations, self.EXPECTED_OPERATIONS)
+        self.assertEqual(fixtures, [])
+        self.assertFalse(any(fake.running.values()))
+        self.assertEqual(
+            evidence,
+            {
+                "sandbox-ram-upper-checks.json",
+                "sandbox-ram-upper-runtime.json",
+                "sandbox-ram-upper-run.log",
+                "sandbox-ram-upper-run-outcome.json",
+                "sandbox-ram-upper-probe.log",
+                "sandbox-ram-upper-view.log",
+                "sandbox-ram-upper-charge.log",
+                "sandbox-ram-upper-first-stop-outcome.json",
+                "sandbox-ram-upper-second-stop-outcome.json",
+            },
+        )
+        self.assertEqual(
+            [record["operation"] for record in checks], self.EXPECTED_OPERATIONS
+        )
+        # Every launch keeps its upper in RAM, and only the refused one names a
+        # scratch image.
+        launches = [
+            record["argv"]
+            for record in checks
+            if record["operation"] in {"run", "provision"}
+        ]
+        for argv in launches:
+            self.assertEqual(argv[argv.index("--upper") + 1], "ram")
+        self.assertEqual(
+            ["--scratch" in argv for argv in launches], [True, False, False]
+        )
+
+    def test_acceptance_detects_ram_upper_regressions(self):
+        regressions = {
+            "accepts-scratch": "provision returned 0, expected 1",
+            "start-takes-upper": "with error 'unsupported'",
+            "attaches-scratch": "did not attach its distro layer alone",
+            "declares-scratch": "does not declare the RAM upper alone",
+            "probe-fails": "the one-shot RAM-upper probe did not report",
+            "drops-report": "the one-shot run's OpenVMM command does not name",
+            "run-reports-failure": "the one-shot run reported",
+            "partial-teardown": "the one-shot run's teardown is",
+            "incomplete-teardown": "the one-shot run's teardown is",
+            "records-scratch": "provision recorded the RAM upper as",
+            "has-scratch-device": "has the virtio block devices ['vda', 'vdb']",
+            "uncharged": "the memory charge of the RAM upper returned status 11",
+            "keeps-state": "the restarted sandbox's empty upper returned status 1",
+        }
+        for fault, message in regressions.items():
+            with (
+                self.subTest(fault=fault),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                fake = _FakeRamUpperSandboxCli(fault)
+                with self.assertRaisesRegex(RuntimeError, re.escape(message)):
+                    self._run(root, fake)
+                # Cleanup ends every OpenVMM process and removes the fixture.
+                self.assertFalse(any(fake.running.values()))
+                self.assertEqual(list(root.glob("nvx-public-ram-upper-*")), [])
+                self.assertTrue(
+                    (root / "results" / "sandbox-ram-upper-checks.json").is_file()
+                )
+
+    def test_charge_script_needs_a_kill_that_only_the_upper_file_causes(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        # The stand-in dd is killed as the memory controller kills the real one:
+        # while the file holds the upper's pages, or always, or never.
+        for dd, expected in (
+            ('[ -e "$fill" ] && return 137; return 0', (0, "NVX-RAM-UPPER-CHARGED\n")),
+            ("return 0", (11, "")),
+            ("return 137", (12, "")),
+        ):
+            with self.subTest(dd=dd), tempfile.TemporaryDirectory() as temporary:
+                fill = f"{Path(temporary).as_posix()}/fill"
+                script = sandbox_ram_upper_tests.CHARGE_SCRIPT.replace(
+                    "/tmp/nvx-ram-upper-fill", fill
+                )
+                result = subprocess.run(
+                    [
+                        shell,
+                        "-c",
+                        f"fill='{fill}'\nhead() {{ :; }}\ndd() {{ {dd}; }}\n{script}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(
+                    (result.returncode, result.stdout), expected, result.stderr
+                )
+                self.assertFalse(Path(fill).exists())
 
 
 class GuestIdentityScriptTests(unittest.TestCase):
@@ -2477,7 +3890,7 @@ class FilesystemPolicyScenarioTests(unittest.TestCase):
 
 
 class FilesystemCommaPathsScenarioTests(unittest.TestCase):
-    """The filesystem-comma-paths scenario with `nvx.py run` and the guest
+    """The filesystem-comma-paths scenario with `nvx-rs run` and the guest
     simulated."""
 
     @staticmethod
@@ -2511,6 +3924,7 @@ class FilesystemCommaPathsScenarioTests(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as temporary,
             patch.object(microvm_tests, "run_guest_script", side_effect=guest),
+            patch.object(nvx_rs, "require_binary", return_value=_FAKE_NVX_RS),
         ):
             microvm_tests.run_filesystem_comma_paths(
                 "kvm", memory_mib=128, timeout=1.0, output_dir=Path(temporary)
@@ -2525,9 +3939,7 @@ class FilesystemCommaPathsScenarioTests(unittest.TestCase):
         for (command, script), shares in zip(
             launched, ((alpha,), (reports,), (alpha, reports)), strict=True
         ):
-            self.assertEqual(command[0], sys.executable)
-            self.assertEqual(Path(command[1]).name, "nvx.py")
-            self.assertEqual(command[2], "run")
+            self.assertEqual(command[:4], _FAKE_PUBLIC_RUN)
             self.assertEqual(command[command.index("--hypervisor") + 1], "kvm")
             mounts = self._values(command, "--mount")
             denied = self._values(command, "--mount-deny")
@@ -2589,29 +4001,6 @@ class FilesystemCommaPathsScenarioTests(unittest.TestCase):
         self.assertIn("nvx-exit 0", script)
 
 
-class ControlSessionTests(unittest.TestCase):
-    def test_named_pipe_connect_retries_transient_invalid_argument(self):
-        error = OSError(control_session.errno.EINVAL, "Invalid argument")
-        with (
-            patch.object(control_session, "_winapi") as winapi,
-            patch.object(
-                control_session.time,
-                "monotonic",
-                side_effect=[0.0, 0.0],
-            ),
-            patch.object(control_session.time, "sleep") as sleep,
-        ):
-            winapi.CreateFile.side_effect = [error, 123]
-            stream = control_session._NamedPipeStream.connect(
-                Path(r"\\.\pipe\nvx-test"),
-                1.0,
-            )
-
-        self.assertEqual(stream._handle, 123)
-        self.assertEqual(winapi.CreateFile.call_count, 2)
-        sleep.assert_called_once_with(0.025)
-
-
 class _PortExclusionSockets:
     """Create sockets that refuse ports excluded per protocol, as Windows does."""
 
@@ -2641,30 +4030,208 @@ class _PortExclusionSockets:
         return endpoint
 
 
+class _EphemeralPortSockets:
+    """Create sockets to which the host assigns ``ports`` in turn on bind."""
+
+    def __init__(self, ports: Collection[int]) -> None:
+        self._socket_type = socket.socket
+        self._ports = iter(ports)
+        self.created: list[MagicMock] = []
+        self.events: list[tuple[str, int]] = []
+
+    def __call__(self, _family: int, _kind: int) -> MagicMock:
+        endpoint = MagicMock(spec=self._socket_type)
+        port = next(self._ports)
+
+        def bind(_address: tuple[str, int]) -> None:
+            self.events.append(("bind", port))
+
+        def close() -> None:
+            self.events.append(("close", port))
+
+        endpoint.bind.side_effect = bind
+        endpoint.close.side_effect = close
+        endpoint.getsockname.return_value = ("127.0.0.1", port)
+        self.created.append(endpoint)
+        return endpoint
+
+
 class MicrovmTests(unittest.TestCase):
-    def test_managed_lifecycle_spawns_openvmm_with_a_prepared_capability_pipe(self):
-        # OpenVMM reads its capability as soon as it starts, so the scenario hands
-        # it a pipe that already holds the capability and the end of file (#440).
-        prepared: list[int] = []
-        spawned: list[object] = []
+    @staticmethod
+    def _managed_report(backend: str = "kvm") -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "instance_id": "33" * 16,
+            "backend": backend,
+            "outcome": {
+                "operation": "managed",
+                "category": "success",
+                "status_code": 0,
+            },
+            "network_policy": {
+                "status": "not-requested",
+                "status_code": 0,
+                "mode": "none",
+                "allow_rule_count": 0,
+                "deny_rule_count": 0,
+                "host_loopback": False,
+            },
+            "teardown": {name: True for name in microvm_tests.OUTCOME_TEARDOWN_FIELDS},
+        }
 
-        def prepare(capability: bytes) -> int:
-            descriptor = control_session.capability_pipe(capability)
-            prepared.append(descriptor)
-            return descriptor
+    def _run_managed_lifecycle(
+        self,
+        output_dir: Path,
+        *,
+        returncode: int = 0,
+        console: bytes = b"NVX-GUEST-BOOT-OK: managed\n",
+        report: dict[str, object] | None = None,
+        rejected: int = 1,
+    ) -> list[tuple[list[str], dict[str, str], object]]:
+        """Runs the scenario with a stand-in for the nvx-rs test, which leaves
+        `console`, `report`, and `returncode` as the real one would."""
+        runs: list[tuple[list[str], dict[str, str], object]] = []
 
-        def launch(_command: list[str], *, stdin: object, **_options: object) -> None:
-            # The pipe stays open until OpenVMM has started with it.
-            self.assertIsInstance(stdin, int)
-            os.fstat(cast(int, stdin))
-            spawned.append(stdin)
-            raise RuntimeError("stopped after the spawn")
+        def start_test(
+            command: list[str], *, cwd: object, env: dict[str, str]
+        ) -> MagicMock:
+            runs.append((command, env, cwd))
+            openvmm = cast(list[str], json.loads(env["NVX_MANAGED_LIFECYCLE_COMMAND"]))
+            # The test copies the guest console into the output directory.
+            output_dir = Path(env["NVX_MANAGED_LIFECYCLE_OUTPUT_DIR"])
+            (output_dir / "managed-lifecycle-guest.log").write_bytes(console)
+            report_path = Path(openvmm[openvmm.index("--microvm-report") + 1])
+            report_path.write_text(
+                json.dumps(self._managed_report() if report is None else report),
+                encoding="utf-8",
+            )
+            test = MagicMock()
+            test.wait.return_value = returncode
+            return test
 
         with (
+            patch.object(microvm_tests.shutil, "which", return_value="cargo"),
+            patch.object(microvm_tests.subprocess, "Popen", side_effect=start_test),
+            patch.object(microvm_tests, "OpenvmmProcess") as process,
+        ):
+            process.return_value.__enter__.return_value.wait.return_value = (
+                openvmm_process.OpenvmmProcessResult(rejected, b"")
+            )
+            microvm_tests.run_managed_lifecycle(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initramfs.cpio.gz"),
+                "kvm",
+                memory_mib=256,
+                timeout=5,
+                output_dir=output_dir,
+            )
+        return runs
+
+    def test_managed_lifecycle_runs_the_nvx_rs_test_and_checks_what_it_leaves(self):
+        # nvx-rs/tests/managed_lifecycle.rs drives the control session; the
+        # scenario hands it OpenVMM's command, then checks the outcome report
+        # and the guest console.
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            runs = self._run_managed_lifecycle(output_dir)
+            preserved = json.loads(
+                (output_dir / "managed-outcome.json").read_text(encoding="utf-8")
+            )
+            # An adversarial campaign requires this report, with its teardown.
+            reports, teardown_complete = adversarial_executor._inventory_outcomes(
+                output_dir,
+                required_names=adversarial_executor._REQUIRED_OUTCOME_REPORTS[
+                    "managed-lifecycle"
+                ],
+            )
+
+        self.assertTrue(teardown_complete, reports)
+        self.assertEqual(
+            [report["path"] for report in reports], ["managed-outcome.json"]
+        )
+        self.assertEqual(len(runs), 1)
+        command, environment, cwd = runs[0]
+        self.assertEqual(
+            command,
+            [
+                "cargo",
+                "test",
+                "--manifest-path",
+                os.fspath(BuildConstants.REPO_ROOT / "nvx-rs" / "Cargo.toml"),
+                "--locked",
+                "--test",
+                "managed_lifecycle",
+                "--",
+                "--ignored",
+                "--nocapture",
+            ],
+        )
+        # The repository root selects the pinned Rust release.
+        self.assertEqual(cwd, BuildConstants.REPO_ROOT)
+        self.assertEqual(environment["OPENVMM_LOG"], "off")
+        self.assertEqual(environment["NVX_MANAGED_LIFECYCLE_TIMEOUT"], "5")
+        self.assertEqual(
+            environment["NVX_MANAGED_LIFECYCLE_OUTPUT_DIR"],
+            os.fspath(output_dir.resolve()),
+        )
+        openvmm = json.loads(environment["NVX_MANAGED_LIFECYCLE_COMMAND"])
+        # Cargo runs the test in the nvx-rs directory, so every path is absolute.
+        for option in ("--kernel", "--initrd", "--microvm-report"):
+            self.assertTrue(Path(openvmm[openvmm.index(option) + 1]).is_absolute())
+        self.assertTrue(Path(openvmm[0]).is_absolute())
+        # The microVM console listens on TCP, at the address that the test
+        # copies it from.
+        self.assertEqual(
+            openvmm[openvmm.index("--virtio-console") + 1],
+            f"listen=tcp:{environment['NVX_MANAGED_LIFECYCLE_CONSOLE']}",
+        )
+        self.assertRegex(
+            environment["NVX_MANAGED_LIFECYCLE_CONSOLE"], r"\A127\.0\.0\.1:[0-9]+\Z"
+        )
+        self.assertEqual(
+            openvmm[openvmm.index("--microvm-control-console") + 1],
+            f"listen={environment['NVX_MANAGED_LIFECYCLE_ENDPOINT']}",
+        )
+        for option, value in (
+            ("--microvm-workload-identity", "65534:65534"),
+            ("--microvm-lifecycle", "managed"),
+        ):
+            self.assertEqual(openvmm[openvmm.index(option) + 1], value)
+        self.assertIn("--microvm-control-auth-stdin", openvmm)
+        self.assertEqual(preserved, self._managed_report())
+
+    def test_managed_lifecycle_hands_the_test_an_absolute_pid_journal(self):
+        # The nvx-rs test records OpenVMM in an adversarial campaign's journal
+        # from the nvx-rs directory, so a relative journal resolves here.
+        variable = "NVX_ADVERSARIAL_OPENVMM_PID_JOURNAL"
+        relative = os.path.join("journal", "openvmm-pids.jsonl")
+        for value, expected in (
+            (relative, os.path.abspath(relative)),
+            (os.path.abspath(relative), os.path.abspath(relative)),
+            (None, None),
+        ):
+            with (
+                self.subTest(value=value),
+                tempfile.TemporaryDirectory() as temporary,
+                patch.dict(os.environ),
+            ):
+                os.environ.pop(variable, None)
+                if value is not None:
+                    os.environ[variable] = value
+                runs = self._run_managed_lifecycle(Path(temporary))
+                self.assertEqual(runs[0][1].get(variable), expected)
+
+    def test_managed_lifecycle_requires_cargo(self):
+        with (
             tempfile.TemporaryDirectory() as temporary,
-            patch.object(microvm_tests, "capability_pipe", side_effect=prepare),
-            patch.object(microvm_tests.subprocess, "Popen", side_effect=launch),
-            self.assertRaisesRegex(RuntimeError, "^stopped after the spawn$"),
+            patch.object(microvm_tests.shutil, "which", return_value=None),
+            patch.object(microvm_tests.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(
+                common.ScriptError,
+                "runs the nvx-rs test managed_lifecycle with Cargo, which is not "
+                "on PATH",
+            ),
         ):
             microvm_tests.run_managed_lifecycle(
                 Path("openvmm"),
@@ -2675,12 +4242,88 @@ class MicrovmTests(unittest.TestCase):
                 timeout=5,
                 output_dir=Path(temporary),
             )
+        popen.assert_not_called()
 
-        self.assertEqual(len(prepared), 1)
-        self.assertEqual(spawned, prepared)
-        # The scenario closes its copy of the pipe once OpenVMM has it.
-        with self.assertRaises(OSError):
-            os.fstat(prepared[0])
+    def test_an_interrupted_managed_lifecycle_ends_the_test_and_its_openvmm(self):
+        # A SIGINT that reaches nvx.py alone leaves Cargo's descendants, the
+        # test and its OpenVMM, running; the scenario ends and reaps the whole
+        # tree while the temporary directory that they use still exists.
+        test = MagicMock()
+        test.wait.side_effect = KeyboardInterrupt
+        roots: list[Path] = []
+
+        def start_test(command: list[str], **options: Any) -> MagicMock:
+            openvmm = json.loads(options["env"]["NVX_MANAGED_LIFECYCLE_COMMAND"])
+            roots.append(Path(openvmm[openvmm.index("--microvm-report") + 1]).parent)
+            return test
+
+        def terminate(process: object, *, process_group: bool) -> None:
+            self.assertIs(process, test)
+            self.assertFalse(process_group)
+            self.assertTrue(roots[0].is_dir())
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests.shutil, "which", return_value="cargo"),
+            patch.object(microvm_tests.subprocess, "Popen", side_effect=start_test),
+            patch.object(
+                microvm_tests, "terminate_process_tree", side_effect=terminate
+            ) as terminate_tree,
+            patch.object(microvm_tests, "OpenvmmProcess") as process,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            microvm_tests.run_managed_lifecycle(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initramfs.cpio.gz"),
+                "kvm",
+                memory_mib=256,
+                timeout=5,
+                output_dir=Path(temporary),
+            )
+        terminate_tree.assert_called_once()
+        self.assertFalse(roots[0].exists())
+        # The scenario ended there, before its other boot.
+        process.assert_not_called()
+
+    def test_managed_lifecycle_fails_with_the_test_and_with_the_report(self):
+        violation = f"{time_abi.VIOLATION_PREFIX}code=bogus\n".encode()
+        failures: tuple[tuple[dict[str, Any], type[Exception], str], ...] = (
+            (
+                {"returncode": 101},
+                RuntimeError,
+                "the managed lifecycle test managed_lifecycle failed with exit "
+                "status 101",
+            ),
+            # The guest's own explanation comes before the test's failure.
+            (
+                {"returncode": 101, "console": violation},
+                time_abi.TimeAbiFailure,
+                "guest reported time ABI violation",
+            ),
+            (
+                {"report": self._managed_report(backend="whp")},
+                RuntimeError,
+                "managed lifecycle outcome report was invalid",
+            ),
+            (
+                {"report": {**self._managed_report(), "teardown": {}}},
+                RuntimeError,
+                "structured outcome report has an invalid teardown outcome",
+            ),
+            (
+                {"rejected": 0},
+                RuntimeError,
+                "managed lifecycle without a control endpoint was not rejected",
+            ),
+        )
+        for options, error, message in failures:
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+                self.assertRaisesRegex(error, re.escape(message)),
+            ):
+                self._run_managed_lifecycle(Path(temporary), **options)
 
     def test_host_loopback_port_candidates_are_spread_across_the_dynamic_range(self):
         first, last = microvm_tests.HOST_LOOPBACK_PORT_RANGE
@@ -2768,13 +4411,17 @@ class MicrovmTests(unittest.TestCase):
         ):
             endpoint.close.assert_called_once_with()
 
-    def test_host_loopback_rejections_cover_snapshots_and_explicit_denial(self):
+    def test_host_loopback_rejections_cover_snapshots_narrow_networks_and_denial(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(microvm_tests, "OpenvmmProcess") as process:
                 process.return_value.__enter__.return_value.wait.side_effect = [
                     openvmm_process.OpenvmmProcessResult(2, message)
                     for message in (
                         b"microVM snapshots do not support --host-loopback allow",
+                        b"--host-loopback allow requires an IPv4 network of "
+                        b"/29 or larger",
                         b"--host-loopback-forward requires explicit --host-loopback allow",
                         b"must match the guest gateway",
                     )
@@ -2789,16 +4436,22 @@ class MicrovmTests(unittest.TestCase):
                     output_dir=Path(temporary),
                 )
         commands = [call.args[0] for call in process.call_args_list]
-        self.assertEqual(len(commands), 3)
+        self.assertEqual(len(commands), 4)
         self.assertEqual(
             [command[command.index("--host-loopback") + 1] for command in commands],
-            ["allow", "deny", "deny"],
+            ["allow", "allow", "deny", "deny"],
+        )
+        self.assertEqual(
+            [command[command.index("--net") + 1] for command in commands],
+            ["192.0.2.2/24", "192.0.2.2/30", "192.0.2.2/24", "192.0.2.2/24"],
         )
         self.assertIn("--snapshot-destination", commands[0])
         self.assertIn("--pidfile", commands[0])
         self.assertNotIn("--host-loopback-forward", commands[0])
-        self.assertIn("--host-loopback-forward", commands[1])
-        self.assertIn("--network-proxy", commands[2])
+        self.assertNotIn("--snapshot-destination", commands[1])
+        self.assertNotIn("--host-loopback-forward", commands[1])
+        self.assertIn("--host-loopback-forward", commands[2])
+        self.assertIn("--network-proxy", commands[3])
 
     def test_host_loopback_rejection_requires_diagnostic_and_no_boot(self):
         diagnostic = b"microVM snapshots do not support --host-loopback allow"
@@ -2949,6 +4602,8 @@ class MicrovmTests(unittest.TestCase):
             path = root / "private-network-ingress.sh"
             path.write_text(
                 "sleep() { :; }\n"
+                # The script's input is a pipe here, not the guest's terminal.
+                'stty() { [ "$*" = -echo ]; }\n'
                 f"pidof() {{ return {0 if ingress_running else 1}; }}\n"
                 'nc() { case "$*" in\n'
                 f"'-l -p '*) {tcp} ;;\n"
@@ -3235,11 +4890,14 @@ class MicrovmTests(unittest.TestCase):
                         "host-loopback-policy.sh.in",
                         MODE=mode,
                         GATEWAY_IPV4="10.0.0.1",
+                        GATEWAY_IPV6="fd00::a00:1",
                         GENERAL_PORT="8444",
                         PROXY_PORT="8443",
                         GUEST_PORT="0",
                         PRIVATE_GUEST_PORT="0",
                         UDP_IPV6_GUEST_PORT="0",
+                        UDP_ECHO_PORT="0",
+                        UDP_ECHO_IPV6_PORT="0",
                     )
                     .replace("nvx-exit", "nvx_exit")
                     .replace("/proc/cmdline", cmdline.as_posix())
@@ -3283,11 +4941,14 @@ class MicrovmTests(unittest.TestCase):
                         "host-loopback-policy.sh.in",
                         MODE="deny",
                         GATEWAY_IPV4="10.0.0.1",
+                        GATEWAY_IPV6="fd00::a00:1",
                         GENERAL_PORT="8444",
                         PROXY_PORT="8443",
                         GUEST_PORT="0",
                         PRIVATE_GUEST_PORT="0",
                         UDP_IPV6_GUEST_PORT="0",
+                        UDP_ECHO_PORT="0",
+                        UDP_ECHO_IPV6_PORT="0",
                     )
                     .replace("nvx-exit", "nvx_exit")
                     .replace("/proc/cmdline", path.as_posix())
@@ -3316,12 +4977,16 @@ class MicrovmTests(unittest.TestCase):
             "host-loopback-policy.sh.in",
             MODE="deny",
             GATEWAY_IPV4="10.0.0.1",
+            GATEWAY_IPV6="fd00::a00:1",
             GENERAL_PORT="8444",
             PROXY_PORT="8443",
             GUEST_PORT="0",
             PRIVATE_GUEST_PORT="0",
             UDP_IPV6_GUEST_PORT="0",
+            UDP_ECHO_PORT="0",
+            UDP_ECHO_IPV6_PORT="0",
         )
+        self.assertNotRegex(script, "@[A-Z0-9_]+@")
         self.assertIn("nc -u -w 1 10.0.0.1 8443", script)
         self.assertIn("nc -u -w 1 10.0.0.1 8444", script)
         self.assertIn("http://10.0.0.1:8443/proxy", script)
@@ -3338,6 +5003,8 @@ class MicrovmTests(unittest.TestCase):
         listeners: bool = True,
         udp_ipv6_listener: bool = True,
         private_listeners: bool = True,
+        udp_echo: bool = True,
+        udp_echo_ipv6: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         shell = _posix_shell()
         if shell is None:
@@ -3371,11 +5038,14 @@ class MicrovmTests(unittest.TestCase):
                     "host-loopback-policy.sh.in",
                     MODE="allow",
                     GATEWAY_IPV4="10.0.0.1",
+                    GATEWAY_IPV6="fd00::a00:1",
                     GENERAL_PORT="8444",
                     PROXY_PORT="0",
                     GUEST_PORT="8080",
                     PRIVATE_GUEST_PORT="8081",
                     UDP_IPV6_GUEST_PORT="8082",
+                    UDP_ECHO_PORT="8083",
+                    UDP_ECHO_IPV6_PORT="8084",
                 )
                 .replace("nvx-exit", "nvx_exit")
                 .replace("/proc/", f"{root.as_posix()}/proc/")
@@ -3392,9 +5062,14 @@ class MicrovmTests(unittest.TestCase):
             private_server = (
                 "echo NVX-HOST-LOOPBACK-INBOUND" if private_request else ":"
             )
+            echo_reply = "echo NVX-HOST-LOOPBACK-UDP-ECHO-REPLY"
+            udp_echo_server = echo_reply if udp_echo else ":"
+            udp_echo_ipv6_server = echo_reply if udp_echo_ipv6 else ":"
             path = root / "host-loopback-policy.sh"
             path.write_text(
                 "sleep() { :; }\n"
+                # The script's input is a pipe here, not the guest's terminal.
+                'stty() { [ "$*" = -echo ]; }\n'
                 f"pidof() {{ return {0 if announcer else 1}; }}\n"
                 "wget() { echo NVX-HOST-LOOPBACK-GENERAL; }\n"
                 'nc() { case "$*" in\n'
@@ -3402,6 +5077,8 @@ class MicrovmTests(unittest.TestCase):
                 f"'-u -l -p 8082 '*) {udp_ipv6_server} ;;\n"
                 f"'-u -l -p '*) {udp_server} ;;\n"
                 f"'-l -s '*) {private_server} ;;\n"
+                f"'-u -w 2 10.0.0.1 8083') {udp_echo_server} ;;\n"
+                f"'-u -w 2 fd00::a00:1 8084') {udp_echo_ipv6_server} ;;\n"
                 "*) return 1 ;;\n"
                 "esac; }\n"
                 'nvx_exit() { exit "$1"; }\n' + script,
@@ -3552,6 +5229,176 @@ class MicrovmTests(unittest.TestCase):
             with self.assertRaisesRegex(TimeoutError, "did not answer"):
                 microvm_tests._host_loopback_udp_exchange("127.0.0.1", port, 0)
 
+    def test_udp_echo_server_answers_each_request(self):
+        for address, family in (
+            ("127.0.0.1", socket.AF_INET),
+            ("::1", socket.AF_INET6),
+        ):
+            with self.subTest(address):
+                server = socket.socket(family, socket.SOCK_DGRAM)
+                try:
+                    server.bind((address, 0))
+                except OSError:
+                    server.close()
+                    continue
+                stop = threading.Event()
+                errors: list[Exception] = []
+                thread = threading.Thread(
+                    target=microvm_tests._udp_echo_server,
+                    args=(server, stop, errors),
+                    daemon=True,
+                )
+                thread.start()
+                try:
+                    with socket.socket(family, socket.SOCK_DGRAM) as client:
+                        client.settimeout(5)
+                        client.connect(server.getsockname()[:2])
+                        for _ in range(2):
+                            client.send(microvm_tests.HOST_LOOPBACK_UDP_ECHO_REQUEST)
+                            self.assertEqual(
+                                client.recv(64),
+                                microvm_tests.HOST_LOOPBACK_UDP_ECHO_REPLY,
+                            )
+                finally:
+                    stop.set()
+                    thread.join(10)
+                    server.close()
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(errors, [])
+
+    def test_udp_echo_server_rejects_an_unexpected_request(self):
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server,
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client,
+        ):
+            server.bind(("127.0.0.1", 0))
+            errors: list[Exception] = []
+            thread = threading.Thread(
+                target=microvm_tests._udp_echo_server,
+                args=(server, threading.Event(), errors),
+                daemon=True,
+            )
+            thread.start()
+            client.sendto(b"UNEXPECTED\n", server.getsockname())
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), "unexpected host-loopback UDP echo request")
+
+    def test_host_loopback_udp_echo_avoids_the_published_guest_ports(self):
+        # The probes that drew the guest ports released them, so ephemeral binds
+        # can draw them. Each rejected socket holds its port until one is free.
+        sockets = _EphemeralPortSockets((8080, 8082, 50000))
+
+        with patch.object(microvm_tests.socket, "socket", side_effect=sockets):
+            udp_echo = microvm_tests._bind_host_loopback_udp_echo(
+                socket.AF_INET6, "::1", (8080, 8082)
+            )
+
+        self.assertIs(udp_echo, sockets.created[-1])
+        self.assertEqual(
+            sockets.events,
+            [
+                ("bind", 8080),
+                ("bind", 8082),
+                ("bind", 50000),
+                ("close", 8080),
+                ("close", 8082),
+            ],
+        )
+        for endpoint in sockets.created:
+            endpoint.setsockopt.assert_called_once_with(
+                socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1
+            )
+            endpoint.bind.assert_called_once_with(("::1", 0))
+
+    def test_host_loopback_udp_echo_gives_up_after_the_attempt_budget(self):
+        attempts = microvm_tests.HOST_LOOPBACK_PORT_BIND_ATTEMPTS
+        published = range(50000, 50000 + attempts)
+        sockets = _EphemeralPortSockets(published)
+
+        with (
+            patch.object(microvm_tests.socket, "socket", side_effect=sockets),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            microvm_tests._bind_host_loopback_udp_echo(
+                socket.AF_INET, "127.0.0.1", published
+            )
+
+        self.assertEqual(
+            str(raised.exception),
+            "failed to bind a UDP port on 127.0.0.1 outside guest ports "
+            f"{list(published)} after {attempts} attempts",
+        )
+        self.assertEqual(len(sockets.created), attempts)
+        for endpoint in sockets.created:
+            endpoint.setsockopt.assert_not_called()
+            endpoint.close.assert_called_once_with()
+
+    def test_host_loopback_udp_echoes_avoid_both_published_guest_ports(self):
+        # The guest's UDP servers are dual-stack, so OpenVMM publishes both of
+        # their ports on both loopback addresses.
+        def answer_udp_control(
+            command: list[str], script: str, *_args: object, **_kwargs: object
+        ) -> None:
+            if "--host-loopback" in command:
+                return
+            ports = {
+                int(line.split()[5])
+                for line in script.splitlines()
+                if line.strip().startswith("nc -u -w 1")
+            }
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                for port in ports:
+                    sender.sendto(b"NVX-HOST-LOOPBACK-UDP-CONTROL", ("127.0.0.1", port))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(microvm_tests, "_http_server"),
+                patch.object(microvm_tests, "_udp_echo_server"),
+                patch.object(
+                    microvm_tests, "run_guest_script", side_effect=answer_udp_control
+                ),
+                patch.object(
+                    microvm_tests,
+                    "_host_loopback_publication_port",
+                    side_effect=range(50001, 50101),
+                ),
+                patch.object(
+                    microvm_tests, "_bind_host_loopback_udp_echo"
+                ) as bind_udp_echo,
+                patch.object(microvm_tests, "OpenvmmProcess") as process,
+                patch.object(
+                    microvm_tests, "_verify_host_loopback_publication"
+                ) as verify,
+                patch.object(microvm_tests, "run_host_loopback_rejections"),
+            ):
+                bind_udp_echo.return_value.getsockname.return_value = (
+                    "127.0.0.1",
+                    40000,
+                )
+                process.return_value.__enter__.return_value.wait.return_value = (
+                    openvmm_process.OpenvmmProcessResult(0, b"")
+                )
+                microvm_tests.run_host_loopback_policy(
+                    Path("openvmm"),
+                    Path("kernel"),
+                    Path("initrd"),
+                    "whp",
+                    memory_mib=128,
+                    timeout=5,
+                    output_dir=Path(temporary),
+                )
+
+        published = tuple(verify.call_args.args[:2])
+        self.assertEqual(
+            [bound.args for bound in bind_udp_echo.call_args_list],
+            [
+                (socket.AF_INET, "127.0.0.1", published),
+                (socket.AF_INET6, "::1", published),
+            ],
+        )
+
     def test_host_loopback_allow_script_checks_publication_and_traffic(self):
         run = self._run_host_loopback_allow_script
         for label, check, expected in (
@@ -3588,6 +5435,12 @@ class MicrovmTests(unittest.TestCase):
                 97,
             ),
             ("private-reached", functools.partial(run, private_request=True), 96),
+            ("udp-echo-unanswered", functools.partial(run, udp_echo=False), 84),
+            (
+                "udp-echo-ipv6-unanswered",
+                functools.partial(run, udp_echo_ipv6=False),
+                85,
+            ),
         ):
             with self.subTest(label):
                 result = check()
@@ -4019,6 +5872,24 @@ class MicrovmTests(unittest.TestCase):
                 )
         interaction.assert_not_called()
 
+    def test_time_abi_monitor_failure_does_not_start_process(self):
+        # #720: the monitor is built before OpenVMM starts, so that its
+        # failure cannot leave OpenVMM running outside the cleanup.
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "output.log"
+            with (
+                patch.object(
+                    openvmm_process,
+                    "TimeAbiMonitor",
+                    side_effect=RuntimeError("synthetic monitor failure"),
+                ),
+                patch.object(openvmm_process, "InteractiveProcess") as interaction,
+                self.assertRaisesRegex(RuntimeError, "synthetic monitor failure"),
+            ):
+                openvmm_process.OpenvmmProcess(["openvmm"], log_path)
+            self.assertFalse(log_path.exists())
+        interaction.assert_not_called()
+
     def test_snapshot_restore_runs_the_time_abi_steps_through_nvx_time(self):
         snapshot = (
             Path(__file__).parents[1] / "guest" / "common" / "nvx-snapshot"
@@ -4056,7 +5927,14 @@ class MicrovmTests(unittest.TestCase):
             snapshot,
         )
         self.assertIn('console_status "NVX-SNAPSHOT-ERROR: $*"', snapshot)
-        for stage in ("packet", "entropy", "identity", "runtime-hook", "acknowledge"):
+        for stage in (
+            "packet",
+            "network",
+            "entropy",
+            "identity",
+            "runtime-hook",
+            "acknowledge",
+        ):
             self.assertIn(
                 f'console_status "NVX-POST-RESTORE-STAGE: {stage}"',
                 snapshot,
@@ -4091,6 +5969,7 @@ class MicrovmTests(unittest.TestCase):
 
         markers = [
             'console_status "NVX-POST-RESTORE-STAGE: packet"',
+            'console_status "NVX-POST-RESTORE-STAGE: network"',
             'console_status "NVX-POST-RESTORE-STAGE: entropy"',
             'console_status "NVX-POST-RESTORE-STAGE: identity"',
             'console_status "NVX-POST-RESTORE-STAGE: runtime-hook"',
@@ -4173,7 +6052,7 @@ class MicrovmTests(unittest.TestCase):
                         'nvx_time() { printf "%s\\n" "$*" >>"$calls"; }\n'
                         'activate_restore_memory() { echo "memory $*"; }\n'
                         f"{functions}\n"
-                        f"post_restore {flags} 0 0 {generation_id}\n"
+                        f"post_restore {flags} 0 0 {generation_id} - 0\n"
                         'echo "pending=$post_restore_pending"\n'
                     ),
                     text=True,
@@ -4242,16 +6121,494 @@ class MicrovmTests(unittest.TestCase):
         self.assertEqual(dispatch_metadata("0"), (0, "suppressed=true\n"))
         # nvx-time finished the restore and handed it to the daemon.
         self.assertEqual(
-            dispatch_metadata(f"2 4 0 0 {generation_id}"),
+            dispatch_metadata(f"2 4 0 0 {generation_id} - 0"),
             (0, "suppressed=false\n"),
         )
         self.assertEqual(
-            dispatch_metadata(f"1 4 2 0 {generation_id}"),
-            (0, f"post_restore 4 2 0 {generation_id}\nsuppressed=false\n"),
+            dispatch_metadata(f"1 4 2 0 {generation_id} 10.0.0.1 1"),
+            (
+                0,
+                f"post_restore 4 2 0 {generation_id} 10.0.0.1 1\nsuppressed=false\n",
+            ),
         )
         self.assertEqual(
             dispatch_metadata("3"),
             (1, "fail_closed snapshot capture metadata is invalid\n"),
+        )
+
+    def test_untiered_restore_applies_its_network_settings_before_the_acknowledgement(
+        self,
+    ):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        snapshot = (
+            Path(__file__).parents[1] / "guest" / "common" / "nvx-snapshot"
+        ).read_text(encoding="utf-8")
+
+        def function(name: str) -> str:
+            start = snapshot.index(f"{name}() {{")
+            return snapshot[start : snapshot.index("\n}\n", start) + 3]
+
+        functions = "".join(
+            function(name)
+            for name in (
+                "console_status",
+                "fail_closed",
+                "cmdline_value",
+                "apply_restore_network",
+                "post_restore",
+                "finish_restore",
+            )
+        )
+        for code, stand_in in (
+            (">/dev/console", '>>"$console_log"'),
+            ("/sbin/nvx-exit", "nvx_exit"),
+            ("/sbin/nvx-time", "nvx_time"),
+            ("</proc/cmdline", '<"$cmdline_file"'),
+            (">/etc/resolv.conf", '>"$resolver"'),
+            ("[ -x /sbin/nvx-ingress ]", '[ -x "$ingress" ]'),
+            ('/sbin/nvx-ingress start "$gateway"', '"$ingress" start "$gateway"'),
+        ):
+            self.assertIn(code, functions)
+            functions = functions.replace(code, stand_in)
+        generation_id = "0123456789abcdef0123456789abcdef"
+
+        def restore(
+            dns_server: str,
+            announce: str,
+            *,
+            command_line: str = "virtnet_ip=10.0.0.2 virtnet_gw=10.0.0.1",
+            ingress: int | None = 0,
+            resolver: str = "resolv.conf",
+        ) -> tuple[int, str, str, str, str, str]:
+            """Run the repair of a restore whose packet names ``dns_server``
+            and asks for the announcement of the guest's listeners when
+            ``announce`` is 1, with a stand-in for nvx-ingress that exits with
+            ``ingress``, or none, and return the shell's status, stdout, and
+            stderr, the console, the calls of nvx-ingress and of nvx-time in
+            order, and the resolver file."""
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "cmdline").write_text(command_line + "\n", encoding="ascii")
+                if ingress is not None:
+                    program = root / "nvx-ingress"
+                    program.write_text(
+                        "#!/bin/sh\n"
+                        f'printf "nvx-ingress %s\\n" "$*" >>"{root}/nvx-time"\n'
+                        f"exit {ingress}\n",
+                        encoding="ascii",
+                    )
+                    program.chmod(0o755)
+                result = subprocess.run(
+                    [shell, "-s", "--", temporary, resolver],
+                    input=(
+                        "set -eu\n"
+                        'console_log="$1/console"\n'
+                        'calls="$1/nvx-time"\n'
+                        'cmdline_file="$1/cmdline"\n'
+                        'resolver="$1/$2"\n'
+                        'ingress="$1/nvx-ingress"\n'
+                        ': >"$console_log"\n'
+                        ': >"$calls"\n'
+                        "snapshot_tier=legacy\n"
+                        "PACKET_MEMORY_TARGET=2\n"
+                        "PACKET_ACK_REQUIRED=4\n"
+                        "restore_new_cpus=none\n"
+                        "post_restore_pending=false\n"
+                        'nvx_exit() { echo "exit $1"; }\n'
+                        # The acknowledgement records what the resolver
+                        # names by then.
+                        "nvx_time() {\n"
+                        '    printf "%s resolver=%s\\n" "$*" \\\n'
+                        '        "$(cat "$resolver" 2>/dev/null)" >>"$calls"\n'
+                        "}\n"
+                        f"{functions}\n"
+                        f"post_restore 4 0 0 {generation_id} {dns_server} {announce}\n"
+                        'echo "pending=$post_restore_pending"\n'
+                    ),
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+                return (
+                    result.returncode,
+                    result.stdout,
+                    result.stderr,
+                    (root / "console").read_text(encoding="ascii"),
+                    (root / "nvx-time").read_text(encoding="ascii"),
+                    (
+                        (root / "resolv.conf").read_text(encoding="ascii")
+                        if (root / "resolv.conf").exists()
+                        else ""
+                    ),
+                )
+
+        stages = (
+            "NVX-POST-RESTORE-STAGE: packet\n"
+            "NVX-POST-RESTORE-STAGE: network\n"
+            "NVX-POST-RESTORE-STAGE: acknowledge\n"
+        )
+        # The resolver names the DNS server, and nvx-ingress starts the
+        # announcer to the IPv4 gateway, before the acknowledgement.
+        self.assertEqual(
+            restore("10.0.0.1", "1"),
+            (
+                0,
+                "NVX-POST-RESTORE-OK: tier=legacy\npending=false\n",
+                "",
+                stages,
+                "nvx-ingress start 10.0.0.1\n"
+                "restore-finish --ack --new-cpus none resolver=nameserver 10.0.0.1\n",
+                "nameserver 10.0.0.1\n",
+            ),
+        )
+        # Either setting alone.
+        self.assertEqual(
+            restore("fd00::a00:1", "0")[3:],
+            (
+                stages,
+                "restore-finish --ack --new-cpus none "
+                "resolver=nameserver fd00::a00:1\n",
+                "nameserver fd00::a00:1\n",
+            ),
+        )
+        self.assertEqual(
+            restore("-", "1")[3:],
+            (
+                stages,
+                "nvx-ingress start 10.0.0.1\n"
+                "restore-finish --ack --new-cpus none resolver=\n",
+                "",
+            ),
+        )
+        # Settings that ask for nothing leave a plain restore quiet.
+        self.assertEqual(
+            restore("-", "0"),
+            (
+                0,
+                "pending=false\n",
+                "",
+                "",
+                "restore-finish --ack --new-cpus none resolver=\n",
+                "",
+            ),
+        )
+
+        # A failure fails the restore, which is never acknowledged. An
+        # announcer that does not start, as when no privileged source port is
+        # free for its socket, is one.
+        failures: tuple[tuple[tuple[str, str, dict[str, Any]], str, str], ...] = (
+            (
+                ("-", "1", {"command_line": "virtnet_ip=10.0.0.2"}),
+                "listener announcements need an IPv4 gateway",
+                "",
+            ),
+            (
+                ("-", "1", {"ingress": None}),
+                "listener announcements need /sbin/nvx-ingress",
+                "",
+            ),
+            (
+                ("10.0.0.1", "1", {"ingress": 1}),
+                "failed to start nvx-ingress",
+                "nvx-ingress start 10.0.0.1\n",
+            ),
+            (
+                ("10.0.0.1", "0", {"resolver": "missing/resolv.conf"}),
+                "failed to name the DNS server in /etc/resolv.conf",
+                "",
+            ),
+            (("-", "2", {}), "restore packet metadata is invalid", ""),
+            (("10.0.0.z", "0", {}), "restore packet metadata is invalid", ""),
+        )
+        for (dns_server, announce, options), error, started in failures:
+            status, stdout, stderr, _, calls, _ = restore(
+                dns_server, announce, **options
+            )
+            self.assertEqual(status, 1, (error, stdout, stderr))
+            self.assertIn("exit 1\n", stdout)
+            self.assertIn(f"nvx-snapshot: {error}; terminating the VM\n", stderr)
+            self.assertEqual(calls, started)
+
+    def _run_host_share_write_back(
+        self,
+        mountinfo: str,
+        stats: Sequence[str | None],
+        *,
+        failing_sync: int | None = None,
+        pass_limit: int | None = None,
+        prelude: str = "",
+        script: str = "write_back_host_shares\n",
+    ) -> tuple[int, str, list[str]]:
+        """Run nvx-snapshot's write-back of the host shares that `mountinfo`
+        mounts, and return the shell's status, its stderr, and the calls of
+        the stand-ins of debugfs and sync(1), which record them in order.
+
+        Pass N reads `stats[N - 1]`, and cannot read a missing or None entry.
+        The `failing_sync`th sync fails, and `pass_limit` replaces the limit of
+        1,024 passes. `prelude` runs before the functions are defined, and
+        `script` after the stand-ins are."""
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        snapshot = (
+            Path(__file__).parents[1] / "guest" / "common" / "nvx-snapshot"
+        ).read_text(encoding="utf-8")
+        start = snapshot.index("list_host_shares() {")
+        end = snapshot.index("\n}\n", snapshot.index("write_back_host_shares() {")) + 3
+        functions = snapshot[start:end].replace(
+            "/proc/self/mountinfo", '"$root/mountinfo"'
+        )
+        if pass_limit is not None:
+            limit = '[ "$passes" -ge 1024 ]'
+            self.assertIn(limit, functions)
+            functions = functions.replace(limit, f'[ "$passes" -ge {pass_limit} ]')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "mountinfo").write_text(mountinfo, encoding="ascii", newline="\n")
+            for index, text in enumerate(stats, 1):
+                if text is not None:
+                    (root / f"stats-{index}").write_text(
+                        text, encoding="ascii", newline="\n"
+                    )
+            if failing_sync is not None:
+                (root / f"sync-fail-{failing_sync}").touch()
+            result = subprocess.run(
+                [shell, "-s", "--", temporary],
+                input=(
+                    "set -eu\n"
+                    'root="$1"\n'
+                    'echo 0 >"$root/passes"\n'
+                    'echo 0 >"$root/syncs"\n'
+                    ': >"$root/calls"\n'
+                    f"{prelude}"
+                    f"{functions}"
+                    "read_writeback_stats() {\n"
+                    '    pass=$(($(cat "$root/passes") + 1))\n'
+                    '    echo "$pass" >"$root/passes"\n'
+                    '    printf \'%s\\n\' "stats $*" >>"$root/calls"\n'
+                    '    cat "$root/stats-$pass" 2>/dev/null\n'
+                    "}\n"
+                    "sync() {\n"
+                    '    count=$(($(cat "$root/syncs") + 1))\n'
+                    '    echo "$count" >"$root/syncs"\n'
+                    '    printf \'%s\\n\' "sync $*" >>"$root/calls"\n'
+                    '    [ ! -e "$root/sync-fail-$count" ]\n'
+                    "}\n"
+                    f"{script}"
+                ),
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            calls = (root / "calls").read_text(encoding="ascii").splitlines()
+        return result.returncode, result.stderr, calls
+
+    def test_host_share_write_back_repeats_until_no_inode_is_dirty(self):
+        status, stderr, calls = self._run_host_share_write_back(
+            _ONE_SHARE_MOUNTINFO,
+            [_bdi_stats(2, io=1), _bdi_stats(0, more_io=1), _bdi_stats(0)],
+        )
+        self.assertEqual((status, stderr), (0, ""))
+        # Each pass syncs the share through its whole mount, and so does the
+        # pass that counts no dirty inode, whose sync waits for the writes
+        # still in flight.
+        self.assertEqual(calls, [f"stats {_ONE_SHARE_STATS}", "sync -f /mnt/share"] * 3)
+
+    def test_host_share_write_back_skips_a_guest_without_host_shares(self):
+        status, stderr, calls = self._run_host_share_write_back(
+            "22 1 0:20 / /proc rw - proc proc rw\n"
+            "60 25 8:1 / /data rw - ext4 /dev/vda rw\n",
+            [],
+        )
+        self.assertEqual((status, stderr, calls), (0, "", []))
+
+    def test_host_share_write_back_names_one_mount_of_each_share(self):
+        status, stderr, calls = self._run_host_share_write_back(
+            # A share mounted whole, and one mounted only below its root, whose
+            # mount points mountinfo escapes and one of which holds a newline.
+            "31 25 0:42 / /mnt/share rw - virtiofs microvm rw\n"
+            "40 25 0:50 /child /bound\\012line rw - virtiofs microvm rw\n"
+            "41 25 0:50 /child /srv/my\\040data\\134x rw - virtiofs microvm rw\n"
+            "42 25 0:42 /0 /mnt/share/again rw - virtiofs microvm rw\n",
+            [_bdi_stats(1) + _bdi_stats(0), _bdi_stats(0) + _bdi_stats(0)],
+        )
+        self.assertEqual((status, stderr), (0, ""))
+        stats = "/sys/kernel/debug/bdi/0:42/stats /sys/kernel/debug/bdi/0:50/stats"
+        self.assertEqual(
+            calls,
+            [f"stats {stats}", "sync -f /mnt/share", "sync -f /srv/my data\\x"] * 2,
+        )
+
+        status, stderr, calls = self._run_host_share_write_back(
+            "50 25 0:60 /x /only\\012newline rw - virtiofs microvm rw\n",
+            [_bdi_stats(0)],
+        )
+        self.assertEqual(
+            (status, stderr, calls),
+            (1, "nvx-snapshot: no mount point of host share 0:60 can be named\n", []),
+        )
+
+    def test_host_share_write_back_continues_while_passes_make_progress(self):
+        counts = [5, 3, 3, 2, 0]
+        status, stderr, calls = self._run_host_share_write_back(
+            _ONE_SHARE_MOUNTINFO, [_bdi_stats(count) for count in counts]
+        )
+        self.assertEqual((status, stderr), (0, ""))
+        self.assertEqual(
+            calls, [f"stats {_ONE_SHARE_STATS}", "sync -f /mnt/share"] * len(counts)
+        )
+
+    def test_host_share_write_back_fails_when_passes_stall(self):
+        # Three passes in a row that count no fewer dirty inodes than the pass
+        # before each fail, however many passes made progress before them.
+        for counts in ([4, 4, 4, 4], [1, 2, 3, 4], [2, 1, 1, 1, 1]):
+            status, stderr, calls = self._run_host_share_write_back(
+                _ONE_SHARE_MOUNTINFO,
+                [_bdi_stats(count) for count in counts] + [_bdi_stats(0)],
+            )
+            self.assertEqual(
+                (status, stderr),
+                (
+                    1,
+                    "nvx-snapshot: the host shares kept dirty pages through "
+                    f"{len(counts)} write-back passes\n",
+                ),
+                counts,
+            )
+            self.assertEqual(
+                calls,
+                [f"stats {_ONE_SHARE_STATS}", "sync -f /mnt/share"] * len(counts),
+                counts,
+            )
+
+    def test_host_share_write_back_bounds_its_passes(self):
+        # Counts that fall in every other pass never stall three times in a
+        # row, so only the limit of passes ends them.
+        status, stderr, calls = self._run_host_share_write_back(
+            _ONE_SHARE_MOUNTINFO,
+            [_bdi_stats(count) for count in [2, 1] * 4],
+            pass_limit=6,
+        )
+        self.assertEqual(
+            (status, stderr),
+            (
+                1,
+                "nvx-snapshot: the host shares kept dirty pages through 6 "
+                "write-back passes\n",
+            ),
+        )
+        self.assertEqual(calls.count("sync -f /mnt/share"), 6)
+
+    def test_host_share_write_back_refuses_unreadable_or_malformed_lists(self):
+        for stats in (
+            None,
+            "b_dirty: 1\nb_io: 0\n",
+            "b_dirty: 1\nb_io: x\nb_more_io: 0\n",
+            "b_dirty: -1\nb_io: 0\nb_more_io: 0\n",
+            "b_dirty:\nb_io: 0\nb_more_io: 0\n",
+            "b_dirty: 1\nb_io: 0\nb_more_io: 0\nb_io: 0\n",
+        ):
+            status, stderr, calls = self._run_host_share_write_back(
+                _ONE_SHARE_MOUNTINFO, [stats, _bdi_stats(0)]
+            )
+            self.assertEqual(
+                (status, stderr, calls),
+                (
+                    1,
+                    "nvx-snapshot: cannot read the writeback lists of the host "
+                    "shares\n",
+                    [f"stats {_ONE_SHARE_STATS}"],
+                ),
+                stats,
+            )
+
+    def test_host_share_write_back_refuses_a_failed_sync(self):
+        # The sync of the pass that counts no dirty inode waits for the
+        # writes in flight, so its failure refuses the capture too.
+        for failing_sync in (1, 2):
+            status, stderr, calls = self._run_host_share_write_back(
+                _ONE_SHARE_MOUNTINFO,
+                [_bdi_stats(1), _bdi_stats(0)],
+                failing_sync=failing_sync,
+            )
+            self.assertEqual(
+                (status, stderr),
+                (
+                    1,
+                    "nvx-snapshot: failed to write back the host share at /mnt/share\n",
+                ),
+            )
+            self.assertEqual(
+                calls,
+                [f"stats {_ONE_SHARE_STATS}", "sync -f /mnt/share"] * failing_sync,
+            )
+
+    def test_failed_host_share_write_back_thaws_and_requests_no_capture(self):
+        snapshot = (
+            Path(__file__).parents[1] / "guest" / "common" / "nvx-snapshot"
+        ).read_text(encoding="utf-8")
+        # Every capture writes the shares back after the cleanup trap and the
+        # paired barriers are in place, and before the request.
+        write_back = snapshot.index("write_back_host_shares || exit 1")
+        self.assertLess(snapshot.index("trap cleanup EXIT"), write_back)
+        self.assertLess(snapshot.index('fsfreeze -f "$scratch_mount"'), write_back)
+        self.assertLess(write_back, snapshot.index("/sbin/nvx-time capture"))
+
+        helpers_start = snapshot.index("console_status() {")
+        cleanup_end = snapshot.index("\n}\n", snapshot.index("cleanup() {")) + 3
+        helpers = (
+            snapshot[helpers_start:cleanup_end]
+            .replace(">/dev/console", '>>"$root/console"')
+            .replace("/sbin/nvx-exit", "nvx_exit")
+            .replace("/sbin/nvx-time", "nvx_time")
+        )
+        status, stderr, calls = self._run_host_share_write_back(
+            _ONE_SHARE_MOUNTINFO,
+            [None],
+            prelude=(
+                'container_cgroup="$root/cgroup"\n'
+                'scratch_mount="$root/scratch"\n'
+                'mkdir "$container_cgroup"\n'
+                'echo 1 >"$container_cgroup/cgroup.freeze"\n'
+                "container_frozen=true\n"
+                "scratch_frozen=true\n"
+                "stall_detectors_suppressed=true\n"
+                "post_restore_pending=false\n"
+                "fsfreeze() {\n"
+                '    printf \'%s\\n\' "fsfreeze $1" >>"$root/calls"\n'
+                "}\n"
+                "nvx_time() {\n"
+                '    freeze=$(cat "$container_cgroup/cgroup.freeze")\n'
+                '    printf \'%s\\n\' "nvx-time $* freeze=$freeze" >>"$root/calls"\n'
+                "}\n"
+                "nvx_exit() {\n"
+                '    printf \'%s\\n\' "nvx-exit $*" >>"$root/calls"\n'
+                "}\n"
+                f"{helpers}"
+            ),
+            script=(
+                "trap cleanup EXIT\n"
+                "write_back_host_shares || exit 1\n"
+                "nvx_time capture\n"
+            ),
+        )
+        # The guest requests no capture, thaws the scratch filesystem and then
+        # the workload, and only then restores the stall detectors.
+        self.assertEqual(
+            (status, stderr),
+            (1, "nvx-snapshot: cannot read the writeback lists of the host shares\n"),
+        )
+        self.assertEqual(
+            calls,
+            [
+                f"stats {_ONE_SHARE_STATS}",
+                "fsfreeze -u",
+                "nvx-time cancel-capture freeze=0",
+            ],
         )
 
     def test_console_log_persists_buffered_and_completed_output(self):
@@ -4308,6 +6665,141 @@ class MicrovmTests(unittest.TestCase):
                 self.assertEqual(result.output, b"BEGIN-END\n")
                 self.assertEqual(log_path.read_bytes(), result.output)
                 self.assertEqual(queues.return_value.get.call_count, 4)
+
+    def test_process_transcript_grows_while_the_process_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "output.log"
+            with (
+                patch.object(openvmm_process, "InteractiveProcess") as interaction,
+                patch.object(openvmm_process.threading, "Thread"),
+                patch.object(openvmm_process.queue, "Queue") as queues,
+            ):
+                interaction.return_value.process.poll.return_value = None
+                interaction.return_value.process.wait.return_value = 0
+                queues.return_value.get.side_effect = [b"BOOT\n", None]
+                queues.return_value.get_nowait.side_effect = queue.Empty
+                with openvmm_process.OpenvmmProcess(["openvmm"], log_path) as process:
+                    process.wait_for(b"BOOT", 1)
+                    # Consumed bytes are on disk while OpenVMM is still running.
+                    self.assertEqual(log_path.read_bytes(), b"BOOT\n")
+                    process.wait(1)
+                self.assertEqual(log_path.read_bytes(), b"BOOT\n")
+
+    def test_process_transcript_open_failure_surfaces_before_start(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "output.log"
+            log_path.mkdir()
+            with patch.object(openvmm_process, "InteractiveProcess") as interaction:
+                with self.assertRaises(OSError):
+                    openvmm_process.OpenvmmProcess(["openvmm"], log_path)
+            interaction.assert_not_called()
+
+    def test_process_close_writes_output_delivered_after_the_last_wait(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "output.log"
+            with (
+                patch.object(openvmm_process, "InteractiveProcess") as interaction,
+                patch.object(openvmm_process.threading, "Thread"),
+                patch.object(openvmm_process.queue, "Queue") as queues,
+            ):
+                interaction.return_value.process.poll.return_value = None
+                queues.return_value.get_nowait.side_effect = [b"LATE\n", queue.Empty]
+                process = openvmm_process.OpenvmmProcess(["openvmm"], log_path)
+                process.close()
+            self.assertEqual(log_path.read_bytes(), b"LATE\n")
+
+    def test_process_close_keeps_output_queued_during_interaction_close(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "output.log"
+            closed: list[bool] = []
+            with (
+                patch.object(openvmm_process, "InteractiveProcess") as interaction,
+                patch.object(openvmm_process.threading, "Thread"),
+                patch.object(openvmm_process.queue, "Queue") as queues,
+            ):
+                interaction.return_value.process.poll.return_value = None
+                interaction.return_value.close.side_effect = lambda: closed.append(True)
+
+                pending = [b"LAST\n"]
+
+                def get_nowait() -> bytes:
+                    # The reader queues its last chunk only while the interaction shuts down.
+                    if closed and pending:
+                        return pending.pop()
+                    raise queue.Empty
+
+                queues.return_value.get_nowait.side_effect = get_nowait
+                process = openvmm_process.OpenvmmProcess(["openvmm"], log_path)
+                process.close()
+                self.assertEqual(process.output, b"LAST\n")
+            self.assertEqual(log_path.read_bytes(), b"LAST\n")
+
+    def test_process_close_keeps_queued_output_when_interaction_close_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "output.log"
+            with (
+                patch.object(openvmm_process, "InteractiveProcess") as interaction,
+                patch.object(openvmm_process.threading, "Thread"),
+                patch.object(openvmm_process.queue, "Queue") as queues,
+            ):
+                interaction.return_value.process.poll.return_value = None
+                interaction.return_value.close.side_effect = OSError("reader stuck")
+                queues.return_value.get_nowait.side_effect = [b"QUEUED\n", queue.Empty]
+                process = openvmm_process.OpenvmmProcess(["openvmm"], log_path)
+                with self.assertRaises(OSError):
+                    process.close()
+                self.assertEqual(process.output, b"QUEUED\n")
+            self.assertEqual(log_path.read_bytes(), b"QUEUED\n")
+
+    def test_process_close_releases_resources_when_the_transcript_write_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "output.log"
+            with (
+                patch.object(openvmm_process, "InteractiveProcess") as interaction,
+                patch.object(openvmm_process.threading, "Thread"),
+                patch.object(openvmm_process.queue, "Queue") as queues,
+            ):
+                interaction.return_value.process.poll.return_value = None
+                queues.return_value.get_nowait.side_effect = [b"LATE\n", queue.Empty]
+                process = openvmm_process.OpenvmmProcess(["openvmm"], log_path)
+                failing = MagicMock()
+                failing.closed = False
+                failing.write.side_effect = OSError("no space left on device")
+                process._log.close()
+                process._log = failing
+                with self.assertRaises(OSError):
+                    process.close()
+            interaction.return_value.close.assert_called_once_with()
+            failing.close.assert_called_once_with()
+
+    def test_process_close_keeps_every_queued_chunk_when_the_transcript_write_fails(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "output.log"
+            with (
+                patch.object(openvmm_process, "InteractiveProcess") as interaction,
+                patch.object(openvmm_process.threading, "Thread"),
+                patch.object(openvmm_process.queue, "Queue") as queues,
+            ):
+                interaction.return_value.process.poll.return_value = None
+                queues.return_value.get_nowait.side_effect = [
+                    b"FIRST\n",
+                    b"SECOND\n",
+                    b"THIRD\n",
+                    queue.Empty,
+                ]
+                process = openvmm_process.OpenvmmProcess(["openvmm"], log_path)
+                failing = MagicMock()
+                failing.closed = False
+                failing.write.side_effect = OSError("no space left on device")
+                process._log.close()
+                process._log = failing
+                with self.assertRaises(OSError):
+                    process.close()
+                self.assertEqual(bytes(process._output), b"FIRST\nSECOND\nTHIRD\n")
+            interaction.return_value.close.assert_called_once_with()
+            failing.close.assert_called_once_with()
 
     def test_process_wait_clamps_elapsed_process_timeout(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -4518,13 +7010,29 @@ class MicrovmTests(unittest.TestCase):
             if isinstance(node, ast.Call)
             and ast.unparse(node.func) == "TcpConsole.connect"
         ]
-        # The managed lifecycle, the console-snapshot capture and restore, and
-        # the snapshot-tier capture, restore, and gate-timeout restore.
-        self.assertEqual(len(connects), 6)
+        # The console-snapshot capture and restore, and the snapshot-tier
+        # capture, restore, and gate-timeout restore.
+        self.assertEqual(len(connects), 5)
         for keywords in connects:
             self.assertRegex(
                 keywords.get("monitor", ""), r"^TimeAbiMonitor\(\w*command\)$"
             )
+        # The managed lifecycle's console is a file, which the same monitor
+        # scans once the nvx-rs test that drives the guest has ended.
+        managed = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "run_managed_lifecycle"
+        )
+        self.assertIn(
+            "TimeAbiMonitor(command)",
+            [
+                ast.unparse(node)
+                for node in ast.walk(managed)
+                if isinstance(node, ast.Call)
+            ],
+        )
         # Only the cold boots whose shell is on the virtio console ask for
         # nvx-time status. Restores never ask, and in the managed lifecycle
         # init starts the managed agent instead of a shell.
@@ -4546,8 +7054,19 @@ class MicrovmTests(unittest.TestCase):
         self.assertIn("NVX-SNAPSHOT-UUID-", script)
         self.assertIn("NVX-SNAPSHOT-TEMP-ID-", script)
 
+    def test_snapshot_core_checks_that_restored_processes_cannot_reach_the_ports(self):
+        # nvx-time holds the port permission only for each port transaction, so
+        # the processes that it starts on a restored VM cannot reach the ports.
+        script = microvm_tests._read_script("snapshot-core.sh")
+
+        self.assertIn(
+            'port_access="$(/sbin/nvx-time test port-access)" || fail 55', script
+        )
+        self.assertIn('echo "NVX-SNAPSHOT-PORT-ACCESS-$port_access"', script)
+        self.assertEqual(script.count("|| fail 55"), 1)
+
     def test_snapshot_core_reads_the_entropy_that_nvx_time_kept(self):
-        # Restore packet v4 is consumed by nvx-time capture, which leaves the
+        # The restore packet is consumed by nvx-time capture, which leaves the
         # entropy of an untiered restore in /run/nvx/restore-entropy.
         shell = _posix_shell()
         if shell is None:
@@ -4734,7 +7253,12 @@ class MicrovmTests(unittest.TestCase):
 
     def test_canceled_capture_checks_query_status_and_rcu_suppression(self):
         script = microvm_tests.canceled_capture_checks()
-        self.assertTrue(script.startswith(time_abi.status_script()))
+        query = time_abi.status_script().removesuffix("\n") + "; "
+        self.assertTrue(script.startswith(query))
+        # One console line, which the shell reads whole before it runs any of
+        # it, so that the terminal echoes none of it into the status lines.
+        self.assertEqual(script.count("\n"), 1)
+        self.assertTrue(script.endswith("\n"))
         self.assertIn(
             "$(cat /sys/module/rcupdate/parameters/rcu_cpu_stall_suppress)", script
         )
@@ -4750,7 +7274,7 @@ class MicrovmTests(unittest.TestCase):
         if shell is None:
             self.skipTest("no POSIX shell")
         answers = subprocess.run(
-            [shell, "-c", script.removeprefix(time_abi.status_script())],
+            [shell, "-c", script.removeprefix(query)],
             capture_output=True,
             check=True,
         ).stdout
@@ -4760,10 +7284,8 @@ class MicrovmTests(unittest.TestCase):
 
     def test_canceled_capture_requires_generation_zero_and_no_suppression(self):
         command = ["openvmm", "--hypervisor", "kvm", "--kernel", "vmlinux"]
-        echoed = (
-            b'~ # echo "NVX-""CANCELED-CAPTURE-RCU $(cat /sys/module/rcupdate/'
-            b'parameters/rcu_cpu_stall_suppress)"; echo "NVX-""CANCELED-CAPTURE-DONE"\r\n'
-        )
+        checks = microvm_tests.canceled_capture_checks().encode()
+        echoed = b"~ # " + checks.replace(b"\n", b"\r\n")
         microvm_tests.check_canceled_capture(
             echoed + _canceled_capture_output("kvm"), command
         )
@@ -5081,6 +7603,29 @@ class MicrovmTests(unittest.TestCase):
             ["NVX-LIFECYCLE-FAIL code=1", "NVX-EXIT 1"],
         )
 
+    def test_lifecycle_script_ends_its_debug_port_line(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        script = microvm_tests._read_script("lifecycle.sh")
+        tail = script[script.index("for octal in") : script.index("nvx-exit 0")]
+        # OpenVMM prints the debug port's bytes in the console stream, where
+        # the staged script prints its marker right after them.
+        result = subprocess.run(
+            [shell],
+            input=b"dd() { cat; }\n" + tail.encode(),
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(
+            microvm_tests.contains_output_line(
+                result.stdout, microvm_tests.LIFECYCLE_COMPLETION_MARKER
+            ),
+            result.stdout,
+        )
+
     def test_smp_uses_requested_processor_count(self):
         text = (
             b"NVX-SMP-PROBE-OK\r\n" + _warp_probe_output(4) + b"nvx-exit 0\r\n"
@@ -5097,7 +7642,9 @@ class MicrovmTests(unittest.TestCase):
                 return_value="probe\n",
             ) as smp_probe_script,
             patch.object(
-                microvm_tests, "run_guest_script", return_value={"text": text}
+                microvm_tests,
+                "run_guest_script",
+                return_value=_guest_script_result(text),
             ) as run_guest_script,
         ):
             microvm_tests.run_smp(
@@ -5144,7 +7691,9 @@ class MicrovmTests(unittest.TestCase):
         for text, message in cases:
             with self.subTest(message=message):
                 with patch.object(
-                    microvm_tests, "run_guest_script", return_value={"text": text}
+                    microvm_tests,
+                    "run_guest_script",
+                    return_value=_guest_script_result(text),
                 ):
                     with self.assertRaisesRegex(RuntimeError, message):
                         microvm_tests.run_smp(
@@ -5166,7 +7715,7 @@ class MicrovmTests(unittest.TestCase):
         self.assertNotIn("smp-lapic", microvm_tests.DEBUG_KERNEL_SCENARIOS)
         text = (b"NVX-SMP-PROBE-OK\r\n" + _warp_probe_output(4)).decode()
         with patch.object(
-            microvm_tests, "run_guest_script", return_value={"text": text}
+            microvm_tests, "run_guest_script", return_value=_guest_script_result(text)
         ) as run:
             microvm_tests.run_smp(
                 Path("openvmm"),
@@ -5196,20 +7745,24 @@ class MicrovmTests(unittest.TestCase):
 
     def test_smp_lapic_asserts_the_counting_lapic_facts(self):
         rates = f"tsc_hz=2793437000 lapic_hz={time_abi.LAPIC_HZ['kvm']}"
-        passing = (
+        # The status query runs before the staged script, which prints the
+        # markers.
+        status = (
             f"NVX-TIME-ABI: v=1 phase=boot status=ok cpus=4 {rates} "
             "generation=0 elapsed_us=2390\r\n"
             "NVX-TIME-ABI: v=1 phase=runtime status=synchronized generation=0 "
             "discontinuities=0 offset_ns=-1200 uncertainty_ns=900 "
             "rejected_samples=0 last_sample_error=none\r\n"
             "NVX-TIME-STATUS-EXIT status=0\r\n"
-            "NVX-SMP-LAPIC-COUNTING-OK\r\n"
-            "NVX-SMP-PROBE-OK\r\n" + _warp_probe_output(4).decode()
         )
+        counting = "NVX-SMP-LAPIC-COUNTING-OK\r\n"
+        output = counting + "NVX-SMP-PROBE-OK\r\n" + _warp_probe_output(4).decode()
 
-        def run_smp_lapic(text: str) -> MagicMock:
+        def run_smp_lapic(transcript: str, output: str) -> MagicMock:
             with patch.object(
-                microvm_tests, "run_guest_script", return_value={"text": text}
+                microvm_tests,
+                "run_guest_script",
+                return_value=_guest_script_result(output, transcript=transcript),
             ) as run:
                 microvm_tests.run_smp(
                     Path("openvmm"),
@@ -5224,23 +7777,37 @@ class MicrovmTests(unittest.TestCase):
                 )
             return run
 
-        command, script, marker = run_smp_lapic(passing).call_args.args
+        command, script, marker = run_smp_lapic(status, output).call_args.args
         self.assertEqual(command[command.index("--cmdline") + 1], "quiet loglevel=0")
         self.assertTrue(script.startswith(microvm_tests.counting_lapic_script(4)))
         self.assertIn(benchmark.smp_probe_script(4, exit_guest=False), script)
         self.assertEqual(marker, time_abi.WARP_PROBE_COMPLETION_MARKER)
-        for text, message in (
+        for label, transcript, printed, message in (
             (
-                passing.replace("NVX-SMP-LAPIC-COUNTING-OK\r\n", ""),
+                "missing",
+                status,
+                output.replace(counting, ""),
                 "without the counting-LAPIC marker",
             ),
-            (passing.replace("cpus=4 tsc_hz", "cpus=2 tsc_hz"), "cpus=2 is not 4"),
+            # Only the script's own output counts.
+            (
+                "before the start line",
+                status + counting,
+                output.replace(counting, ""),
+                "without the counting-LAPIC marker",
+            ),
+            (
+                "two CPUs",
+                status.replace("cpus=4 tsc_hz", "cpus=2 tsc_hz"),
+                output,
+                "cpus=2 is not 4",
+            ),
         ):
             with (
-                self.subTest(message=message),
+                self.subTest(label),
                 self.assertRaisesRegex(RuntimeError, message),
             ):
-                run_smp_lapic(text)
+                run_smp_lapic(transcript, printed)
 
     def test_counting_lapic_check_requires_the_counting_lapic_on_every_cpu(self):
         shell = _posix_shell()
@@ -5339,6 +7906,172 @@ class MicrovmTests(unittest.TestCase):
             microvm_tests.VIRTIO_NET_COMPLETION_MARKER,
         )
 
+    def test_command_line_limit_fills_the_guest_kernel_buffer(self):
+        self.assertIn("command-line-limit", microvm_tests.MICROVM_TEST_SCENARIOS)
+        # The tokens that OpenVMM reports around the caller's, ending with its
+        # network bootstrap.
+        head = "earlycon=xe9 console=hvc0 reboot=t panic=-1 quiet loglevel=0"
+        tail = (
+            "nr_cpus=1 virtio_mmio.device=0x1000@0xd0000000:5 virtnet_ip=10.0.0.2 "
+            "virtnet_mask=255.255.255.0 virtnet_gw=10.0.0.1 "
+            "virtnet_ip6=fd00::a00:2/120 virtnet_gw6=fd00::a00:1"
+        )
+
+        def line(padding: int) -> str:
+            return f"{head} cmdline_limit.padding={'x' * padding} {tail}"
+
+        padding = 2048 - len(line(1))
+        self.assertEqual(len(line(padding)), 2047)
+        refused = openvmm_process.OpenvmmProcessResult(
+            1, b"Error: " + microvm_tests.COMMAND_LINE_LIMIT_ERROR + b"\n"
+        )
+
+        def guest(text: str) -> microvm_tests.GuestScriptResult:
+            return _guest_script_result(
+                f"NVX-COMMAND-LINE: {text}\r\nNVX-COMMAND-LINE-LIMIT-OK\r\n",
+                # The echo of the staged script, cut before its marker.
+                transcript='NVX-COMMAND-LINE: %s\\n\' "$(cat /proc/cmdline)"\r\n',
+            )
+
+        def run_scenario(
+            longest: str, over: openvmm_process.OpenvmmProcessResult
+        ) -> tuple[MagicMock, MagicMock]:
+            with (
+                tempfile.TemporaryDirectory() as temporary,
+                patch.object(
+                    microvm_tests,
+                    "run_guest_script",
+                    side_effect=[guest(line(1)), guest(longest)],
+                ) as run_guest_script,
+                patch.object(microvm_tests, "OpenvmmProcess") as process,
+            ):
+                process.return_value.__enter__.return_value.wait.return_value = over
+                microvm_tests.run_command_line_limit(
+                    Path("openvmm"),
+                    Path("vmlinux"),
+                    Path("initrd"),
+                    "whp",
+                    memory_mib=128,
+                    timeout=60,
+                    output_dir=Path(temporary),
+                )
+            return run_guest_script, process
+
+        run_guest_script, process = run_scenario(line(padding), refused)
+        commands = [call.args[0] for call in run_guest_script.call_args_list]
+        commands.append(process.call_args.args[0])
+        self.assertEqual(
+            [command[command.index("--cmdline") + 1] for command in commands],
+            [
+                f"quiet loglevel=0 cmdline_limit.padding={'x' * length}"
+                for length in (1, padding, padding + 1)
+            ],
+        )
+        for command in commands:
+            self.assertEqual(command[command.index("--net") + 1], "10.0.0.2/24")
+        for call in run_guest_script.call_args_list:
+            self.assertEqual(
+                call.args[1:],
+                (
+                    microvm_tests._read_script("command-line-limit.sh"),
+                    microvm_tests.COMMAND_LINE_LIMIT_COMPLETION_MARKER,
+                ),
+            )
+        self.assertEqual(
+            [call.kwargs["log_path"].name for call in run_guest_script.call_args_list],
+            ["command-line-limit-shortest.log", "command-line-limit.log"],
+        )
+
+        # A guest that lost a token, or an OpenVMM that boots or fails
+        # otherwise one byte over the limit, fails the scenario.
+        for longest, over, message in (
+            (line(padding)[:-1], refused, "not the expected 2047-byte one"),
+            (
+                line(padding),
+                openvmm_process.OpenvmmProcessResult(
+                    0, microvm_tests.BOOT_MARKER + b" alpine\n"
+                ),
+                "did not refuse",
+            ),
+            (
+                line(padding),
+                openvmm_process.OpenvmmProcessResult(1, b"Error: other\n"),
+                "did not refuse",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                run_scenario(longest, over)
+
+    def test_command_line_limit_script_requires_the_last_token_route(self):
+        shell = _posix_shell()
+        if shell is None:
+            self.skipTest("POSIX shell is unavailable")
+        route = (
+            "00000000000000000000000000000000 00 00000000000000000000000000000000 00 "
+            "fd00000000000000000000000a000001 00000400 00000001 00000000 00000003 "
+            "eth0\n"
+        )
+        command_line = "console=hvc0 virtnet_gw6=fd00::a00:1"
+        for name, table, status, expected in (
+            ("route", route, 0, "NVX-COMMAND-LINE-LIMIT-OK"),
+            ("no-route", "", 20, "NVX-COMMAND-LINE-LIMIT-FAIL code=20"),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "proc" / "net").mkdir(parents=True)
+                (root / "proc" / "cmdline").write_text(
+                    command_line + "\n", encoding="ascii"
+                )
+                (root / "proc" / "net" / "ipv6_route").write_text(
+                    table, encoding="ascii"
+                )
+                path = root / "command-line-limit.sh"
+                path.write_text(
+                    "nvx_exit() { :; }\n"
+                    + microvm_tests._read_script("command-line-limit.sh")
+                    .replace("nvx-exit", "nvx_exit")
+                    .replace("/proc/", f"{root.as_posix()}/proc/"),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                result = subprocess.run(
+                    [shell, path.as_posix()],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(
+                    result.returncode, status, result.stdout + result.stderr
+                )
+                self.assertIn(f"NVX-COMMAND-LINE: {command_line}\n", result.stdout)
+                self.assertIn(expected, result.stdout)
+
+    def test_runner_runs_the_command_line_limit_scenario(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with tempfile.TemporaryDirectory() as temporary:
+            args = nvx.parse_args(
+                ["test-microvm", "--backend", "mshv", "--output-dir", temporary]
+            )
+            with (
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(
+                    microvm_tests, "MICROVM_TEST_SCENARIOS", ("command-line-limit",)
+                ),
+                patch.object(microvm_tests, "require_file", side_effect=require),
+                patch.object(microvm_tests, "run_command_line_limit") as run,
+            ):
+                self.assertEqual(microvm_tests.run(args), 0)
+
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[3], "mshv")
+        self.assertEqual(run.call_args.kwargs["output_dir"], Path(temporary))
+
     def test_directional_network_commands_map_generic_default_actions(self):
         with patch.object(
             microvm_tests,
@@ -5392,6 +8125,7 @@ class MicrovmTests(unittest.TestCase):
                 "_bind_consecutive_ports",
                 side_effect=[endpoints, RuntimeError("UDP unavailable")],
             ),
+            patch.object(microvm_tests, "compile_egress_policy") as compile_policy,
             self.assertRaisesRegex(RuntimeError, "UDP unavailable"),
         ):
             microvm_tests.run_l3_l4_egress_policy(
@@ -5405,6 +8139,7 @@ class MicrovmTests(unittest.TestCase):
             )
         for endpoint in endpoints:
             endpoint.close.assert_called_once_with()
+        compile_policy.assert_not_called()
 
     def test_bounded_egress_acceptance_policy_lowers_ranges_and_exclusions(self):
         policy = microvm_tests._bounded_egress_policy(
@@ -5475,10 +8210,16 @@ class MicrovmTests(unittest.TestCase):
                     patch.object(microvm_tests, "run_guest_script") as run_guest_script,
                     patch.object(microvm_tests, "OpenvmmProcess") as openvmm_process,
                     patch.object(
+                        microvm_tests,
+                        "compile_egress_policy",
+                        return_value=nvx_rs.EgressRules(allow=(), deny=()),
+                    ),
+                    patch.object(
                         microvm_tests.threading,
                         "Thread",
                         side_effect=ImmediateThread,
                     ),
+                    patch.object(nvx_rs, "require_binary", return_value=_FAKE_NVX_RS),
                 ):
                     wait = openvmm_process.return_value.__enter__.return_value.wait
                     wait.side_effect = (
@@ -5504,13 +8245,10 @@ class MicrovmTests(unittest.TestCase):
                     )
 
                     policy_path = output_dir / "l3-l4-requested-policy.json"
-                    nvx_path = str(Path(microvm_tests.__file__).parents[1] / "nvx.py")
                     self.assertEqual(
                         run_guest_script.call_args.args[0],
                         [
-                            sys.executable,
-                            nvx_path,
-                            "run",
+                            *_FAKE_PUBLIC_RUN,
                             "--guest",
                             guest,
                             "--hypervisor",
@@ -5544,7 +8282,7 @@ class MicrovmTests(unittest.TestCase):
                             encoding="utf-8"
                         )
                     )
-                    self.assertEqual(results["interface"], "nvx.py run")
+                    self.assertEqual(results["interface"], "nvx-rs run")
                     self.assertEqual(
                         results["observed"]["allowed"],
                         ["tcp:start", "tcp:end", "udp:start", "udp:end"],
@@ -5625,6 +8363,11 @@ class MicrovmTests(unittest.TestCase):
                             return_value=(tcp, udp),
                         ),
                         patch.object(microvm_tests, "run_guest_script"),
+                        patch.object(
+                            microvm_tests,
+                            "compile_egress_policy",
+                            return_value=nvx_rs.EgressRules(allow=(), deny=()),
+                        ),
                         patch.object(
                             microvm_tests.threading,
                             "Thread",
@@ -5742,7 +8485,7 @@ class MicrovmTests(unittest.TestCase):
 
         def guest(
             command: list[str], _script: str, _marker: bytes, **_kwargs: object
-        ) -> dict[str, str]:
+        ) -> microvm_tests.GuestScriptResult:
             policy = Path(command[command.index("--network-egress-policy-file") + 1])
             name = policy.name.removeprefix("l3-l4-egress-").removesuffix(
                 "-policy.json"
@@ -5758,12 +8501,15 @@ class MicrovmTests(unittest.TestCase):
             }
             if guest_report is not None and guest_report[0] == name:
                 reports[guest_report[1]] = guest_report[2]
-            # The tty echoes script lines, which must not count as reports.
-            text = 'echo "NVX-L3-L4-PROBE icmp=echoed"\r\n' + "".join(
+            text = "".join(
                 f"NVX-L3-L4-PROBE {probe}={value}\r\n"
                 for probe, value in reports.items()
             )
-            return {"text": text + "NVX-L3-L4-EGRESS-PROTOCOLS-OK\r\n"}
+            return _guest_script_result(
+                text + "NVX-L3-L4-EGRESS-PROTOCOLS-OK\r\n",
+                # The tty echoes script lines, which must not count as reports.
+                transcript='> echo "NVX-L3-L4-PROBE icmp=echoed"\r\n',
+            )
 
         class FakeServer:
             def __init__(
@@ -5827,15 +8573,13 @@ class MicrovmTests(unittest.TestCase):
                 )
             ]
             self.assertEqual(run_guest_script.call_count, len(names))
-            nvx_path = str(Path(microvm_tests.__file__).parents[1] / "nvx.py")
+            public_run = nvx_rs.command_line(("run",))
             for call, name in zip(run_guest_script.call_args_list, names, strict=True):
                 policy_path = output_dir / f"l3-l4-egress-{name}-policy.json"
                 self.assertEqual(
                     call.args[0],
                     [
-                        sys.executable,
-                        nvx_path,
-                        "run",
+                        *public_run,
                         "--guest",
                         "alpine",
                         "--hypervisor",
@@ -5929,6 +8673,26 @@ class MicrovmTests(unittest.TestCase):
                     (output_dir / "l3-l4-egress-protocols-results.json").exists()
                 )
 
+    def _run_egress_script(
+        self, shell: str, script: str
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        """Run an L3/L4 egress script in the host's shell with a TMPDIR of its
+        own, which holds a stale result, and return the shell's result and the
+        names of the files that the run left in that TMPDIR."""
+        with tempfile.TemporaryDirectory() as temporary:
+            probe_dir = Path(temporary)
+            (probe_dir / "nvx-egress-stale").write_text("stale\n", encoding="utf-8")
+            result = subprocess.run(
+                [shell],
+                input=script,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+                env=_probe_environment(probe_dir),
+            )
+            return result, sorted(path.name for path in probe_dir.iterdir())
+
     def test_l3_l4_egress_protocol_script_reports_each_probe(self):
         shell = _posix_shell()
         if shell is None:
@@ -5956,14 +8720,7 @@ class MicrovmTests(unittest.TestCase):
             "}\n"
             "ping() { return 1; }\n"
         )
-        result = subprocess.run(
-            [shell],
-            input=stubs + script,
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
+        result, probes = self._run_egress_script(shell, stubs + script)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -5976,6 +8733,17 @@ class MicrovmTests(unittest.TestCase):
                 "NVX-L3-L4-PROBE icmp=blocked",
                 "NVX-L3-L4-EGRESS-PROTOCOLS-OK",
                 "NVX-EXIT 0",
+            ],
+        )
+        # The run replaced the stale result in its TMPDIR with its probes'.
+        self.assertEqual(
+            probes,
+            [
+                "nvx-egress-icmp",
+                "nvx-egress-tcp-named",
+                "nvx-egress-tcp-other",
+                "nvx-egress-udp-named",
+                "nvx-egress-udp-other",
             ],
         )
 
@@ -6163,7 +8931,7 @@ class MicrovmTests(unittest.TestCase):
             "192.0.2.1", 20001, 20002, 20003
         ):
             with self.subTest(case=case.name):
-                compiled = egress_policy.compile_policy(
+                compiled = _compile(
                     {"allow": list(case.allow), "deny": list(case.deny)}
                 )
                 self.assertEqual((compiled.allow, compiled.deny), expected[case.name])
@@ -6197,7 +8965,7 @@ class MicrovmTests(unittest.TestCase):
 
         def guest(
             command: list[str], _script: str, _marker: bytes, **_kwargs: object
-        ) -> dict[str, str]:
+        ) -> microvm_tests.GuestScriptResult:
             name = policy_name(command)
             current.append(name)
             reports = {
@@ -6210,12 +8978,15 @@ class MicrovmTests(unittest.TestCase):
             }
             if guest_report is not None and guest_report[0] == name:
                 reports[guest_report[1]] = guest_report[2]
-            # The tty echoes script lines, which must not count as reports.
-            text = 'echo "NVX-L3-L4-PROBE tcp-first=echoed"\r\n' + "".join(
+            text = "".join(
                 f"NVX-L3-L4-PROBE {probe}={value}\r\n"
                 for probe, value in reports.items()
             )
-            return {"text": text + "NVX-L3-L4-EGRESS-PORT-RANGES-OK\r\n"}
+            return _guest_script_result(
+                text + "NVX-L3-L4-EGRESS-PORT-RANGES-OK\r\n",
+                # The tty echoes script lines, which must not count as reports.
+                transcript='> echo "NVX-L3-L4-PROBE tcp-first=echoed"\r\n',
+            )
 
         class FakeServer:
             def __init__(
@@ -6242,14 +9013,21 @@ class MicrovmTests(unittest.TestCase):
                 return MagicMock(returncode=0, output=microvm_tests.BOOT_MARKER)
             return MagicMock(returncode=2, output=output)
 
-        def public_dry_run(command: list[str], **_kwargs: object) -> MagicMock:
+        run_process = subprocess.run
+
+        def public_dry_run(command: list[str], **kwargs: Any) -> object:
+            if "--dry-run" not in command:
+                # nvx-rs, which compiles each policy.
+                return cast(object, run_process(command, **kwargs))
             if nvx_accepts == policy_name(command):
                 return MagicMock(returncode=0, stderr=b"")
             path = Path(command[command.index("--network-egress-policy-file") + 1])
             try:
-                egress_policy.compile_policy_file(path)
-            except common.ScriptError as error:
-                return MagicMock(returncode=1, stderr=f"error: {error}\n".encode())
+                nvx_rs.compile_egress_policy(path)
+            except nvx_rs.NvxRsError as error:
+                return MagicMock(
+                    returncode=1, stderr=f"error[{error.code}]: {error}\n".encode()
+                )
             return MagicMock(returncode=0, stderr=b"")
 
         with (
@@ -6306,9 +9084,7 @@ class MicrovmTests(unittest.TestCase):
             ]
             self.assertEqual(run_guest_script.call_count, len(names))
             public_run = [
-                sys.executable,
-                str(Path(microvm_tests.__file__).parents[1] / "nvx.py"),
-                "run",
+                *nvx_rs.command_line(("run",)),
                 "--guest",
                 "alpine",
                 "--hypervisor",
@@ -6374,7 +9150,12 @@ class MicrovmTests(unittest.TestCase):
             self.assertEqual(
                 rejected, ["192.0.2.1:tcp:20003-20001", "192.0.2.1:udp:-20003"]
             )
-            dry_runs = [call.args[0] for call in nvx_run.call_args_list]
+            # The other calls are nvx-rs, which compiles each case's policy.
+            dry_runs = [
+                call.args[0]
+                for call in nvx_run.call_args_list
+                if "--dry-run" in call.args[0]
+            ]
             self.assertEqual(len(dry_runs), 2)
             for command, name in zip(
                 dry_runs, ("reversed-end-port", "end-port-without-port"), strict=True
@@ -6560,14 +9341,7 @@ class MicrovmTests(unittest.TestCase):
             "    esac\n"
             "}\n"
         )
-        result = subprocess.run(
-            [shell],
-            input=stubs + script,
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
+        result, probes = self._run_egress_script(shell, stubs + script)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -6585,6 +9359,22 @@ class MicrovmTests(unittest.TestCase):
                 "NVX-L3-L4-PROBE udp-above=failed-2",
                 "NVX-L3-L4-EGRESS-PORT-RANGES-OK",
                 "NVX-EXIT 0",
+            ],
+        )
+        # The run replaced the stale result in its TMPDIR with its probes'.
+        self.assertEqual(
+            probes,
+            [
+                "nvx-egress-tcp-above",
+                "nvx-egress-tcp-below",
+                "nvx-egress-tcp-first",
+                "nvx-egress-tcp-inside",
+                "nvx-egress-tcp-last",
+                "nvx-egress-udp-above",
+                "nvx-egress-udp-below",
+                "nvx-egress-udp-first",
+                "nvx-egress-udp-inside",
+                "nvx-egress-udp-last",
             ],
         )
 
@@ -6672,9 +9462,7 @@ class MicrovmTests(unittest.TestCase):
         every_probe = set(microvm_tests.IPV6_EGRESS_PROBES)
         lowered = {}
         for case in cases:
-            compiled = egress_policy.compile_policy(
-                {"allow": list(case.allow), "deny": list(case.deny)}
-            )
+            compiled = _compile({"allow": list(case.allow), "deny": list(case.deny)})
             lowered[case.name] = (
                 case.default,
                 compiled.allow,
@@ -6775,7 +9563,7 @@ class MicrovmTests(unittest.TestCase):
 
         def guest(
             command: list[str], _script: str, _marker: bytes, **_kwargs: object
-        ) -> dict[str, str]:
+        ) -> microvm_tests.GuestScriptResult:
             policy = Path(command[command.index("--network-egress-policy-file") + 1])
             name = policy.name.removeprefix("ipv6-egress-").removesuffix("-policy.json")
             current.append(name)
@@ -6792,14 +9580,16 @@ class MicrovmTests(unittest.TestCase):
             dns = cases[name].dns or "none"
             if dns_report is not None and dns_report[0] == name:
                 dns = dns_report[1]
-            # The tty echoes script lines, which must not count as reports.
-            text = 'echo "NVX-IPV6-EGRESS-DNS ${dns:-none}"\r\n'
-            text += f"NVX-IPV6-EGRESS-DNS {dns}\r\n"
+            text = f"NVX-IPV6-EGRESS-DNS {dns}\r\n"
             text += "".join(
                 f"NVX-L3-L4-PROBE {probe}={value}\r\n"
                 for probe, value in reports.items()
             )
-            return {"text": text + "NVX-IPV6-EGRESS-OK\r\n"}
+            return _guest_script_result(
+                text + "NVX-IPV6-EGRESS-OK\r\n",
+                # The tty echoes script lines, which must not count as reports.
+                transcript='> echo "NVX-IPV6-EGRESS-DNS ${dns:-none}"\r\n',
+            )
 
         class FakeServer:
             def __init__(
@@ -6873,15 +9663,13 @@ class MicrovmTests(unittest.TestCase):
                 20001,
             )
             self.assertEqual(run_guest_script.call_count, len(cases))
-            nvx_path = str(Path(microvm_tests.__file__).parents[1] / "nvx.py")
+            public_run = nvx_rs.command_line(("run",))
             for call, case in zip(run_guest_script.call_args_list, cases, strict=True):
                 policy_path = output_dir / f"ipv6-egress-{case.name}-policy.json"
                 self.assertEqual(
                     call.args[0],
                     [
-                        sys.executable,
-                        nvx_path,
-                        "run",
+                        *public_run,
                         "--guest",
                         "alpine",
                         "--hypervisor",
@@ -7115,6 +9903,9 @@ class MicrovmTests(unittest.TestCase):
             .replace("/proc/", f"{root.as_posix()}/proc/")
             .replace("/etc/resolv.conf", f"{root.as_posix()}/etc/resolv.conf")
         )
+        # The root's tmp stands for the guest's /tmp, where the probes keep
+        # their results.
+        (root / "tmp").mkdir(exist_ok=True)
         return subprocess.run(
             [shell],
             input="record_exit() { printf 'NVX-EXIT %s\\n' \"$1\"; }\n"
@@ -7124,6 +9915,7 @@ class MicrovmTests(unittest.TestCase):
             capture_output=True,
             timeout=10,
             check=False,
+            env=_probe_environment(root / "tmp"),
         )
 
     def test_ipv6_egress_script_checks_the_identity_and_reports_each_probe(self):
@@ -7182,6 +9974,10 @@ class MicrovmTests(unittest.TestCase):
                 root = Path(temporary)
                 (root / "proc" / "net").mkdir(parents=True)
                 (root / "etc").mkdir()
+                (root / "tmp").mkdir()
+                (root / "tmp" / "nvx-egress-stale").write_text(
+                    "stale\n", encoding="utf-8"
+                )
                 (root / "proc" / "cmdline").write_text(
                     "quiet virtnet_ip=192.0.2.2 virtnet_mask=255.255.255.0 "
                     f"virtnet_gw=192.0.2.1{dns} virtnet_ip6=fd00::c000:202/120 "
@@ -7216,6 +10012,18 @@ class MicrovmTests(unittest.TestCase):
                         "NVX-L3-L4-PROBE tcp4-named=unexpected",
                         "NVX-IPV6-EGRESS-OK",
                         "NVX-EXIT 0",
+                    ],
+                )
+                # The run replaced the stale result in the root's tmp with its
+                # probes'.
+                self.assertEqual(
+                    sorted(path.name for path in (root / "tmp").iterdir()),
+                    [
+                        "nvx-egress-icmp6",
+                        "nvx-egress-tcp4-named",
+                        "nvx-egress-tcp6-named",
+                        "nvx-egress-tcp6-other",
+                        "nvx-egress-udp6-named",
                     ],
                 )
 
@@ -7366,13 +10174,11 @@ class MicrovmTests(unittest.TestCase):
             for index, value in enumerate(command)
             if value == "--microvm-sandbox-block"
         ]
-        self.assertEqual(len(values), 4)
+        self.assertEqual(len(values), 2)
         self.assertTrue(values[0].startswith("distro:file:"))
-        self.assertTrue(values[1].startswith("runtime:file:"))
-        self.assertTrue(values[2].startswith("custom:file:"))
-        self.assertTrue(values[3].startswith("scratch:file:"))
-        self.assertTrue(all(value.endswith(",ro") for value in values[:3]))
-        self.assertFalse(values[3].endswith(",ro"))
+        self.assertTrue(values[0].endswith(",ro"))
+        self.assertTrue(values[1].startswith("scratch:file:"))
+        self.assertFalse(values[1].endswith(",ro"))
         self.assertEqual(
             run_guest_script.call_args.args[2],
             microvm_tests.SANDBOX_BLOCKS_COMPLETION_MARKER,
@@ -8013,6 +10819,2588 @@ class MicrovmTests(unittest.TestCase):
         )
         self.assertIs(raised.exception.__cause__, failure)
 
+    def _run_platform_restore_processors(
+        self,
+        backend: str,
+        processor_counts: list[int],
+        output_dir: Path,
+        measure_once: MagicMock,
+        *,
+        fingerprints: list[tuple[str, str, str, str | None]] | None = None,
+    ) -> tuple[MagicMock, MagicMock, MagicMock]:
+        fingerprint = ("manifest", "state", "memory", None)
+        with (
+            patch.object(
+                microvm_tests,
+                "workload_boot_command",
+                return_value=["openvmm", "boot"],
+            ) as workload_boot_command,
+            patch.object(microvm_tests, "capture_snapshot") as capture_snapshot,
+            patch.object(microvm_tests, "measure_once", measure_once),
+            patch.object(
+                microvm_tests,
+                "_scratch_snapshot_fingerprint",
+                side_effect=fingerprints or itertools.repeat(fingerprint),
+            ),
+            patch.object(microvm_tests, "_expect_process_failure") as expect_failure,
+        ):
+            microvm_tests.run_platform_restore_processors(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                backend,
+                processor_counts,
+                memory_mib=128,
+                timeout=60,
+                output_dir=output_dir,
+            )
+        return workload_boot_command, capture_snapshot, expect_failure
+
+    def test_platform_restore_processors_activate_each_target_of_one_capture(self):
+        def blocks(command: list[str]) -> list[str]:
+            return [
+                command[index + 1]
+                for index, argument in enumerate(command)
+                if argument == "--microvm-sandbox-block"
+            ]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "logs"
+            measure_once = _restore_processors_measure(
+                "mshv",
+                capacity=4,
+                prefix=microvm_tests.PLATFORM_POST_RESTORE_MARKER + b"\r\n",
+            )
+            workload_boot_command, capture_snapshot, expect_failure = (
+                self._run_platform_restore_processors(
+                    "mshv", [1, 2, 4, 8], output_dir, measure_once
+                )
+            )
+            logs = sorted(path.name for path in output_dir.iterdir())
+
+        self.assertIn(
+            "platform-restore-processors", microvm_tests.MICROVM_TEST_SCENARIOS
+        )
+        self.assertIn(
+            "platform-restore-processors", microvm_tests.SANDBOX_CONTROL_SCENARIOS
+        )
+        self.assertEqual(workload_boot_command.call_args.kwargs["processors"], 4)
+        # A platform command line carries no tenant configuration, so the
+        # boot-online count is the capture's only caller token.
+        self.assertEqual(workload_boot_command.call_args.args[5], "maxcpus=1")
+        capture = capture_snapshot.call_args.args[0]
+        self.assertEqual(capture[capture.index("--snapshot-tier") + 1], "platform")
+        capture_blocks = blocks(capture)
+        self.assertEqual(len(capture_blocks), 2)
+        self.assertRegex(capture_blocks[0], r"^distro:file:.+,ro$")
+        self.assertRegex(capture_blocks[1], r"^scratch:file:.+(?<!,ro)$")
+        self.assertEqual(capture_snapshot.call_args.kwargs["processors"], 1)
+        self.assertEqual(
+            capture_snapshot.call_args.kwargs["post_restore_script"],
+            microvm_tests._read_script("restore-processors.sh")
+            + time_abi.warp_probe_script()
+            + time_abi.status_script(),
+        )
+        # Counts above the capacity of 4 are not restore targets.
+        self.assertEqual(
+            [_restore_target(entry.args[0]) for entry in measure_once.call_args_list],
+            [1, 2, 4, None],
+        )
+        restore_scratches: list[str] = []
+        for entry in measure_once.call_args_list:
+            command = entry.args[0]
+            self.assertEqual(command[command.index("--processors") + 1], "4")
+            restore_blocks = blocks(command)
+            self.assertEqual(restore_blocks[0], capture_blocks[0])
+            self.assertRegex(restore_blocks[1], r"^scratch:file:.+(?<!,ro)$")
+            restore_scratches.append(restore_blocks[1])
+            self.assertEqual(entry.kwargs["marker"], benchmark.RESTORE_MARKER)
+            self.assertTrue(entry.kwargs["guest_exit_prequeued"])
+            self.assertEqual(
+                entry.kwargs["environment"][benchmark.SNAPSHOT_PROFILE_ENV], "1"
+            )
+        self.assertNotIn(capture_blocks[1], restore_scratches)
+        self.assertEqual(len(set(restore_scratches)), len(restore_scratches))
+        self.assertEqual(
+            [
+                (_restore_target(entry.args[0]), entry.args[3])
+                for entry in expect_failure.call_args_list
+            ],
+            [
+                (0, b"restore-online VP count 0 is not supported"),
+                (3, b"restore-online VP count 3 is not supported"),
+                (8, b"restore-online VP count 8 exceeds VP capacity 4"),
+            ],
+        )
+        for entry in expect_failure.call_args_list:
+            self.assertEqual(
+                entry.kwargs["forbidden_markers"], (benchmark.RESTORE_MARKER,)
+            )
+        self.assertEqual(
+            logs,
+            [
+                "platform-restore-processors-1.log",
+                "platform-restore-processors-2.log",
+                "platform-restore-processors-4.log",
+                "platform-restore-processors-untargeted.log",
+            ],
+        )
+
+    def test_platform_restore_processors_require_the_platform_repair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^platform restore target 2 did not run the platform repair$",
+            ):
+                self._run_platform_restore_processors(
+                    "kvm",
+                    [2],
+                    Path(temporary),
+                    _restore_processors_measure("kvm", capacity=4),
+                )
+
+    def test_platform_restore_processors_check_the_mshv_prefix(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"restore target 2 bound VPs \[0, 1, 2, 3\] on mshv; "
+                r"expected exactly VPs 0\.\.1 of capacity 4",
+            ):
+                self._run_platform_restore_processors(
+                    "mshv",
+                    [2],
+                    Path(temporary),
+                    _restore_processors_measure(
+                        "mshv",
+                        mshv_prefix=False,
+                        capacity=4,
+                        prefix=microvm_tests.PLATFORM_POST_RESTORE_MARKER + b"\r\n",
+                    ),
+                )
+
+    def test_platform_restore_processors_keep_the_snapshot_intact(self):
+        original = ("manifest", "state", "memory", None)
+        changed = ("manifest", "state", "changed", None)
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "^a refused platform restore modified snapshot artifacts$",
+            ):
+                self._run_platform_restore_processors(
+                    "whp",
+                    [1],
+                    Path(temporary),
+                    _restore_processors_measure(
+                        "whp",
+                        capacity=4,
+                        prefix=microvm_tests.PLATFORM_POST_RESTORE_MARKER + b"\r\n",
+                    ),
+                    # The capture, the restore of 1, the untargeted restore,
+                    # and the refused restores.
+                    fingerprints=[original, original, original, changed],
+                )
+
+    def test_platform_zero_fill_script_digests_the_reads_around_the_image_end(self):
+        capacity = microvm_tests.PLATFORM_ZERO_FILL_CAPACITY
+        sectors = microvm_tests.PLATFORM_ZERO_FILL_IMAGE_SECTORS
+        image = microvm_tests._zero_fill_image(sectors)
+        # Every sector differs from its neighbors and from zeros.
+        self.assertEqual(len(image), sectors * 512)
+        self.assertEqual(image[:512], b"\x01" * 512)
+        self.assertEqual(image[-512:], bytes((600 % 251 + 1,)) * 512)
+        self.assertNotIn(0, image)
+        script = microvm_tests.platform_zero_fill_script(
+            image, capacity, microvm_tests.PLATFORM_ZERO_FILL_SCRATCH
+        )
+        self.assertNotRegex(script, r"@[A-Z0-9_]+@")
+
+        # The device that the clone's guest reads: the image, then zeros.
+        device = image + bytes(capacity - len(image))
+
+        def digest(data: bytes) -> str:
+            return hashlib.sha256(data).hexdigest()
+
+        self.assertIn(f'= {capacity} ] || fail "distro size', script)
+        self.assertIn(
+            f'digest /dev/vda 512 0 {sectors})" = {digest(device[: sectors * 512])}',
+            script,
+        )
+        # The image ends in the page of sectors 600 to 607.
+        self.assertIn(
+            f'digest /dev/vda 4096 75 1)" = {digest(device[75 * 4096 : 76 * 4096])}',
+            script,
+        )
+        self.assertIn(
+            f'digest /dev/vda 512 {sectors} {capacity // 512 - sectors})" = '
+            f"{digest(device[sectors * 512 :])}",
+            script,
+        )
+        scratch = digest(bytes(microvm_tests.PLATFORM_ZERO_FILL_SCRATCH))
+        self.assertEqual(script.count(f'digest /dev/vdb 4096 0 256)" = {scratch}'), 2)
+        for marker in (
+            microvm_tests.PLATFORM_ZERO_FILL_IMAGE_MARKER,
+            microvm_tests.PLATFORM_ZERO_FILL_SCRATCH_MARKER,
+        ):
+            self.assertIn(f"\necho {marker.decode()}\n", script)
+
+        for invalid in (image[:-256], image[:512] * 8, bytes(capacity)):
+            with self.assertRaises(ValueError):
+                microvm_tests.platform_zero_fill_script(invalid, capacity, 4096)
+
+    def _run_platform_zero_fill(
+        self,
+        output_dir: Path,
+        measure_once: MagicMock,
+        *,
+        fingerprints: Sequence[tuple[str, str, str, str | None]] | None = None,
+        capture: Callable[..., None] | None = None,
+        refused: Callable[..., None] | None = None,
+    ) -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]:
+        fingerprint = ("manifest", "state", "memory", None)
+        with (
+            patch.object(
+                microvm_tests,
+                "workload_boot_command",
+                return_value=["openvmm", "boot"],
+            ) as workload_boot_command,
+            patch.object(
+                microvm_tests, "capture_snapshot", side_effect=capture
+            ) as capture_snapshot,
+            patch.object(microvm_tests, "measure_once", measure_once),
+            patch.object(
+                microvm_tests,
+                "_scratch_snapshot_fingerprint",
+                side_effect=fingerprints or itertools.repeat(fingerprint),
+            ),
+            patch.object(
+                microvm_tests, "_expect_process_failure", side_effect=refused
+            ) as expect_failure,
+            patch.object(microvm_tests, "_expect_boot_failure") as expect_boot_failure,
+        ):
+            microvm_tests.run_platform_zero_fill(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=60,
+                output_dir=output_dir,
+            )
+        return (
+            workload_boot_command,
+            capture_snapshot,
+            expect_failure,
+            expect_boot_failure,
+        )
+
+    @staticmethod
+    def _zero_fill_measure(
+        output: bytes | None = None,
+        on_restore: Callable[[list[str]], None] | None = None,
+    ) -> MagicMock:
+        def measure(command: list[str], **kwargs: object) -> None:
+            if on_restore is not None:
+                on_restore(command)
+            log_path = cast(Path, kwargs["log_path"])
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_bytes(
+                output
+                if output is not None
+                else microvm_tests.PLATFORM_POST_RESTORE_MARKER
+                + b"\r\n"
+                + microvm_tests.PLATFORM_ZERO_FILL_IMAGE_MARKER
+                + b"\r\n"
+                + microvm_tests.PLATFORM_ZERO_FILL_SCRATCH_MARKER
+                + b"\r\n"
+                + benchmark.RESTORE_MARKER
+                + b"\r\n"
+            )
+
+        return MagicMock(side_effect=measure)
+
+    def test_platform_zero_fill_restores_a_shorter_image_with_an_absent_scratch(
+        self,
+    ):
+        def blocks(command: list[str]) -> list[str]:
+            return [
+                command[index + 1]
+                for index, argument in enumerate(command)
+                if argument == "--microvm-sandbox-block"
+            ]
+
+        def block_path(block: str) -> Path:
+            return Path(block.split(":file:", 1)[1].removesuffix(",ro"))
+
+        capacity = microvm_tests.PLATFORM_ZERO_FILL_CAPACITY
+        image = microvm_tests._zero_fill_image(
+            microvm_tests.PLATFORM_ZERO_FILL_IMAGE_SECTORS
+        )
+        sizes: dict[str, int] = {}
+        restore_images: list[bytes] = []
+
+        def capture(command: list[str], *_args: object, **_kwargs: object) -> None:
+            distro, scratch = blocks(command)
+            sizes["placeholder"] = block_path(distro).stat().st_size
+            sizes["capture-scratch"] = block_path(scratch).stat().st_size
+
+        def on_restore(command: list[str]) -> None:
+            (distro,) = blocks(command)
+            restore_images.append(block_path(distro).read_bytes())
+
+        def refused(command: list[str], *_args: object, **_kwargs: object) -> None:
+            # The first refused restore is the longer image's.
+            sizes.setdefault(
+                "longer-image", block_path(blocks(command)[0]).stat().st_size
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "logs"
+            measure_once = self._zero_fill_measure(on_restore=on_restore)
+            (
+                workload_boot_command,
+                capture_snapshot,
+                expect_failure,
+                expect_boot_failure,
+            ) = self._run_platform_zero_fill(
+                output_dir, measure_once, capture=capture, refused=refused
+            )
+            logs = sorted(path.name for path in output_dir.iterdir())
+
+        self.assertIn("platform-zero-fill", microvm_tests.MICROVM_TEST_SCENARIOS)
+        self.assertIn("platform-zero-fill", microvm_tests.SANDBOX_CONTROL_SCENARIOS)
+        # A platform command line carries no caller tokens.
+        self.assertEqual(workload_boot_command.call_args.args[5], "")
+        capture_command = capture_snapshot.call_args.args[0]
+        self.assertEqual(
+            capture_command[capture_command.index("--snapshot-tier") + 1], "platform"
+        )
+        capture_blocks = blocks(capture_command)
+        self.assertEqual(len(capture_blocks), 2)
+        self.assertRegex(capture_blocks[0], r"^distro:file:.+,ro$")
+        self.assertRegex(capture_blocks[1], r"^scratch:file:.+(?<!,ro)$")
+        self.assertEqual(capture_snapshot.call_args.kwargs["processors"], 1)
+        self.assertEqual(
+            capture_snapshot.call_args.kwargs["post_restore_script"],
+            microvm_tests.platform_zero_fill_script(
+                image, capacity, microvm_tests.PLATFORM_ZERO_FILL_SCRATCH
+            ),
+        )
+        # The placeholder fixes the capacity, and the longer image exceeds it.
+        self.assertEqual(
+            sizes,
+            {
+                "placeholder": capacity,
+                "capture-scratch": microvm_tests.PLATFORM_ZERO_FILL_SCRATCH,
+                "longer-image": capacity + 512,
+            },
+        )
+
+        # One clone restores the shorter image with its scratch absent.
+        measure_once.assert_called_once()
+        restore = measure_once.call_args.args[0]
+        (restore_distro,) = blocks(restore)
+        self.assertRegex(restore_distro, r"^distro:file:.+,ro$")
+        self.assertNotEqual(restore_distro, capture_blocks[0])
+        self.assertIn("--restore-absent-scratch", restore)
+        self.assertEqual(restore_images, [image])
+        self.assertEqual(
+            measure_once.call_args.kwargs["environment"]["OPENVMM_LOG"], "off"
+        )
+        self.assertTrue(measure_once.call_args.kwargs["guest_exit_prequeued"])
+        self.assertEqual(
+            measure_once.call_args.kwargs["failure_marker"],
+            microvm_tests.PLATFORM_ZERO_FILL_FAILURE_MARKER,
+        )
+        self.assertEqual(logs, ["platform-zero-fill-restore.log"])
+
+        # OpenVMM refuses the other restores before the guest runs.
+        self.assertEqual(
+            [entry.args[3] for entry in expect_failure.call_args_list],
+            [reason for _, reason in microvm_tests.PLATFORM_ZERO_FILL_REJECTED],
+        )
+        longer, absent_and_file, no_scratch = (
+            entry.args[0] for entry in expect_failure.call_args_list
+        )
+        self.assertEqual(len(blocks(longer)), 2)
+        self.assertNotIn("--restore-absent-scratch", longer)
+        self.assertEqual(len(blocks(absent_and_file)), 2)
+        self.assertIn("--restore-absent-scratch", absent_and_file)
+        self.assertEqual(blocks(no_scratch), [restore_distro])
+        self.assertNotIn("--restore-absent-scratch", no_scratch)
+        for entry in expect_failure.call_args_list:
+            self.assertIn("--restore-snapshot", entry.args[0])
+            self.assertEqual(
+                entry.kwargs["forbidden_markers"], (benchmark.RESTORE_MARKER,)
+            )
+        # A cold boot has no captured scratch to declare absent.
+        cold_boot = expect_boot_failure.call_args.args[0]
+        self.assertEqual(cold_boot[:2], ["openvmm", "boot"])
+        self.assertIn("--restore-absent-scratch", cold_boot)
+        self.assertNotIn("--restore-snapshot", cold_boot)
+        self.assertEqual(expect_boot_failure.call_args.args[3], b"--restore-snapshot")
+
+    def test_platform_zero_fill_requires_both_checks_and_the_platform_repair(self):
+        complete = (
+            microvm_tests.PLATFORM_POST_RESTORE_MARKER,
+            microvm_tests.PLATFORM_ZERO_FILL_IMAGE_MARKER,
+            microvm_tests.PLATFORM_ZERO_FILL_SCRATCH_MARKER,
+        )
+        for missing in complete:
+            output = b"".join(
+                marker + b"\r\n" for marker in complete if marker != missing
+            )
+            with (
+                self.subTest(missing=missing),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^platform zero-fill restore did not report "
+                    + re.escape(repr(missing.decode()))
+                    + "$",
+                ):
+                    self._run_platform_zero_fill(
+                        Path(temporary), self._zero_fill_measure(output)
+                    )
+
+    def test_platform_zero_fill_reports_guest_failures(self):
+        failure = benchmark.GuestFailureReported(
+            "NVX-ZERO-FILL-FAIL distro reads past the image's end", "tail"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(RuntimeError) as raised:
+                self._run_platform_zero_fill(
+                    Path(temporary), MagicMock(side_effect=failure)
+                )
+        self.assertEqual(
+            str(raised.exception),
+            "platform zero-fill restore: guest reported "
+            "NVX-ZERO-FILL-FAIL distro reads past the image's end\n"
+            "--- OpenVMM output ---\ntail",
+        )
+
+    def test_platform_zero_fill_keeps_the_image_and_the_snapshot_intact(self):
+        def overwrite_image(command: list[str]) -> None:
+            image = command[command.index("--microvm-sandbox-block") + 1]
+            Path(image.split(":file:", 1)[1].removesuffix(",ro")).write_bytes(b"x")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "^platform zero-fill restore changed the distro image$",
+            ):
+                self._run_platform_zero_fill(
+                    Path(temporary),
+                    self._zero_fill_measure(on_restore=overwrite_image),
+                )
+
+        original = ("manifest", "state", "memory", None)
+        changed = ("manifest", "state", "changed", None)
+        for fingerprints, message in (
+            # The capture, then the clone.
+            ([original, changed], "^platform zero-fill restore modified snapshot"),
+            # The capture, the clone, then the refused restores.
+            (
+                [original, original, changed],
+                "^a refused platform zero-fill restore modified snapshot",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._run_platform_zero_fill(
+                        Path(temporary),
+                        self._zero_fill_measure(),
+                        fingerprints=fingerprints,
+                    )
+
+    def test_platform_network_policy_script_probes_both_services_and_serves_the_host(
+        self,
+    ):
+        script = microvm_tests.platform_network_policy_script(
+            allowed_port=40001, other_port=40002, guest_port=18080
+        )
+        self.assertNotRegex(script, r"@[A-Z0-9_]+@")
+        self.assertIn('"http://10.0.0.1:$2/$1"', script)
+        self.assertIn("wget -T 2 -qO /tmp/nvx-platform-network-probe", script)
+        self.assertIn("\nprobe allowed 40001\n", script)
+        self.assertIn("\nprobe other 40002\n", script)
+        # The guest's server answers the host's exchange through a forward.
+        ack = microvm_tests.HOST_LOOPBACK_TCP_ACK.decode().removesuffix("\n")
+        self.assertIn(f"printf '{ack}\\n' |\n    nc -l -p 18080 -w 20", script)
+        self.assertIn("printf '%04X' 18080", script)
+        self.assertIn(
+            "grep -qx "
+            + microvm_tests.HOST_LOOPBACK_TCP_REQUEST.decode().strip()
+            + " /tmp/nvx-platform-network-inbound",
+            script,
+        )
+        # After an exchange through a forward, the guest waits for the host's
+        # request, which the release may overtake, before it stops its server.
+        self.assertIn("read -r release exchange ||", script)
+        self.assertIn(
+            "forward)\n    tries=0\n    while ! grep -qx "
+            + microvm_tests.HOST_LOOPBACK_TCP_REQUEST.decode().strip()
+            + " /tmp/nvx-platform-network-inbound",
+            script,
+        )
+        self.assertLess(
+            script.index("forward)\n    tries=0"), script.index('kill "$listener"')
+        )
+        for marker in (
+            microvm_tests.PLATFORM_NETWORK_LISTENING_MARKER,
+            microvm_tests.PLATFORM_NETWORK_CHECKED,
+        ):
+            self.assertIn(marker.decode(), script)
+        self.assertIn(
+            'echo "NVX-PLATFORM-NETWORK-IDENTITY mac=$mac ipv4=$ipv4 ipv6=$ipv6"',
+            script,
+        )
+        self.assertIn(
+            'echo "'
+            + microvm_tests.PLATFORM_NETWORK_PROBE_PREFIX.decode()
+            + 'allowed=$allowed other=$other inbound=$inbound"',
+            script,
+        )
+        self.assertIn(
+            'echo "' + microvm_tests.PLATFORM_NETWORK_FAILURE_MARKER.decode() + ' $1"',
+            script,
+        )
+
+    def test_platform_network_clones_reach_what_their_policies_admit(self):
+        clones = microvm_tests.platform_network_clones(
+            allowed_port=40001, other_port=40002, host_port=40003, guest_port=18080
+        )
+        self.assertEqual(
+            [
+                (clone.name, clone.allowed, clone.other, clone.forward)
+                for clone in clones
+            ],
+            [
+                ("deny-all", False, False, False),
+                ("egress-rules", True, False, False),
+                ("forward", True, True, True),
+                ("proxy", False, True, False),
+            ],
+        )
+        deny_all, rules, forward, proxy = clones
+        # A clone without connectivity keeps the template's own policy.
+        self.assertEqual(
+            deny_all.policy, microvm_tests.PLATFORM_NETWORK_TEMPLATE_POLICY
+        )
+        self.assertEqual(
+            microvm_tests.PLATFORM_NETWORK_TEMPLATE_POLICY,
+            ("--network-egress", "deny", "--host-loopback", "deny"),
+        )
+        self.assertEqual(
+            rules.policy,
+            (
+                "--network-egress",
+                "deny",
+                "--network-egress-allow",
+                "10.0.0.1/32:tcp:40001",
+            ),
+        )
+        self.assertEqual(
+            forward.policy,
+            (
+                "--network-egress",
+                "allow",
+                "--host-loopback",
+                "allow",
+                "--host-loopback-forward",
+                "tcp:40003:18080",
+                "--network-ingress",
+                "allow",
+            ),
+        )
+        self.assertEqual(
+            proxy.policy,
+            (
+                "--network-egress",
+                "deny",
+                "--host-loopback",
+                "deny",
+                "--network-proxy",
+                "10.0.0.1:40002",
+            ),
+        )
+        self.assertEqual(
+            [clone.probe_report() for clone in clones],
+            [
+                b"NVX-PLATFORM-NETWORK-PROBE allowed=denied other=denied inbound=none",
+                b"NVX-PLATFORM-NETWORK-PROBE allowed=reached other=denied inbound=none",
+                b"NVX-PLATFORM-NETWORK-PROBE allowed=reached other=reached "
+                b"inbound=reached",
+                b"NVX-PLATFORM-NETWORK-PROBE allowed=denied other=reached inbound=none",
+            ],
+        )
+
+    @staticmethod
+    def _platform_network_reaches(policy: Sequence[str], port: int) -> bool:
+        """Return whether OpenVMM lets a clone under ``policy`` reach a host
+        service at ``port`` of the gateway."""
+
+        def value(option: str) -> str | None:
+            return policy[policy.index(option) + 1] if option in policy else None
+
+        return (
+            value("--network-egress") == "allow"
+            or value("--network-egress-allow") == f"10.0.0.1/32:tcp:{port}"
+            or value("--network-proxy") == f"10.0.0.1:{port}"
+        )
+
+    def _simulate_platform_network_guest(
+        self, command: list[str], ports: dict[str, int]
+    ) -> list[bytes]:
+        """Return the lines of the clone that ``command`` restores, after it
+        requests each host service in ``ports`` that its policy admits."""
+        policy = command[command.index("--restore-network-policy") + 1 :]
+        reached = {
+            name: self._platform_network_reaches(policy, port)
+            for name, port in ports.items()
+        }
+        for name, port in ports.items():
+            if not reached[name]:
+                continue
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+                client.sendall(
+                    f"GET /{name} HTTP/1.1\r\nHost: 10.0.0.1\r\n\r\n".encode()
+                )
+                answer = b""
+                while chunk := client.recv(4096):
+                    answer += chunk
+            self.assertTrue(
+                answer.endswith(f"\r\n\r\nNVX-PLATFORM-NETWORK-{name}".encode())
+            )
+        clone = microvm_tests.PlatformNetworkClone(
+            "",
+            tuple(policy),
+            allowed=reached["allowed"],
+            other=reached["other"],
+            forward="--host-loopback-forward" in policy,
+        )
+        return [
+            microvm_tests.PLATFORM_POST_RESTORE_MARKER,
+            microvm_tests.PLATFORM_NETWORK_IDENTITY,
+            clone.probe_report(),
+            benchmark.RESTORE_MARKER,
+        ]
+
+    def _run_platform_network_policy(
+        self,
+        output_dir: Path,
+        *,
+        guest: Callable[[list[str], dict[str, int]], list[bytes]] | None = None,
+        fingerprints: Sequence[tuple[str, str, str, str | None]] | None = None,
+    ) -> dict[str, Any]:
+        """Run the scenario with a simulated OpenVMM, whose clones request the
+        scenario's real host services as their policies admit, and return its
+        calls."""
+        captures: list[tuple[list[str], dict[str, Any]]] = []
+        restores: list[list[str]] = []
+        releases: list[str] = []
+        ports: dict[str, int] = {}
+        busy: list[bool] = []
+
+        def capture(command: list[str], *_args: object, **kwargs: Any) -> None:
+            captures.append((command, kwargs))
+            script = kwargs["post_restore_script"]
+            if script is not None:
+                for name in ("allowed", "other"):
+                    match = re.search(rf"\nprobe {name} (\d+)\n", script)
+                    assert match is not None
+                    ports[name] = int(match[1])
+
+        simulated_guest = guest or self._simulate_platform_network_guest
+
+        class FakeProcess:
+            def __init__(self, command: list[str], log_path: Path) -> None:
+                restores.append(command)
+                self.command = command
+                self.log_path = log_path
+                self.lines: list[bytes] = []
+                self.released = False
+
+            def __enter__(self) -> "FakeProcess":
+                return self
+
+            def __exit__(self, *_exception: object) -> None:
+                return None
+
+            def wait_for_line(self, marker: bytes, _timeout: float) -> None:
+                assert marker == microvm_tests.PLATFORM_NETWORK_LISTENING_MARKER
+                self.lines = simulated_guest(self.command, ports)
+
+            def send_line(self, line: str) -> None:
+                releases.append(line)
+                self.released = True
+
+            def wait(self, _timeout: float) -> openvmm_process.OpenvmmProcessResult:
+                assert self.released
+                output = b"".join(line + b"\r\n" for line in self.lines)
+                self.log_path.write_bytes(output)
+                return openvmm_process.OpenvmmProcessResult(0, output)
+
+        def refused(command: list[str], *_args: object, **_kwargs: object) -> None:
+            if "--host-loopback-forward" in command:
+                port = int(
+                    command[command.index("--host-loopback-forward") + 1].split(":")[1]
+                )
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    try:
+                        probe.bind(("127.0.0.1", port))
+                    except OSError:
+                        busy.append(True)
+                    else:
+                        busy.append(False)
+
+        fingerprint = ("manifest", "state", "memory", None)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with (
+            patch.object(
+                microvm_tests,
+                "workload_boot_command",
+                return_value=["openvmm", "boot"],
+            ) as workload_boot_command,
+            patch.object(microvm_tests, "capture_snapshot", side_effect=capture),
+            patch.object(microvm_tests, "OpenvmmProcess", FakeProcess),
+            patch.object(microvm_tests, "_host_loopback_tcp_exchange") as exchange,
+            patch.object(
+                microvm_tests,
+                "_scratch_snapshot_fingerprint",
+                side_effect=fingerprints or itertools.repeat(fingerprint),
+            ),
+            patch.object(
+                microvm_tests, "_expect_process_failure", side_effect=refused
+            ) as expect_failure,
+            patch.object(microvm_tests, "_expect_boot_failure") as expect_boot_failure,
+        ):
+            microvm_tests.run_platform_network_policy(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=60,
+                output_dir=output_dir,
+            )
+        return {
+            "workload_boot_command": workload_boot_command,
+            "captures": captures,
+            "restores": restores,
+            "releases": releases,
+            "exchange": exchange,
+            "expect_failure": expect_failure,
+            "expect_boot_failure": expect_boot_failure,
+            "ports": ports,
+            "busy": busy,
+        }
+
+    def test_platform_network_policy_restores_one_template_with_four_policies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "logs"
+            calls = self._run_platform_network_policy(output_dir)
+            logs = sorted(path.name for path in output_dir.iterdir())
+
+        self.assertIn("platform-network-policy", microvm_tests.MICROVM_TEST_SCENARIOS)
+        self.assertIn(
+            "platform-network-policy", microvm_tests.SANDBOX_CONTROL_SCENARIOS
+        )
+        # A platform command line carries no caller tokens, and the template
+        # has a NIC.
+        boot_call = calls["workload_boot_command"].call_args
+        self.assertEqual(boot_call.args[5], "")
+        self.assertEqual(
+            boot_call.kwargs["network"], microvm_tests.PLATFORM_NETWORK_CIDR
+        )
+
+        # The template and the plain deny-all snapshot are platform captures
+        # with sandbox blocks, and only the template's clones run the checks.
+        (template, template_kwargs), (plain, plain_kwargs) = calls["captures"]
+        for command in (template, plain):
+            self.assertEqual(command[:2], ["openvmm", "boot"])
+            self.assertEqual(command[command.index("--snapshot-tier") + 1], "platform")
+            self.assertEqual(command.count("--microvm-sandbox-block"), 2)
+        policy = template.index("--network-egress")
+        self.assertEqual(
+            template[policy : policy + 4],
+            list(microvm_tests.PLATFORM_NETWORK_TEMPLATE_POLICY),
+        )
+        self.assertNotIn("--host-loopback", plain)
+        self.assertEqual(plain[plain.index("--network-egress") + 1], "deny")
+        ports = calls["ports"]
+        self.assertEqual(
+            template_kwargs["post_restore_script"],
+            microvm_tests.platform_network_policy_script(
+                allowed_port=ports["allowed"],
+                other_port=ports["other"],
+                guest_port=microvm_tests.PLATFORM_NETWORK_GUEST_PORT,
+            ),
+        )
+        self.assertIsNone(plain_kwargs["post_restore_script"])
+        self.assertEqual(template_kwargs["processors"], 1)
+
+        # Each clone restores the template with its own policy.
+        restores = calls["restores"]
+        self.assertEqual(len(restores), 4)
+        forward_port = None
+        for command, name in zip(
+            restores, ("deny-all", "egress-rules", "forward", "proxy"), strict=True
+        ):
+            with self.subTest(clone=name):
+                self.assertIn("--restore-snapshot", command)
+                self.assertEqual(
+                    command[command.index("--network-profile") + 1], "portable"
+                )
+                self.assertIn("--restore-absent-scratch", command)
+                self.assertEqual(command.count("--microvm-sandbox-block"), 1)
+                self.assertRegex(
+                    command[command.index("--microvm-sandbox-block") + 1],
+                    r"^distro:file:.+,ro$",
+                )
+                self.assertIn("--restore-network-policy", command)
+                if "--host-loopback-forward" in command:
+                    forward_port = int(
+                        command[command.index("--host-loopback-forward") + 1].split(
+                            ":"
+                        )[1]
+                    )
+        self.assertIsNotNone(forward_port)
+        calls["exchange"].assert_called_once_with("127.0.0.1", forward_port, 60)
+        # Each release tells the guest whether the host exchanged a line with
+        # it through a forward, which only the forward clone has.
+        self.assertEqual(
+            calls["releases"],
+            [
+                "NVX-PLATFORM-NETWORK-CHECKED none",
+                "NVX-PLATFORM-NETWORK-CHECKED none",
+                "NVX-PLATFORM-NETWORK-CHECKED forward",
+                "NVX-PLATFORM-NETWORK-CHECKED none",
+            ],
+        )
+        self.assertEqual(
+            logs,
+            sorted(
+                f"platform-network-policy-{name}.log"
+                for name in ("deny-all", "egress-rules", "forward", "proxy")
+            ),
+        )
+
+        # OpenVMM refuses the other restores before the guest runs.
+        failures = calls["expect_failure"].call_args_list
+        self.assertEqual(
+            [entry.args[3] for entry in failures],
+            [
+                *(reason for _, reason in microvm_tests.PLATFORM_NETWORK_REJECTED),
+                microvm_tests.PLATFORM_NETWORK_BUSY_FORWARD_REJECTION,
+                microvm_tests.PLATFORM_NETWORK_NOT_TEMPLATE_REJECTION,
+            ],
+        )
+        (
+            kept_policy,
+            kept_host_loopback,
+            readdressed,
+            foreign_proxy,
+            busy_forward,
+            plain_restore,
+        ) = (entry.args[0] for entry in failures)
+        self.assertNotIn("--restore-network-policy", kept_policy)
+        self.assertNotIn("--restore-network-policy", kept_host_loopback)
+        self.assertEqual(
+            kept_host_loopback[kept_host_loopback.index("--host-loopback") + 1],
+            "allow",
+        )
+        self.assertEqual(readdressed[readdressed.index("--net") + 1], "10.1.0.2/24")
+        self.assertTrue(
+            foreign_proxy[foreign_proxy.index("--network-proxy") + 1].startswith(
+                "10.0.0.9:"
+            )
+        )
+        # The busy forward's host port was held while OpenVMM bound it.
+        self.assertEqual(calls["busy"], [True])
+        for command in (readdressed, foreign_proxy, busy_forward, plain_restore):
+            self.assertIn("--restore-network-policy", command)
+        self.assertEqual(
+            Path(plain_restore[plain_restore.index("--restore-snapshot") + 1]).name,
+            "plain-deny-all",
+        )
+        for entry in failures:
+            self.assertEqual(
+                entry.kwargs["forbidden_markers"],
+                microvm_tests.PLATFORM_NETWORK_GUEST_MARKERS,
+            )
+        # A refusal must come before the clone's guest prints anything, from
+        # its platform repair's report on.
+        self.assertEqual(
+            microvm_tests.PLATFORM_NETWORK_GUEST_MARKERS,
+            (
+                microvm_tests.PLATFORM_POST_RESTORE_MARKER,
+                microvm_tests.PLATFORM_NETWORK_LISTENING_MARKER,
+                benchmark.RESTORE_MARKER,
+            ),
+        )
+        # A cold boot has no captured policy to replace.
+        cold_boot = calls["expect_boot_failure"].call_args.args[0]
+        self.assertEqual(cold_boot[:2], ["openvmm", "boot"])
+        self.assertIn("--restore-network-policy", cold_boot)
+        self.assertNotIn("--restore-snapshot", cold_boot)
+        self.assertEqual(
+            calls["expect_boot_failure"].call_args.args[3], b"--restore-snapshot"
+        )
+
+    def test_platform_network_policy_requires_what_each_policy_admits(self):
+        def guest_reporting(
+            replace: bytes, by: bytes
+        ) -> Callable[[list[str], dict[str, int]], list[bytes]]:
+            def guest(command: list[str], ports: dict[str, int]) -> list[bytes]:
+                return [
+                    line.replace(replace, by)
+                    for line in self._simulate_platform_network_guest(command, ports)
+                ]
+
+            return guest
+
+        for replace, by, message in (
+            # A clone whose NIC changed its identity.
+            (
+                b"mac=52:54:00:00:00:02",
+                b"mac=52:54:00:00:00:03",
+                "did not report 'NVX-PLATFORM-NETWORK-IDENTITY",
+            ),
+            # A clone without its platform repair.
+            (b"tier=platform", b"tier=workload-start", "did not report 'NVX-POST"),
+            # A clone that the template's deny-all let reach a service.
+            (
+                b"allowed=denied other=denied",
+                b"allowed=reached other=denied",
+                "^platform network policy clone deny-all did not report",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._run_platform_network_policy(
+                        Path(temporary), guest=guest_reporting(replace, by)
+                    )
+
+        # The host services must receive exactly the requests that a policy
+        # admits, whatever the guest reports.
+        def guest_reaching_more(
+            command: list[str], ports: dict[str, int]
+        ) -> list[bytes]:
+            lines = self._simulate_platform_network_guest(command, ports)
+            with socket.create_connection(
+                ("127.0.0.1", ports["other"]), timeout=5
+            ) as client:
+                client.sendall(b"GET /other HTTP/1.1\r\n\r\n")
+                while client.recv(4096):
+                    pass
+            return lines
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^platform network policy clone deny-all: the allowed and other "
+                r"host services received \(0, 1\) requests, not \(0, 0\)$",
+            ):
+                self._run_platform_network_policy(
+                    Path(temporary), guest=guest_reaching_more
+                )
+
+    def test_platform_network_refusal_rejects_an_expected_error_after_guest_entry(
+        self,
+    ):
+        error = b"fatal error: " + microvm_tests.PLATFORM_NETWORK_BUSY_FORWARD_REJECTION
+
+        def refuse(output: bytes) -> None:
+            process = MagicMock()
+            process.__enter__.return_value.wait.return_value = (
+                openvmm_process.OpenvmmProcessResult(1, output)
+            )
+            with (
+                tempfile.TemporaryDirectory() as temporary,
+                patch.object(microvm_tests, "OpenvmmProcess", return_value=process),
+            ):
+                microvm_tests._expect_process_failure(
+                    ["openvmm", "restore"],
+                    Path(temporary) / "refused.log",
+                    60,
+                    microvm_tests.PLATFORM_NETWORK_BUSY_FORWARD_REJECTION,
+                    forbidden_markers=microvm_tests.PLATFORM_NETWORK_GUEST_MARKERS,
+                )
+
+        # OpenVMM refused the restore before its guest printed anything.
+        refuse(error + b"\r\n")
+        # The same error after any line of a guest that ran fails the check.
+        for marker in microvm_tests.PLATFORM_NETWORK_GUEST_MARKERS:
+            with (
+                self.subTest(marker=marker),
+                self.assertRaisesRegex(
+                    RuntimeError, "^invalid restore entered the guest before failing$"
+                ),
+            ):
+                refuse(marker + b"\r\n" + error + b"\r\n")
+
+    def test_platform_network_policy_reports_guest_failures(self):
+        def failing_guest(command: list[str], _ports: dict[str, int]) -> list[bytes]:
+            log_path = output_dir / "platform-network-policy-deny-all.log"
+            log_path.write_bytes(
+                b"NVX-PLATFORM-NETWORK-FAIL the TCP server did not listen\r\n"
+            )
+            raise TimeoutError("line marker was not observed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            with self.assertRaises(RuntimeError) as raised:
+                self._run_platform_network_policy(output_dir, guest=failing_guest)
+        self.assertEqual(
+            str(raised.exception),
+            "platform network policy clone deny-all failed: "
+            "NVX-PLATFORM-NETWORK-FAIL the TCP server did not listen; see "
+            f"{output_dir / 'platform-network-policy-deny-all.log'}",
+        )
+        self.assertIsInstance(raised.exception.__cause__, TimeoutError)
+
+    def test_platform_network_policy_keeps_the_template_intact(self):
+        original = ("manifest", "state", "memory", None)
+        changed = ("manifest", "state", "changed", None)
+        for fingerprints, message in (
+            # The capture, then the first clone.
+            ([original, original, changed], "^clone deny-all modified the NIC"),
+            # The capture and the four clones, then the refused restores.
+            (
+                [original] * 6 + [changed],
+                "^a refused restore modified the NIC template$",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._run_platform_network_policy(
+                        Path(temporary), fingerprints=fingerprints
+                    )
+
+    def test_untiered_network_policy_script_reports_the_repair_and_serves_the_host(
+        self,
+    ):
+        script = microvm_tests.untiered_network_policy_script(
+            allowed_port=40001, other_port=40002, guest_port=50001
+        )
+        self.assertNotRegex(script, r"@[A-Z0-9_]+@")
+        # The guest reports the resolver and the announcer that its repair set
+        # up, and probes both host services.
+        self.assertIn("' /etc/resolv.conf 2>/dev/null) ||\n    resolver=none", script)
+        self.assertIn("if pidof nvx-ingress >/dev/null; then", script)
+        self.assertIn('"http://192.0.2.1:$2/$1"', script)
+        self.assertIn("wget -T 2 -qO /tmp/nvx-untiered-network-probe", script)
+        self.assertIn("\nprobe allowed 40001\n", script)
+        self.assertIn("\nprobe other 40002\n", script)
+        self.assertIn(
+            'echo "'
+            + microvm_tests.UNTIERED_NETWORK_REPORT_PREFIX.decode()
+            + 'resolver=$resolver announcer=$announcer allowed=$allowed other=$other"',
+            script,
+        )
+        # The guest's server answers the host, one client at a time, as many
+        # as a restore's host reaches it through.
+        ack = microvm_tests.HOST_LOOPBACK_TCP_ACK.decode().removesuffix("\n")
+        self.assertIn('while [ "$client" -lt 2 ]; do', script)
+        self.assertIn(f"printf '{ack}\\n' |\n            nc -l -p 50001 -w 20", script)
+        self.assertIn("printf '%04X' 50001", script)
+        # Once released, the guest waits for each line that the host sent,
+        # which the release may overtake, before it stops its server.
+        request = microvm_tests.HOST_LOOPBACK_TCP_REQUEST.decode().strip()
+        self.assertIn("read -r release exchanges ||", script)
+        self.assertIn(
+            f'grep -qx {request} \\\n        "/tmp/nvx-untiered-network-inbound-$client"',
+            script,
+        )
+        self.assertLess(
+            script.index("read -r release exchanges"), script.index('kill "$server"')
+        )
+        for marker in (
+            microvm_tests.UNTIERED_NETWORK_LISTENING_MARKER,
+            microvm_tests.UNTIERED_NETWORK_CHECKED,
+        ):
+            self.assertIn(marker.decode(), script)
+        self.assertTrue(
+            script.endswith(
+                'echo "'
+                + microvm_tests.UNTIERED_NETWORK_INBOUND_PREFIX.decode()
+                + '$exchanges"\n'
+            )
+        )
+        self.assertIn(
+            'echo "' + microvm_tests.UNTIERED_NETWORK_FAILURE_MARKER.decode() + ' $1"',
+            script,
+        )
+
+    def test_untiered_network_restores_name_what_their_policies_give_the_guest(self):
+        restores = microvm_tests.untiered_network_restores(
+            allowed_port=40001, host_port=40003, guest_port=50001
+        )
+        self.assertEqual(
+            [
+                (
+                    restore.name,
+                    restore.dns_server,
+                    restore.announces,
+                    restore.allowed,
+                    restore.other,
+                    restore.forward,
+                    restore.publication,
+                    restore.exchanges,
+                    restore.network_settings,
+                )
+                for restore in restores
+            ],
+            [
+                ("deny-all", None, False, False, False, False, None, 0, False),
+                ("egress-dns", "192.0.2.1", False, True, False, False, None, 0, True),
+                (
+                    "host-loopback",
+                    "fd00::c000:201",
+                    True,
+                    False,
+                    False,
+                    True,
+                    "host-loopback",
+                    2,
+                    True,
+                ),
+                (
+                    "private-ingress",
+                    "192.0.2.1",
+                    True,
+                    True,
+                    True,
+                    False,
+                    "private-networks",
+                    1,
+                    True,
+                ),
+            ],
+        )
+        deny_all, egress_dns, host_loopback, private_ingress = restores
+        # A restore without connectivity keeps the template's own policy.
+        self.assertEqual(
+            deny_all.policy, microvm_tests.PLATFORM_NETWORK_TEMPLATE_POLICY
+        )
+        self.assertEqual(
+            egress_dns.policy,
+            (
+                "--network-egress",
+                "deny",
+                "--network-egress-allow",
+                "192.0.2.1/32:udp:53",
+                "--network-egress-allow",
+                "192.0.2.1/32:tcp:40001",
+            ),
+        )
+        self.assertEqual(
+            host_loopback.policy,
+            (
+                "--network-egress",
+                "deny",
+                "--network-egress-allow",
+                "fd00::c000:201/128:udp:53",
+                "--host-loopback",
+                "allow",
+                "--host-loopback-forward",
+                "tcp:40003:50001",
+            ),
+        )
+        self.assertEqual(
+            private_ingress.policy,
+            (
+                "--network-egress",
+                "allow",
+                "--network-ingress",
+                "allow",
+                "--host-loopback",
+                "allow",
+            ),
+        )
+        # Each restore's expectations are what OpenVMM gives its policy.
+        for restore in restores:
+            with self.subTest(restore=restore.name):
+                self.assertEqual(
+                    self._untiered_network_settings(restore.policy, 40001),
+                    (
+                        restore.dns_server,
+                        restore.announces,
+                        restore.allowed,
+                        restore.other,
+                    ),
+                )
+
+    def test_untiered_network_reports_hold_what_each_policy_gives_the_guest(self):
+        restores = {
+            restore.name: restore
+            for restore in microvm_tests.untiered_network_restores(
+                allowed_port=40001, host_port=40003, guest_port=50001
+            )
+        }
+
+        def line(fields: str) -> bytes:
+            return (
+                microvm_tests.UNTIERED_NETWORK_REPORT_PREFIX + fields.encode() + b"\r\n"
+            )
+
+        report = microvm_tests._untiered_network_report(
+            b"NVX-POST-RESTORE-OK: tier=legacy\r\n"
+            + line("resolver=192.0.2.1 announcer=none allowed=reached other=denied"),
+            "restore egress-dns",
+        )
+        self.assertEqual(
+            report,
+            {
+                "resolver": "192.0.2.1",
+                "announcer": "none",
+                "allowed": "reached",
+                "other": "denied",
+            },
+        )
+        microvm_tests._check_untiered_network_report(
+            restores["egress-dns"], report, "restore egress-dns"
+        )
+        # Without a DNS server, the resolver keeps the image's own, which may
+        # name a local resolver but never a gateway.
+        for resolver in ("none", "127.0.0.53"):
+            microvm_tests._check_untiered_network_report(
+                restores["deny-all"],
+                {
+                    "resolver": resolver,
+                    "announcer": "none",
+                    "allowed": "denied",
+                    "other": "denied",
+                },
+                "restore deny-all",
+            )
+
+        def fields(
+            resolver: str, announcer: str, allowed: str, other: str
+        ) -> dict[str, str]:
+            return {
+                "resolver": resolver,
+                "announcer": announcer,
+                "allowed": allowed,
+                "other": other,
+            }
+
+        for name, report, message in (
+            (
+                "egress-dns",
+                fields("none", "none", "reached", "denied"),
+                r"names none, not 192\.0\.2\.1$",
+            ),
+            (
+                "egress-dns",
+                fields("192.0.2.1,127.0.0.53", "none", "reached", "denied"),
+                r"names 192\.0\.2\.1,127\.0\.0\.53, not 192\.0\.2\.1$",
+            ),
+            (
+                "deny-all",
+                fields("192.0.2.1", "none", "denied", "denied"),
+                "although the policy names no DNS server$",
+            ),
+            (
+                "deny-all",
+                fields("127.0.0.53,fd00::c000:201", "none", "denied", "denied"),
+                "although the policy names no DNS server$",
+            ),
+            (
+                "host-loopback",
+                fields("fd00::c000:201", "none", "denied", "denied"),
+                "reported announcer=none$",
+            ),
+            (
+                "egress-dns",
+                fields("192.0.2.1", "running", "reached", "denied"),
+                "reported announcer=running$",
+            ),
+            (
+                "private-ingress",
+                fields("192.0.2.1", "running", "reached", "denied"),
+                "reported other=denied$",
+            ),
+        ):
+            with (
+                self.subTest(name=name, report=report),
+                self.assertRaisesRegex(RuntimeError, f"^restore {name}: .*{message}"),
+            ):
+                microvm_tests._check_untiered_network_report(
+                    restores[name], report, f"restore {name}"
+                )
+
+        valid = line("resolver=none announcer=none allowed=denied other=denied")
+        for output, message in (
+            (b"", "printed 0 network reports, not 1$"),
+            (valid + valid, "printed 2 network reports, not 1$"),
+            (line("resolver=none announcer=none allowed=denied"), "malformed report"),
+            (
+                line("resolver=none announcer=none allowed=denied other=a other=b"),
+                "malformed report",
+            ),
+            (
+                line("resolver announcer=none allowed=denied other=denied"),
+                "malformed report",
+            ),
+        ):
+            with (
+                self.subTest(output=output),
+                self.assertRaisesRegex(RuntimeError, f"^restore deny-all .*{message}"),
+            ):
+                microvm_tests._untiered_network_report(output, "restore deny-all")
+
+    @staticmethod
+    def _untiered_network_settings(
+        policy: Sequence[str], allowed_port: int
+    ) -> tuple[str | None, bool, bool, bool]:
+        """Return what OpenVMM gives the guest of a restore under ``policy``:
+        the DNS server, as its gateway_dns_server derives it, whether the guest
+        announces its listeners, and whether the guest reaches the host service
+        at ``allowed_port`` of the gateway and the other host service."""
+
+        def values(option: str) -> list[str]:
+            return [
+                policy[index + 1]
+                for index, value in enumerate(policy)
+                if value == option
+            ]
+
+        allow_all = values("--network-egress") == ["allow"]
+        rules = values("--network-egress-allow")
+        if allow_all or "192.0.2.1/32:udp:53" in rules:
+            dns_server: str | None = "192.0.2.1"
+        elif "fd00::c000:201/128:udp:53" in rules:
+            dns_server = "fd00::c000:201"
+        else:
+            dns_server = None
+        announces = values("--network-ingress") == ["allow"] or values(
+            "--host-loopback"
+        ) == ["allow"]
+        allowed = allow_all or f"192.0.2.1/32:tcp:{allowed_port}" in rules
+        return dns_server, announces, allowed, allow_all
+
+    def _simulate_untiered_network_guest(
+        self, command: list[str], ports: dict[str, int]
+    ) -> list[bytes]:
+        """Return the lines of the guest that ``command`` restores before its
+        release, after it requests each host service in ``ports`` that its
+        policy admits."""
+        policy = command[command.index("--restore-network-policy") + 1 :]
+        dns_server, announces, allowed, other = self._untiered_network_settings(
+            policy, ports["allowed"]
+        )
+        for name, reached in (("allowed", allowed), ("other", other)):
+            if not reached:
+                continue
+            with socket.create_connection(
+                ("127.0.0.1", ports[name]), timeout=5
+            ) as client:
+                client.sendall(
+                    f"GET /{name} HTTP/1.1\r\nHost: 192.0.2.1\r\n\r\n".encode()
+                )
+                answer = b""
+                while chunk := client.recv(4096):
+                    answer += chunk
+            self.assertTrue(
+                answer.endswith(f"\r\n\r\nNVX-PLATFORM-NETWORK-{name}".encode())
+            )
+        lines: list[bytes] = []
+        if dns_server is not None or announces:
+            lines.append(microvm_tests.UNTIERED_POST_RESTORE_MARKER)
+        lines.append(
+            microvm_tests.UNTIERED_NETWORK_REPORT_PREFIX
+            + (
+                f"resolver={dns_server or 'none'} "
+                f"announcer={'running' if announces else 'none'} "
+                f"allowed={'reached' if allowed else 'denied'} "
+                f"other={'reached' if other else 'denied'}"
+            ).encode()
+        )
+        return lines
+
+    def _run_untiered_network_policy(
+        self,
+        output_dir: Path,
+        *,
+        guest: Callable[[list[str], dict[str, int]], list[bytes]] | None = None,
+        fingerprints: Sequence[tuple[str, str, str]] | None = None,
+        host_addresses: Sequence[str] = ("192.0.2.10",),
+        accepts_tcp: bool = False,
+        exchange: Callable[[str, int, float], None] | None = None,
+    ) -> dict[str, Any]:
+        """Run the scenario with a simulated OpenVMM, whose restores request
+        the scenario's real host services as their policies admit, on a host
+        whose addresses other than loopback are ``host_addresses``, through
+        which a TCP connection completes if ``accepts_tcp``, and with
+        ``exchange`` standing for each exchange with the guest's server, and
+        return its calls."""
+        captures: list[tuple[list[str], dict[str, Any]]] = []
+        restores: list[list[str]] = []
+        releases: list[str] = []
+        ports: dict[str, int] = {}
+
+        def capture(command: list[str], *_args: object, **kwargs: Any) -> None:
+            captures.append((command, kwargs))
+            script = kwargs["post_restore_script"]
+            for name in ("allowed", "other"):
+                match = re.search(rf"\nprobe {name} (\d+)\n", script)
+                assert match is not None
+                ports[name] = int(match[1])
+            match = re.search(r"nc -l -p (\d+) ", script)
+            assert match is not None
+            ports["guest"] = int(match[1])
+
+        simulated_guest = guest or self._simulate_untiered_network_guest
+
+        class FakeProcess:
+            def __init__(self, command: list[str], log_path: Path) -> None:
+                restores.append(command)
+                self.command = command
+                self.log_path = log_path
+                self.lines: list[bytes] = []
+                self.exchanges: bytes | None = None
+
+            def __enter__(self) -> "FakeProcess":
+                return self
+
+            def __exit__(self, *_exception: object) -> None:
+                return None
+
+            def wait_for_line(self, marker: bytes, _timeout: float) -> None:
+                assert marker == microvm_tests.UNTIERED_NETWORK_LISTENING_MARKER
+                self.lines = simulated_guest(self.command, ports)
+
+            def send_line(self, line: str) -> None:
+                releases.append(line)
+                self.exchanges = line.split()[1].encode()
+
+            def wait(self, _timeout: float) -> openvmm_process.OpenvmmProcessResult:
+                assert self.exchanges is not None
+                lines = [
+                    *self.lines,
+                    microvm_tests.UNTIERED_NETWORK_INBOUND_PREFIX + self.exchanges,
+                    benchmark.RESTORE_MARKER,
+                ]
+                output = b"".join(line + b"\r\n" for line in lines)
+                self.log_path.write_bytes(output)
+                return openvmm_process.OpenvmmProcessResult(0, output)
+
+        fingerprint = ("manifest", "state", "memory")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with (
+            patch.object(
+                microvm_tests,
+                "workload_boot_command",
+                return_value=["openvmm", "boot"],
+            ) as workload_boot_command,
+            patch.object(microvm_tests, "capture_snapshot", side_effect=capture),
+            patch.object(microvm_tests, "OpenvmmProcess", FakeProcess),
+            patch.object(
+                microvm_tests, "_host_loopback_tcp_exchange", side_effect=exchange
+            ) as exchange_mock,
+            patch.object(microvm_tests, "_wait_until") as wait_until,
+            patch.object(
+                microvm_tests, "_holds_loopback", return_value=False
+            ) as holds_loopback,
+            patch.object(
+                microvm_tests, "_host_ipv4_addresses", return_value=list(host_addresses)
+            ),
+            patch.object(
+                microvm_tests, "_accepts_tcp", return_value=accepts_tcp
+            ) as accepts_tcp_mock,
+            patch.object(
+                microvm_tests,
+                "_snapshot_fingerprint",
+                side_effect=fingerprints or itertools.repeat(fingerprint),
+            ),
+            patch.object(microvm_tests, "_expect_process_failure") as expect_failure,
+        ):
+            microvm_tests.run_untiered_network_policy(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=60,
+                output_dir=output_dir,
+            )
+        return {
+            "workload_boot_command": workload_boot_command,
+            "captures": captures,
+            "restores": restores,
+            "releases": releases,
+            "exchange": exchange_mock,
+            "wait_until": wait_until,
+            "holds_loopback": holds_loopback,
+            "accepts_tcp": accepts_tcp_mock,
+            "expect_failure": expect_failure,
+            "ports": ports,
+        }
+
+    def test_untiered_network_policy_restores_one_template_with_four_policies(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "logs"
+            calls = self._run_untiered_network_policy(output_dir)
+            logs = sorted(path.name for path in output_dir.iterdir())
+
+        self.assertIn("untiered-network-policy", microvm_tests.MICROVM_TEST_SCENARIOS)
+        # Every guest runs it: the non-sandbox mode captures the template.
+        self.assertNotIn(
+            "untiered-network-policy", microvm_tests.SANDBOX_CONTROL_SCENARIOS
+        )
+        self.assertNotIn(
+            "untiered-network-policy", microvm_tests.UBUNTU_UNSUPPORTED_SCENARIOS
+        )
+        boot_call = calls["workload_boot_command"].call_args
+        self.assertEqual(boot_call.args[5], "")
+        self.assertEqual(
+            boot_call.kwargs["network"], microvm_tests.UNTIERED_NETWORK_CIDR
+        )
+
+        # The template is a snapshot without a tier or sandbox blocks, whose
+        # NIC has the complete deny-all policy.
+        ((template, template_kwargs),) = calls["captures"]
+        self.assertEqual(
+            template[:-2],
+            [
+                "openvmm",
+                "boot",
+                *microvm_tests.PLATFORM_NETWORK_TEMPLATE_POLICY,
+            ],
+        )
+        self.assertEqual(template[-2], "--snapshot-destination")
+        self.assertNotIn("--snapshot-tier", template)
+        self.assertNotIn("--microvm-sandbox-block", template)
+        ports = calls["ports"]
+        self.assertEqual(
+            template_kwargs["post_restore_script"],
+            microvm_tests.untiered_network_policy_script(
+                allowed_port=ports["allowed"],
+                other_port=ports["other"],
+                guest_port=ports["guest"],
+            ),
+        )
+        self.assertEqual(template_kwargs["processors"], 1)
+
+        # Each restore installs its own policy on the template.
+        restores = calls["restores"]
+        names = ("deny-all", "egress-dns", "host-loopback", "private-ingress")
+        forward_port = None
+        for command, name in zip(restores, names, strict=True):
+            with self.subTest(restore=name):
+                self.assertEqual(
+                    command[command.index("--restore-snapshot") + 1], template[-1]
+                )
+                self.assertEqual(
+                    command[command.index("--network-profile") + 1], "portable"
+                )
+                self.assertNotIn("--microvm-sandbox-block", command)
+                self.assertNotIn("--restore-absent-scratch", command)
+                self.assertIn("--restore-network-policy", command)
+                if "--host-loopback-forward" in command:
+                    forward = command[command.index("--host-loopback-forward") + 1]
+                    forward_port = int(forward.split(":")[1])
+                    self.assertEqual(forward, f"tcp:{forward_port}:{ports['guest']}")
+        self.assertIsNotNone(forward_port)
+        self.assertNotEqual(forward_port, ports["guest"])
+        # The host reaches the guest's server through the forward and the port
+        # that a policy publishes, on host loopback alone, which no other host
+        # address reaches, or through another host address for private-network
+        # ingress, and finds it on no host loopback port when the policy
+        # publishes nothing.
+        self.assertEqual(
+            [entry.args for entry in calls["exchange"].call_args_list],
+            [
+                ("127.0.0.1", forward_port, 60),
+                ("127.0.0.1", ports["guest"], 60),
+                ("192.0.2.10", ports["guest"], 60),
+            ],
+        )
+        self.assertEqual(
+            [entry.args for entry in calls["accepts_tcp"].call_args_list],
+            [("192.0.2.10", ports["guest"])],
+        )
+        self.assertEqual(calls["wait_until"].call_count, 2)
+        self.assertEqual(
+            [entry.args for entry in calls["holds_loopback"].call_args_list],
+            [(socket.AF_INET, socket.SOCK_STREAM, ports["guest"])] * 2,
+        )
+        self.assertEqual(
+            calls["releases"],
+            [
+                "NVX-UNTIERED-NETWORK-CHECKED 0",
+                "NVX-UNTIERED-NETWORK-CHECKED 0",
+                "NVX-UNTIERED-NETWORK-CHECKED 2",
+                "NVX-UNTIERED-NETWORK-CHECKED 1",
+            ],
+        )
+        self.assertEqual(
+            logs,
+            sorted(f"untiered-network-policy-{name}.log" for name in names),
+        )
+
+        # OpenVMM refuses the other restores before the guest runs.
+        failures = calls["expect_failure"].call_args_list
+        self.assertEqual(
+            [entry.args[3] for entry in failures],
+            [reason for _, reason in microvm_tests.UNTIERED_NETWORK_REJECTED],
+        )
+        for entry in failures:
+            self.assertEqual(
+                entry.kwargs["forbidden_markers"],
+                microvm_tests.UNTIERED_NETWORK_GUEST_MARKERS,
+            )
+            self.assertNotIn("--restore-network-policy", entry.args[0])
+        kept_policy, ingress = (entry.args[0] for entry in failures)
+        self.assertEqual(kept_policy[-2:], ["--network-egress", "allow"])
+        self.assertEqual(
+            ingress[-6:],
+            [
+                *microvm_tests.PLATFORM_NETWORK_TEMPLATE_POLICY,
+                "--network-ingress",
+                "allow",
+            ],
+        )
+
+    def test_untiered_network_policy_requires_what_each_policy_gives_the_guest(self):
+        def guest_reporting(
+            replace: bytes, by: bytes
+        ) -> Callable[[list[str], dict[str, int]], list[bytes]]:
+            def guest(command: list[str], ports: dict[str, int]) -> list[bytes]:
+                return [
+                    line.replace(replace, by)
+                    for line in self._simulate_untiered_network_guest(command, ports)
+                ]
+
+            return guest
+
+        def guest_dropping(
+            dropped: bytes,
+        ) -> Callable[[list[str], dict[str, int]], list[bytes]]:
+            def guest(command: list[str], ports: dict[str, int]) -> list[bytes]:
+                return [
+                    line
+                    for line in self._simulate_untiered_network_guest(command, ports)
+                    if line != dropped
+                ]
+
+            return guest
+
+        def guest_reporting_completion(
+            command: list[str], ports: dict[str, int]
+        ) -> list[bytes]:
+            lines = self._simulate_untiered_network_guest(command, ports)
+            if microvm_tests.UNTIERED_POST_RESTORE_MARKER in lines:
+                return lines
+            return [microvm_tests.UNTIERED_POST_RESTORE_MARKER, *lines]
+
+        for guest, message in (
+            # A guest whose repair did not name the policy's DNS server.
+            (
+                guest_reporting(b"resolver=192.0.2.1", b"resolver=none"),
+                r"^untiered network policy restore egress-dns: the guest's "
+                r"resolver names none, not 192\.0\.2\.1$",
+            ),
+            # A guest whose repair started no announcer.
+            (
+                guest_reporting(b"announcer=running", b"announcer=none"),
+                "^untiered network policy restore host-loopback: the guest "
+                "reported announcer=none$",
+            ),
+            # A guest whose repair applied settings without reporting it.
+            (
+                guest_dropping(microvm_tests.UNTIERED_POST_RESTORE_MARKER),
+                "^untiered network policy restore egress-dns: the guest's repair "
+                "did not report 'NVX-POST-RESTORE-OK: tier=legacy'$",
+            ),
+            # A guest without settings whose repair did not finish quietly.
+            (
+                guest_reporting_completion,
+                "^untiered network policy restore deny-all: the guest's repair "
+                "reported 'NVX-POST-RESTORE-OK: tier=legacy'$",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._run_untiered_network_policy(Path(temporary), guest=guest)
+
+        # The host services must receive exactly the requests that a policy
+        # admits, whatever the guest reports.
+        def guest_reaching_more(
+            command: list[str], ports: dict[str, int]
+        ) -> list[bytes]:
+            lines = self._simulate_untiered_network_guest(command, ports)
+            with socket.create_connection(
+                ("127.0.0.1", ports["other"]), timeout=5
+            ) as client:
+                client.sendall(b"GET /other HTTP/1.1\r\n\r\n")
+                while client.recv(4096):
+                    pass
+            return lines
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^untiered network policy restore deny-all: the allowed and "
+                r"other host services received \(0, 1\) requests, not \(0, 0\)$",
+            ):
+                self._run_untiered_network_policy(
+                    Path(temporary), guest=guest_reaching_more
+                )
+
+    def test_untiered_network_policy_reports_guest_failures(self):
+        def failing_guest(_command: list[str], _ports: dict[str, int]) -> list[bytes]:
+            log_path = output_dir / "untiered-network-policy-deny-all.log"
+            log_path.write_bytes(
+                b"NVX-UNTIERED-NETWORK-FAIL the TCP server did not listen\r\n"
+            )
+            raise TimeoutError("line marker was not observed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            with self.assertRaises(RuntimeError) as raised:
+                self._run_untiered_network_policy(output_dir, guest=failing_guest)
+        self.assertEqual(
+            str(raised.exception),
+            "untiered network policy restore deny-all failed: "
+            "NVX-UNTIERED-NETWORK-FAIL the TCP server did not listen; see "
+            f"{output_dir / 'untiered-network-policy-deny-all.log'}",
+        )
+        self.assertIsInstance(raised.exception.__cause__, TimeoutError)
+
+    def test_untiered_network_policy_checks_where_ingress_publishes_the_guest_port(
+        self,
+    ):
+        def loopback_only(address: str, port: int, _timeout: float) -> None:
+            # A listener on host loopback alone, which the wildcard bind probe
+            # cannot tell from one on every host address.
+            if address != "127.0.0.1":
+                raise TimeoutError(f"{address}:{port} did not answer")
+
+        cases: tuple[tuple[dict[str, Any], str, str], ...] = (
+            # Private-network ingress that published the guest's port on host
+            # loopback alone.
+            (
+                {"exchange": loopback_only},
+                "private-ingress",
+                r"^192\.0\.2\.10:\d+ did not answer$",
+            ),
+            # Host-loopback access that published the guest's port on another
+            # host address too.
+            (
+                {"accepts_tcp": True},
+                "host-loopback",
+                r"^host-loopback access published guest port \d+ on 192\.0\.2\.10$",
+            ),
+            # A host without an address through which to reach the port that
+            # private-network ingress publishes.
+            (
+                {"host_addresses": ()},
+                "private-ingress",
+                "^the host has no known IPv4 address other than loopback, ",
+            ),
+        )
+        for options, restore, cause in cases:
+            with (
+                self.subTest(restore=restore, cause=cause),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    f"^untiered network policy restore {restore} failed; see ",
+                ) as raised:
+                    self._run_untiered_network_policy(Path(temporary), **options)
+                self.assertRegex(str(raised.exception.__cause__), cause)
+
+    def test_untiered_network_policy_keeps_the_template_intact(self):
+        original = ("manifest", "state", "memory")
+        changed = ("manifest", "state", "changed")
+        for fingerprints, message in (
+            # The capture, then the first restore.
+            ([original, original, changed], "^restore deny-all modified the NIC"),
+            # The capture and the four restores, then the refused restores.
+            (
+                [original] * 6 + [changed],
+                "^a refused restore modified the NIC template$",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._run_untiered_network_policy(
+                        Path(temporary), fingerprints=fingerprints
+                    )
+
+    def test_platform_filesystem_script_uses_the_share_that_the_restore_attaches(
+        self,
+    ):
+        script = microvm_tests._read_script("platform-filesystem.sh")
+        self.assertIn("\nmount -t virtiofs microvm /mnt/late ||", script)
+        self.assertIn('seed="$(cat /mnt/late/host-seed)"', script)
+        self.assertIn(
+            f'[ "$seed" = {microvm_tests.PLATFORM_FILESYSTEM_HOST_SEED.decode()} ]',
+            script,
+        )
+        self.assertIn(
+            f"\nprintf {microvm_tests.PLATFORM_FILESYSTEM_GUEST_RESULT.decode()} "
+            ">/mnt/late/guest-result ||",
+            script,
+        )
+        self.assertIn(
+            f'echo "{microvm_tests.PLATFORM_FILESYSTEM_FAILURE_MARKER.decode()} $1"',
+            script,
+        )
+        self.assertTrue(
+            script.endswith(
+                f"\necho {microvm_tests.PLATFORM_FILESYSTEM_MARKER.decode()}\n"
+            )
+        )
+
+    def _run_platform_filesystem(
+        self,
+        output_dir: Path,
+        measure_once: MagicMock,
+        *,
+        fingerprints: Sequence[tuple[str, str, str, str | None]] | None = None,
+        capture: Callable[..., None] | None = None,
+    ) -> tuple[MagicMock, MagicMock]:
+        fingerprint = ("manifest", "state", "memory", None)
+        with (
+            patch.object(
+                microvm_tests,
+                "workload_boot_command",
+                return_value=["openvmm", "boot"],
+            ) as workload_boot_command,
+            patch.object(
+                microvm_tests, "capture_snapshot", side_effect=capture
+            ) as capture_snapshot,
+            patch.object(microvm_tests, "measure_once", measure_once),
+            patch.object(
+                microvm_tests,
+                "_scratch_snapshot_fingerprint",
+                side_effect=fingerprints or itertools.repeat(fingerprint),
+            ),
+        ):
+            microvm_tests.run_platform_filesystem(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=60,
+                output_dir=output_dir,
+            )
+        return workload_boot_command, capture_snapshot
+
+    @staticmethod
+    def _platform_filesystem_share(command: list[str]) -> Path:
+        mount = command[command.index("--mount") + 1]
+        guest_target, rest = mount.split(",", 1)
+        host_path, mode = rest.rsplit(",", 1)
+        if (guest_target, mode) != ("/mnt/late", "rw"):
+            raise AssertionError(f"unexpected --mount {mount!r}")
+        return Path(host_path)
+
+    @classmethod
+    def _platform_filesystem_measure(
+        cls,
+        output: bytes | None = None,
+        *,
+        result: bytes | None = microvm_tests.PLATFORM_FILESYSTEM_GUEST_RESULT,
+        on_restore: Callable[[list[str]], None] | None = None,
+    ) -> MagicMock:
+        def measure(command: list[str], **kwargs: object) -> None:
+            if on_restore is not None:
+                on_restore(command)
+            if result is not None:
+                share = cls._platform_filesystem_share(command)
+                (share / "guest-result").write_bytes(result)
+            log_path = cast(Path, kwargs["log_path"])
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_bytes(
+                output
+                if output is not None
+                else microvm_tests.PLATFORM_POST_RESTORE_MARKER
+                + b"\r\n"
+                + microvm_tests.PLATFORM_FILESYSTEM_MARKER
+                + b"\r\n"
+                + benchmark.RESTORE_MARKER
+                + b"\r\n"
+            )
+
+        return MagicMock(side_effect=measure)
+
+    def test_platform_filesystem_attaches_the_share_at_the_restore(self):
+        def blocks(command: list[str]) -> list[str]:
+            return [
+                command[index + 1]
+                for index, argument in enumerate(command)
+                if argument == "--microvm-sandbox-block"
+            ]
+
+        seeds: list[bytes] = []
+
+        def on_restore(command: list[str]) -> None:
+            share = self._platform_filesystem_share(command)
+            seeds.append((share / "host-seed").read_bytes())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "logs"
+            measure_once = self._platform_filesystem_measure(on_restore=on_restore)
+            workload_boot_command, capture_snapshot = self._run_platform_filesystem(
+                output_dir, measure_once
+            )
+            logs = sorted(path.name for path in output_dir.iterdir())
+
+        self.assertIn("platform-filesystem", microvm_tests.MICROVM_TEST_SCENARIOS)
+        self.assertIn("platform-filesystem", microvm_tests.SANDBOX_CONTROL_SCENARIOS)
+        # A platform command line carries no caller tokens.
+        self.assertEqual(workload_boot_command.call_args.args[5], "")
+        # The capture leaves the filesystem slot dormant.
+        capture_command = capture_snapshot.call_args.args[0]
+        self.assertNotIn("--mount", capture_command)
+        self.assertEqual(
+            capture_command[capture_command.index("--snapshot-tier") + 1], "platform"
+        )
+        capture_blocks = blocks(capture_command)
+        self.assertEqual(len(capture_blocks), 2)
+        self.assertRegex(capture_blocks[0], r"^distro:file:.+,ro$")
+        self.assertRegex(capture_blocks[1], r"^scratch:file:.+(?<!,ro)$")
+        self.assertEqual(capture_snapshot.call_args.kwargs["processors"], 1)
+        self.assertEqual(
+            capture_snapshot.call_args.kwargs["post_restore_script"],
+            microvm_tests._read_script("platform-filesystem.sh"),
+        )
+
+        # One clone restores the snapshot with a fresh scratch and attaches the
+        # share, which holds the host's seed, to the dormant slot.
+        measure_once.assert_called_once()
+        restore = measure_once.call_args.args[0]
+        self.assertIn("--restore-snapshot", restore)
+        restore_blocks = blocks(restore)
+        self.assertEqual(restore_blocks[0], capture_blocks[0])
+        self.assertRegex(restore_blocks[1], r"^scratch:file:.+(?<!,ro)$")
+        self.assertNotEqual(restore_blocks[1], capture_blocks[1])
+        self.assertEqual(seeds, [microvm_tests.PLATFORM_FILESYSTEM_HOST_SEED])
+        self.assertEqual(
+            measure_once.call_args.kwargs["environment"]["OPENVMM_LOG"], "off"
+        )
+        self.assertTrue(measure_once.call_args.kwargs["guest_exit_prequeued"])
+        self.assertEqual(
+            measure_once.call_args.kwargs["failure_marker"],
+            microvm_tests.PLATFORM_FILESYSTEM_FAILURE_MARKER,
+        )
+        self.assertEqual(logs, ["platform-filesystem-restore.log"])
+
+    def test_platform_filesystem_requires_the_platform_repair_and_the_guest_check(
+        self,
+    ):
+        complete = (
+            microvm_tests.PLATFORM_POST_RESTORE_MARKER,
+            microvm_tests.PLATFORM_FILESYSTEM_MARKER,
+        )
+        for missing in complete:
+            output = b"".join(
+                marker + b"\r\n" for marker in complete if marker != missing
+            )
+            with (
+                self.subTest(missing=missing),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^platform filesystem restore did not report "
+                    + re.escape(repr(missing.decode()))
+                    + "$",
+                ):
+                    self._run_platform_filesystem(
+                        Path(temporary), self._platform_filesystem_measure(output)
+                    )
+
+    def test_platform_filesystem_requires_the_guest_result_on_the_host(self):
+        for result in (None, b"NVX-GUEST-TO-HOS"):
+            with (
+                self.subTest(result=result),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^platform filesystem restore did not write the guest's result$",
+                ):
+                    self._run_platform_filesystem(
+                        Path(temporary),
+                        self._platform_filesystem_measure(result=result),
+                    )
+
+    def test_platform_filesystem_reports_guest_failures(self):
+        failure = benchmark.GuestFailureReported(
+            "NVX-PLATFORM-FILESYSTEM-FAIL read", "tail"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(RuntimeError) as raised:
+                self._run_platform_filesystem(
+                    Path(temporary), MagicMock(side_effect=failure)
+                )
+        self.assertEqual(
+            str(raised.exception),
+            "platform filesystem restore: guest reported "
+            "NVX-PLATFORM-FILESYSTEM-FAIL read\n"
+            "--- OpenVMM output ---\ntail",
+        )
+
+    def test_platform_filesystem_keeps_the_snapshot_intact(self):
+        original = ("manifest", "state", "memory", None)
+        changed = ("manifest", "state", "changed", None)
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "^platform filesystem restore modified snapshot artifacts$",
+            ):
+                self._run_platform_filesystem(
+                    Path(temporary),
+                    self._platform_filesystem_measure(),
+                    # The capture, then the clone.
+                    fingerprints=[original, changed],
+                )
+
+    def test_platform_aggregate_export_script_mounts_and_checks_the_aggregate(self):
+        script = microvm_tests._read_script("platform-aggregate-export.sh")
+        # The clone keeps its captured command line, which discovers the slot
+        # but names no filesystem, so the guest mounts the aggregate itself.
+        self.assertIn(
+            "\ngrep -q 'virtio_mmio.device=0x1000@0xd0001000:6' /proc/cmdline ||",
+            script,
+        )
+        self.assertIn(
+            "\nif grep -Eq '(^| )(virtfs_|nvx_share=)' /proc/cmdline;", script
+        )
+        self.assertIn('\nmount -t virtiofs microvm "$shares" ||', script)
+        self.assertIn(r"""[ "$(ls "$shares" | tr '\n' ' ')" = "0 1 2 3 4 " ]""", script)
+        # It checks every child of the aggregate, and binds a directory and a
+        # file child where it needs them.
+        for child in range(5):
+            self.assertIn(f'"$shares/{child}', script)
+        self.assertIn('\nmount --bind "$shares/0" /workspace ||', script)
+        self.assertIn('\nmount --bind "$shares/3" /config/settings.json ||', script)
+        self.assertIn(
+            "\n    echo "
+            f'"{microvm_tests.PLATFORM_AGGREGATE_FAILURE_MARKER.decode()} $1"\n',
+            script,
+        )
+        self.assertTrue(
+            script.endswith(
+                f"\necho {microvm_tests.PLATFORM_AGGREGATE_MARKER.decode()}\n"
+            )
+        )
+
+    def _run_platform_aggregate_export(
+        self,
+        output_dir: Path,
+        measure_once: MagicMock,
+        *,
+        fingerprints: Sequence[tuple[str, str, str, str | None]] | None = None,
+        refused: Callable[..., None] | None = None,
+        platform: str = "linux",
+    ) -> tuple[MagicMock, MagicMock, MagicMock]:
+        fingerprint = ("manifest", "state", "memory", None)
+        with (
+            patch.object(
+                microvm_tests,
+                "workload_boot_command",
+                return_value=["openvmm", "boot"],
+            ) as workload_boot_command,
+            patch.object(microvm_tests, "capture_snapshot") as capture_snapshot,
+            patch.object(microvm_tests, "measure_once", measure_once),
+            patch.object(
+                microvm_tests,
+                "_scratch_snapshot_fingerprint",
+                side_effect=fingerprints or itertools.repeat(fingerprint),
+            ),
+            patch.object(
+                microvm_tests, "_expect_process_failure", side_effect=refused
+            ) as expect_failure,
+            patch.object(microvm_tests.sys, "platform", platform),
+        ):
+            microvm_tests.run_platform_aggregate_export(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=128,
+                timeout=60,
+                output_dir=output_dir,
+            )
+        return workload_boot_command, capture_snapshot, expect_failure
+
+    @staticmethod
+    def _aggregate_children(command: list[str]) -> list[tuple[str, Path, str]]:
+        """Return the name, host path, and flags of each `--mount-child` of
+        `command`, in order."""
+        children: list[tuple[str, Path, str]] = []
+        for index, argument in enumerate(command):
+            if argument == "--mount-child":
+                name, rest = command[index + 1].split(",", 1)
+                host_path, flags = rest.split(",", 1) if "," in rest else (rest, "")
+                children.append((name, Path(host_path), flags))
+        return children
+
+    @staticmethod
+    def _option_values(command: list[str], option: str) -> list[str]:
+        return [
+            command[index + 1]
+            for index, argument in enumerate(command)
+            if argument == option
+        ]
+
+    @staticmethod
+    def _aggregate_guest(children: list[tuple[str, Path, str]]) -> None:
+        """Change the host trees as the clone's guest does through the
+        aggregate."""
+        roots = {name: host_path for name, host_path, _ in children}
+        (roots["0"] / "from-guest").write_bytes(b"NVX-GUEST-WRITE\n")
+        (roots["0"] / "guest-directory").mkdir()
+        with (roots["2"] / "notes one.txt").open("ab") as notes:
+            notes.write(b"NVX-GUEST-NOTE\n")
+        roots["4"].write_bytes(b"NVX-GUEST-OUTPUT\n")
+
+    @classmethod
+    def _platform_aggregate_measure(
+        cls,
+        output: bytes | None = None,
+        *,
+        guest: Callable[[list[tuple[str, Path, str]]], None] | None = None,
+        on_restore: Callable[[list[str]], None] | None = None,
+    ) -> MagicMock:
+        def measure(command: list[str], **kwargs: object) -> None:
+            if on_restore is not None:
+                on_restore(command)
+            (guest or cls._aggregate_guest)(cls._aggregate_children(command))
+            log_path = cast(Path, kwargs["log_path"])
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_bytes(
+                output
+                if output is not None
+                else microvm_tests.PLATFORM_POST_RESTORE_MARKER
+                + b"\r\n"
+                + microvm_tests.PLATFORM_AGGREGATE_MARKER
+                + b"\r\n"
+                + benchmark.RESTORE_MARKER
+                + b"\r\n"
+            )
+
+        return MagicMock(side_effect=measure)
+
+    def test_platform_aggregate_export_attaches_an_aggregate_at_the_restore(self):
+        def blocks(command: list[str]) -> list[str]:
+            return self._option_values(command, "--microvm-sandbox-block")
+
+        trees: dict[str, dict[str, bytes | None]] = {}
+
+        def on_restore(command: list[str]) -> None:
+            for name, host_path, flags in self._aggregate_children(command):
+                trees[name] = (
+                    {"": host_path.read_bytes()}
+                    if flags.endswith("file")
+                    else microvm_tests._tree_contents(host_path)
+                )
+
+        # Each refused restore requests an aggregate that a cold boot refuses
+        # for the reason that the scenario expects.
+        refusals: list[str] = []
+
+        def refused(command: list[str], *args: object, **_kwargs: object) -> None:
+            reason = cast(bytes, args[2])
+            children = self._aggregate_children(command)
+            roots = [host_path for _, host_path, _ in children]
+            denied = [
+                Path(path) for path in self._option_values(command, "--mount-deny")
+            ]
+            if reason == b"must not overlap":
+                (_, first, _), (_, second, _) = children
+                self.assertTrue(second.is_relative_to(first))
+                refusals.append(
+                    "overlap" if first.is_dir() and second.is_dir() else "file"
+                )
+            elif reason == b"not a regular file":
+                ((_, host_path, flags),) = children
+                self.assertTrue(host_path.is_dir())
+                self.assertEqual(flags, "ro,file")
+                refusals.append("directory-as-file")
+            elif reason == b"not a plain directory":
+                ((_, host_path, flags),) = children
+                self.assertTrue(host_path.is_file())
+                self.assertEqual(flags, "ro")
+                refusals.append("file-as-directory")
+            elif reason == b"not unique":
+                self.assertEqual([name for name, _, _ in children], ["same", "same"])
+                self.assertTrue(all(root.is_dir() for root in roots))
+                refusals.append("repeated-name")
+            elif reason == b"exposes the file":
+                file_children = [
+                    host_path
+                    for _, host_path, flags in children
+                    if flags.endswith("file")
+                ]
+                self.assertIn(denied[-1], file_children)
+                refusals.append("file-policy")
+            elif reason == b"outside the filesystem export roots":
+                self.assertTrue(denied[-1].is_dir())
+                self.assertFalse(any(denied[-1].is_relative_to(root) for root in roots))
+                refusals.append("outside-policy")
+            elif reason == b"absolute host path":
+                self.assertFalse(denied[-1].is_absolute())
+                refusals.append("relative-policy")
+            else:
+                self.fail(f"unexpected refusal {reason!r}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary) / "logs"
+            measure_once = self._platform_aggregate_measure(on_restore=on_restore)
+            (
+                workload_boot_command,
+                capture_snapshot,
+                expect_failure,
+            ) = self._run_platform_aggregate_export(
+                output_dir, measure_once, refused=refused
+            )
+            logs = sorted(path.name for path in output_dir.iterdir())
+
+        self.assertIn("platform-aggregate-export", microvm_tests.MICROVM_TEST_SCENARIOS)
+        self.assertIn(
+            "platform-aggregate-export", microvm_tests.SANDBOX_CONTROL_SCENARIOS
+        )
+        # A platform command line carries no caller tokens, and the capture
+        # leaves the filesystem slot dormant.
+        self.assertEqual(workload_boot_command.call_args.args[5], "")
+        capture_command = capture_snapshot.call_args.args[0]
+        self.assertNotIn("--mount", capture_command)
+        self.assertNotIn("--mount-aggregate", capture_command)
+        self.assertEqual(
+            capture_command[capture_command.index("--snapshot-tier") + 1], "platform"
+        )
+        capture_blocks = blocks(capture_command)
+        self.assertEqual(len(capture_blocks), 2)
+        self.assertRegex(capture_blocks[0], r"^distro:file:.+,ro$")
+        self.assertRegex(capture_blocks[1], r"^scratch:file:.+(?<!,ro)$")
+        self.assertEqual(capture_snapshot.call_args.kwargs["processors"], 1)
+        self.assertEqual(
+            capture_snapshot.call_args.kwargs["post_restore_script"],
+            microvm_tests._read_script("platform-aggregate-export.sh"),
+        )
+
+        # One clone restores the snapshot with a fresh scratch and attaches the
+        # aggregate of the filesystem-shares scenario to the dormant slot.
+        measure_once.assert_called_once()
+        restore = measure_once.call_args.args[0]
+        self.assertIn("--restore-snapshot", restore)
+        restore_blocks = blocks(restore)
+        self.assertEqual(restore_blocks[0], capture_blocks[0])
+        self.assertRegex(restore_blocks[1], r"^scratch:file:.+(?<!,ro)$")
+        self.assertNotEqual(restore_blocks[1], capture_blocks[1])
+        self.assertEqual(
+            self._option_values(restore, "--mount-aggregate"), ["/run/nvx/shares"]
+        )
+        children = self._aggregate_children(restore)
+        self.assertEqual(
+            [(name, flags) for name, _, flags in children],
+            [("0", "rw"), ("1", "ro"), ("2", "rw"), ("3", "ro,file"), ("4", "rw,file")],
+        )
+        workspace, toolcache, data, settings, output = (
+            host_path for _, host_path, _ in children
+        )
+        self.assertEqual(
+            self._option_values(restore, "--mount-deny"),
+            [str(data), str(workspace / "secrets"), str(toolcache / "credentials")],
+        )
+        self.assertEqual(
+            self._option_values(restore, "--mount-allow"),
+            [str(data / "public"), str(data / "notes one.txt")],
+        )
+        self.assertEqual(
+            self._option_values(restore, "--mount-write"), [str(data / "notes one.txt")]
+        )
+        self.assertNotIn("--mount-owner", restore)
+        self.assertEqual(
+            trees,
+            {
+                "0": {
+                    "secrets": None,
+                    "secrets/token": b"NVX-SECRET",
+                    "seed": b"NVX-WORKSPACE",
+                },
+                "1": {
+                    "credentials": None,
+                    "credentials/token": b"NVX-CREDENTIAL",
+                    "seed": b"NVX-TOOLCACHE",
+                    "tools": None,
+                    "tools/node": b"NVX-TOOL",
+                },
+                "2": {
+                    "notes one.txt": b"NVX-NOTES\n",
+                    "private.txt": b"NVX-PRIVATE",
+                    "public": None,
+                    "public/readme": b"NVX-PUBLIC",
+                },
+                "3": {"": b"NVX-SETTINGS"},
+                "4": {"": b"NVX-OUTPUT\n"},
+            },
+        )
+        # Neither file child shares its directory, which holds another file.
+        self.assertEqual(settings.name, "settings.json")
+        self.assertEqual(output.name, "output.txt")
+        self.assertEqual(
+            measure_once.call_args.kwargs["environment"]["OPENVMM_LOG"], "off"
+        )
+        self.assertTrue(measure_once.call_args.kwargs["guest_exit_prequeued"])
+        self.assertEqual(
+            measure_once.call_args.kwargs["failure_marker"],
+            microvm_tests.PLATFORM_AGGREGATE_FAILURE_MARKER,
+        )
+        self.assertEqual(logs, ["platform-aggregate-export-restore.log"])
+
+        # OpenVMM refuses the other restores before the guest runs.
+        self.assertEqual(
+            [entry.args[3] for entry in expect_failure.call_args_list],
+            [reason for _, reason in microvm_tests.PLATFORM_AGGREGATE_REJECTED],
+        )
+        self.assertEqual(
+            [entry.args[1].name for entry in expect_failure.call_args_list],
+            [
+                f"platform-aggregate-export-rejected-{name}.log"
+                for name, _ in microvm_tests.PLATFORM_AGGREGATE_REJECTED
+            ],
+        )
+        self.assertEqual(
+            refusals,
+            [
+                "overlap",
+                "file",
+                "directory-as-file",
+                "file-as-directory",
+                "repeated-name",
+                "file-policy",
+                "outside-policy",
+                "relative-policy",
+            ],
+        )
+        for entry in expect_failure.call_args_list:
+            self.assertIn("--restore-snapshot", entry.args[0])
+            self.assertEqual(blocks(entry.args[0]), restore_blocks)
+            self.assertNotIn("--mount-owner", entry.args[0])
+            self.assertEqual(
+                entry.kwargs["forbidden_markers"],
+                (
+                    microvm_tests.PLATFORM_POST_RESTORE_MARKER,
+                    microvm_tests.PLATFORM_AGGREGATE_MARKER,
+                    benchmark.RESTORE_MARKER,
+                ),
+            )
+
+    def test_platform_aggregate_export_refuses_caller_ownership_on_windows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, expect_failure = self._run_platform_aggregate_export(
+                Path(temporary), self._platform_aggregate_measure(), platform="win32"
+            )
+        rejected = len(microvm_tests.PLATFORM_AGGREGATE_REJECTED)
+        self.assertEqual(len(expect_failure.call_args_list), rejected + 1)
+        owner = expect_failure.call_args_list[-1]
+        self.assertEqual(
+            owner.args[3], microvm_tests.PLATFORM_AGGREGATE_OWNER_REJECTION
+        )
+        self.assertEqual(
+            owner.args[1].name, "platform-aggregate-export-rejected-caller-owner.log"
+        )
+        # The restore is the clone's, with caller ownership.
+        self.assertEqual(owner.args[0][-2:], ["--mount-owner", "caller"])
+        self.assertEqual(len(self._aggregate_children(owner.args[0])), 5)
+
+    def test_platform_aggregate_export_requires_the_platform_repair_and_the_check(
+        self,
+    ):
+        complete = (
+            microvm_tests.PLATFORM_POST_RESTORE_MARKER,
+            microvm_tests.PLATFORM_AGGREGATE_MARKER,
+        )
+        for missing in complete:
+            output = b"".join(
+                marker + b"\r\n" for marker in complete if marker != missing
+            )
+            with (
+                self.subTest(missing=missing),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^platform aggregate export restore did not report "
+                    + re.escape(repr(missing.decode()))
+                    + "$",
+                ):
+                    self._run_platform_aggregate_export(
+                        Path(temporary), self._platform_aggregate_measure(output)
+                    )
+
+    def test_platform_aggregate_export_requires_exactly_the_guest_changes(self):
+        def guest_then(
+            change: Callable[[dict[str, Path]], object],
+        ) -> Callable[[list[tuple[str, Path, str]]], None]:
+            def guest(children: list[tuple[str, Path, str]]) -> None:
+                self._aggregate_guest(children)
+                change({name: host_path for name, host_path, _ in children})
+
+            return guest
+
+        def skip_write(children: list[tuple[str, Path, str]]) -> None:
+            roots = {name: host_path for name, host_path, _ in children}
+            (roots["0"] / "guest-directory").mkdir()
+
+        def skip_directory(children: list[tuple[str, Path, str]]) -> None:
+            roots = {name: host_path for name, host_path, _ in children}
+            (roots["0"] / "from-guest").write_bytes(b"NVX-GUEST-WRITE\n")
+
+        for name, guest, message in (
+            ("missing write", skip_write, "did not write to the read-write directory"),
+            (
+                "missing directory",
+                skip_directory,
+                "did not create the guest's directory",
+            ),
+            (
+                "denied path",
+                guest_then(
+                    lambda roots: (roots["0"] / "secrets" / "token").write_bytes(b"x")
+                ),
+                "changed a denied path",
+            ),
+            (
+                "read-only directory",
+                guest_then(lambda roots: (roots["1"] / "mutation").write_bytes(b"x")),
+                "changed the read-only directory",
+            ),
+            (
+                "data beyond the notes",
+                guest_then(
+                    lambda roots: (roots["2"] / "private.txt").write_bytes(b"x")
+                ),
+                "changed the data directory beyond its writable path",
+            ),
+            (
+                "read-only file",
+                guest_then(lambda roots: roots["3"].write_bytes(b"x")),
+                "changed the shared files' directories",
+            ),
+            (
+                "file's directory",
+                guest_then(
+                    lambda roots: (roots["4"].parent / "added").write_bytes(b"x")
+                ),
+                "changed the shared files' directories",
+            ),
+        ):
+            with (
+                self.subTest(name=name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "^platform aggregate export restore " + message
+                ):
+                    self._run_platform_aggregate_export(
+                        Path(temporary), self._platform_aggregate_measure(guest=guest)
+                    )
+
+    def test_platform_aggregate_export_reports_guest_failures(self):
+        failure = benchmark.GuestFailureReported(
+            "NVX-PLATFORM-AGGREGATE-FAIL mount", "tail"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(RuntimeError) as raised:
+                self._run_platform_aggregate_export(
+                    Path(temporary), MagicMock(side_effect=failure)
+                )
+        self.assertEqual(
+            str(raised.exception),
+            "platform aggregate export restore: guest reported "
+            "NVX-PLATFORM-AGGREGATE-FAIL mount\n"
+            "--- OpenVMM output ---\ntail",
+        )
+
+    def test_platform_aggregate_export_keeps_the_snapshot_and_the_trees_intact(self):
+        original = ("manifest", "state", "memory", None)
+        changed = ("manifest", "state", "changed", None)
+        for fingerprints, message in (
+            # The capture, then the clone.
+            (
+                [original, changed],
+                "^platform aggregate export restore modified snapshot artifacts$",
+            ),
+            # The capture, the clone, then the refused restores.
+            (
+                [original, original, changed],
+                "^a refused platform aggregate export restore modified snapshot "
+                "artifacts$",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self._run_platform_aggregate_export(
+                        Path(temporary),
+                        self._platform_aggregate_measure(),
+                        fingerprints=fingerprints,
+                    )
+
+        def refused_then(
+            change: Callable[[dict[str, Path]], object],
+        ) -> Callable[..., None]:
+            def refused(command: list[str], *_args: object, **_kwargs: object) -> None:
+                # A refused restore of the whole aggregate that reached the
+                # guest might write to a share.
+                children = self._aggregate_children(command)
+                if len(children) == 5:
+                    change({name: host_path for name, host_path, _ in children})
+
+            return refused
+
+        changes: tuple[tuple[str, Callable[[dict[str, Path]], object]], ...] = (
+            (
+                "workspace",
+                lambda roots: (roots["0"] / "secrets" / "token").write_bytes(b"x"),
+            ),
+            ("data", lambda roots: (roots["2"] / "private.txt").write_bytes(b"x")),
+        )
+        for tree, change in changes:
+            with (
+                self.subTest(tree=tree),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "^a refused platform aggregate export restore changed a shared "
+                    "tree$",
+                ):
+                    self._run_platform_aggregate_export(
+                        Path(temporary),
+                        self._platform_aggregate_measure(),
+                        refused=refused_then(change),
+                    )
+
     def test_restore_downtime_shares_one_window_and_waits_for_the_restore_marker(
         self,
     ):
@@ -8291,7 +13679,7 @@ class MicrovmTests(unittest.TestCase):
         with patch.object(
             microvm_tests,
             "run_guest_script",
-            return_value={"text": self._exhaustive_report(8)},
+            return_value=_guest_script_result(self._exhaustive_report(8)),
         ) as run:
             microvm_tests.run_time_abi_conformance(
                 Path("openvmm"),
@@ -8321,7 +13709,7 @@ class MicrovmTests(unittest.TestCase):
         with patch.object(
             microvm_tests,
             "run_guest_script",
-            return_value={"text": self._exhaustive_report(1)},
+            return_value=_guest_script_result(self._exhaustive_report(1)),
         ) as run:
             microvm_tests.run_time_abi_conformance(
                 Path("openvmm"),
@@ -8683,7 +14071,67 @@ class MicrovmTests(unittest.TestCase):
             )
             managed_exec.assert_not_called()
 
-    def test_runner_runs_public_sandbox_scenarios_only_when_named(self):
+    def test_runner_dispatches_public_sandbox_proxy_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "kvm",
+                    "--scenario",
+                    "sandbox-proxy-only",
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(microvm_tests, "require_file", side_effect=require),
+                patch.object(microvm_tests, "run_sandbox_proxy_only") as run,
+                patch.object(microvm_tests, "run_sandbox_lifecycle") as lifecycle,
+            ):
+                self.assertEqual(microvm_tests.run(args), 0)
+            run.assert_called_once_with(
+                "kvm", timeout=args.timeout, output_dir=output_dir
+            )
+            lifecycle.assert_not_called()
+
+    def test_runner_dispatches_public_sandbox_ram_upper(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output_dir = Path(temporary)
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "whp",
+                    "--scenario",
+                    "sandbox-ram-upper",
+                    "--output-dir",
+                    str(output_dir),
+                ]
+            )
+
+            def require(path: Path, _description: str) -> Path:
+                return path
+
+            with (
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(microvm_tests, "require_file", side_effect=require),
+                patch.object(microvm_tests, "run_sandbox_ram_upper") as run,
+                patch.object(microvm_tests, "run_sandbox_lifecycle") as lifecycle,
+            ):
+                self.assertEqual(microvm_tests.run(args), 0)
+            run.assert_called_once_with(
+                "whp", timeout=args.timeout, output_dir=output_dir
+            )
+            lifecycle.assert_not_called()
+
+    def test_a_default_run_runs_the_public_sandbox_scenarios(self):
         def require(path: Path, _description: str) -> Path:
             return path
 
@@ -8696,35 +14144,90 @@ class MicrovmTests(unittest.TestCase):
                 patch.object(
                     microvm_tests,
                     "MICROVM_TEST_SCENARIOS",
-                    ("managed-exec-config", "sandbox-lifecycle", "guest-boot"),
+                    (
+                        "managed-exec-config",
+                        "sandbox-lifecycle",
+                        "sandbox-proxy-only",
+                        "sandbox-ram-upper",
+                        "guest-boot",
+                    ),
                 ),
                 patch.object(microvm_tests, "require_file", side_effect=require),
                 patch.object(microvm_tests, "run_guest_boot") as guest_boot,
                 patch.object(microvm_tests, "run_sandbox_lifecycle") as lifecycle,
+                patch.object(microvm_tests, "run_sandbox_proxy_only") as proxy_only,
+                patch.object(microvm_tests, "run_sandbox_ram_upper") as ram_upper,
                 patch.object(
                     microvm_tests, "run_managed_exec_configuration"
                 ) as managed_exec,
+                redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(microvm_tests.run(args), 0)
 
         guest_boot.assert_called_once()
-        lifecycle.assert_not_called()
-        managed_exec.assert_not_called()
+        lifecycle.assert_called_once()
+        proxy_only.assert_called_once()
+        ram_upper.assert_called_once()
+        managed_exec.assert_called_once()
         self.assertIn("sandbox-lifecycle", microvm_tests.SANDBOX_CONTROL_SCENARIOS)
+        self.assertIn("sandbox-proxy-only", microvm_tests.SANDBOX_CONTROL_SCENARIOS)
+        self.assertIn("sandbox-ram-upper", microvm_tests.SANDBOX_CONTROL_SCENARIOS)
+        self.assertIn("sandbox-ram-upper", microvm_tests.PUBLIC_SANDBOX_SCENARIOS)
 
-    def test_managed_container_launch_prepares_identity_and_static_helper(self):
+    def test_public_sandbox_scenarios_need_their_artifacts_before_any_runs(self):
+        # Without the scratch template, a default run fails before its first
+        # scenario, and says where the template comes from.
+        template = microvm_tests.workload_artifact_paths()[-1][0]
+        self.assertEqual(template.name, "ubuntu-smoke-scratch.ext4")
+
+        def require(path: Path, description: str) -> Path:
+            if path == template:
+                raise common.ScriptError(f"{description} not found: {path}")
+            return path
+
+        with tempfile.TemporaryDirectory() as temporary:
+            args = nvx.parse_args(
+                ["test-microvm", "--backend", "kvm", "--output-dir", temporary]
+            )
+            with (
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(
+                    microvm_tests,
+                    "MICROVM_TEST_SCENARIOS",
+                    ("guest-boot", "sandbox-lifecycle"),
+                ),
+                patch.object(microvm_tests, "require_file", side_effect=require),
+                patch.object(microvm_tests, "run_guest_boot") as guest_boot,
+                patch.object(microvm_tests, "run_sandbox_lifecycle") as lifecycle,
+                self.assertRaisesRegex(
+                    common.ScriptError,
+                    r"^sandbox scratch template not found: .*; sandbox-lifecycle "
+                    r"reads .*: install them with `nvx-rs download` .*"
+                    r"`build-scratch-template`",
+                ),
+            ):
+                microvm_tests.run(args)
+            self.assertFalse((Path(temporary) / microvm_durations.REPORT_NAME).exists())
+
+        guest_boot.assert_not_called()
+        lifecycle.assert_not_called()
+
+    def test_managed_executions_enter_through_the_agent_not_the_container_helpers(self):
         root = Path(__file__).resolve().parent.parent
         bootstrap = (root / "guest" / "common" / "nvx-init-agent").read_text()
         launcher = (root / "guest" / "alpine" / "nvx-container-enter").read_text()
+        # The managed agent generates the workload's machine ID itself, so the
+        # init agent generates one only for a one-shot workload.
+        self.assertLess(
+            bootstrap.index("    /sbin/nvx-managed-agent \\"),
+            bootstrap.index('>"$runtime/workload-machine-id"'),
+        )
         self.assertLess(
             bootstrap.index('>"$runtime/workload-machine-id"'),
-            bootstrap.index("    /sbin/nvx-managed-agent \\"),
+            bootstrap.index("/sbin/nvx-container-launch"),
         )
-        self.assertIn(
-            "set -- /.nvx-agent/nvx-managed-agent \\\n"
-            '        --exec-config-fd "$NVX_EXEC_CONFIG_FD" -- "$@"',
-            launcher,
-        )
+        self.assertNotIn("NVX_EXEC_CONFIG_FD", launcher)
+        self.assertNotIn("nvx-managed-agent", launcher)
 
     def test_runner_uses_ubuntu_artifact_and_default_memory(self):
         requested: list[Path] = []
@@ -8759,6 +14262,45 @@ class MicrovmTests(unittest.TestCase):
             requested,
         )
         self.assertEqual(run_guest_boot.call_args.kwargs["memory_mib"], 512)
+
+    def test_runner_runs_time_host_correction_on_both_guest_images(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        for guest in ("alpine", "ubuntu"):
+            descriptor = microvm_tests.guest_descriptor(guest)
+            with self.subTest(guest=guest), tempfile.TemporaryDirectory() as temporary:
+                args = nvx.parse_args(
+                    [
+                        "test-microvm",
+                        "--backend",
+                        "whp",
+                        "--guest",
+                        guest,
+                        "--scenario",
+                        "time-host-correction",
+                        "--output-dir",
+                        temporary,
+                    ]
+                )
+                with (
+                    patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                    patch.object(microvm_tests, "require_file", side_effect=require),
+                    patch.object(
+                        microvm_tests, "run_time_host_correction"
+                    ) as run_time_host_correction,
+                ):
+                    self.assertEqual(microvm_tests.run(args), 0)
+
+                run_time_host_correction.assert_called_once()
+                self.assertEqual(
+                    run_time_host_correction.call_args.args[2],
+                    BuildConstants.BUILD_DIR / descriptor.initramfs_name,
+                )
+                self.assertEqual(
+                    run_time_host_correction.call_args.kwargs["memory_mib"],
+                    descriptor.default_memory_mib,
+                )
 
     def test_runner_omits_console_snapshot_from_ubuntu_defaults(self):
         def require(path: Path, _description: str) -> Path:
@@ -8955,6 +14497,11 @@ class MicrovmTests(unittest.TestCase):
                     with self.subTest(scenario=scenario):
                         run.assert_called()
                         self.assertEqual(run.call_args.args[1], build / "vmlinux-debug")
+                header = _read_report(build / "logs" / microvm_durations.REPORT_NAME)[0]
+                self.assertEqual(
+                    (header["kernel"], header["scenarios"]),
+                    ("debug", list(microvm_tests.DEBUG_KERNEL_SCENARIOS)),
+                )
                 config.write_text("CONFIG_DETECT_HUNG_TASK=y\n", encoding="utf-8")
                 with self.assertRaisesRegex(
                     common.ScriptError, "lacks CONFIG_SOFTLOCKUP_DETECTOR=y"
@@ -8977,6 +14524,8 @@ class MicrovmTests(unittest.TestCase):
                     "--scenario",
                     "restore-processors",
                     "--scenario",
+                    "platform-restore-processors",
+                    "--scenario",
                     "time-abi-conformance",
                     "--processors",
                     "2",
@@ -8990,10 +14539,13 @@ class MicrovmTests(unittest.TestCase):
                 patch.object(microvm_tests, "require_file", side_effect=require),
                 patch.object(microvm_tests, "run_smp_snapshot") as smp_snapshot,
                 patch.object(microvm_tests, "run_restore_processors") as processors,
+                patch.object(
+                    microvm_tests, "run_platform_restore_processors"
+                ) as platform_processors,
                 patch.object(microvm_tests, "run_time_abi_conformance") as conformance,
             ):
                 self.assertEqual(microvm_tests.run(args), 0)
-        for run in (smp_snapshot, processors):
+        for run in (smp_snapshot, processors, platform_processors):
             run.assert_called_once()
             self.assertEqual(run.call_args.args[4], [2, 4])
             self.assertEqual(run.call_args.kwargs["output_dir"], output_dir)
@@ -9026,6 +14578,198 @@ class MicrovmTests(unittest.TestCase):
             ):
                 self.assertEqual(microvm_tests.run(args), 0)
         self.assertEqual([call.args[4] for call in run.call_args_list], [1, 2, 4, 8])
+
+    def test_runner_flushes_each_progress_line_before_its_scenario(self):
+        # CI timestamps each log line when it leaves the process, so every
+        # scenario's progress line must leave stdout's buffer before the
+        # scenario starts (#694).
+        class FlushRecorder(io.StringIO):
+            flushed = ""
+
+            def flush(self) -> None:
+                super().flush()
+                self.flushed = self.getvalue()
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        stdout = FlushRecorder()
+        progress: list[str] = []
+
+        def scenario(*_args: object, **_kwargs: object) -> None:
+            self.assertEqual(stdout.flushed, stdout.getvalue())
+            progress.append(stdout.flushed.splitlines()[-1])
+
+        scenarios = (
+            *microvm_tests.MICROVM_TEST_SCENARIOS,
+            *microvm_tests.MICROVM_EXPLICIT_SCENARIOS,
+        )
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "kvm",
+                    *(f"--scenario={scenario}" for scenario in scenarios),
+                    "--processors",
+                    "1",
+                    "2",
+                    "--output-dir",
+                    temporary,
+                ]
+            )
+            stack.enter_context(
+                patch.object(microvm_tests, "validate_openvmm_test_backend")
+            )
+            stack.enter_context(
+                patch.object(microvm_tests, "require_file", side_effect=require)
+            )
+            for name in _scenario_runners():
+                stack.enter_context(
+                    patch.object(microvm_tests, name, side_effect=scenario)
+                )
+            stack.enter_context(redirect_stdout(stdout))
+            self.assertEqual(microvm_tests.run(args), 0)
+
+        # console-exit, smp, and smp-lapic run once per processor count.
+        self.assertEqual(len(progress), len(scenarios) + 3)
+        for line in progress:
+            self.assertRegex(line, r"^Running .+ on OpenVMM/kvm$")
+
+    def test_runner_reports_every_scenario_execution(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        scenarios = (
+            *microvm_tests.MICROVM_TEST_SCENARIOS,
+            *microvm_tests.MICROVM_EXPLICIT_SCENARIOS,
+        )
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "whp",
+                    *(f"--scenario={scenario}" for scenario in scenarios),
+                    "--processors",
+                    "2",
+                    "1",
+                    "2",
+                    "--output-dir",
+                    temporary,
+                ]
+            )
+            stack.enter_context(
+                patch.object(microvm_tests, "validate_openvmm_test_backend")
+            )
+            stack.enter_context(
+                patch.object(microvm_tests, "require_file", side_effect=require)
+            )
+            for name in _scenario_runners():
+                stack.enter_context(patch.object(microvm_tests, name))
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            self.assertEqual(microvm_tests.run(args), 0)
+            records = _read_report(Path(temporary) / microvm_durations.REPORT_NAME)
+
+        header, setup, *executions, teardown = records
+        self.assertEqual(header["record"], "run")
+        self.assertEqual(
+            (header["guest"], header["backend"], header["kernel"]),
+            ("alpine", "whp", "default"),
+        )
+        self.assertEqual(header["processors"], [2, 1])
+        self.assertEqual(header["scenarios"], list(scenarios))
+        self.assertEqual((setup["record"], setup["outcome"]), ("setup", "passed"))
+        self.assertEqual(
+            (teardown["record"], teardown["outcome"]), ("teardown", "passed")
+        )
+        # Each execution names the processor counts that it covers, if any.
+        expected: list[tuple[str, list[int] | None]] = []
+        for scenario in scenarios:
+            if scenario in ("console-exit", "smp", "smp-lapic"):
+                expected.extend((scenario, [processors]) for processors in (2, 1))
+            elif scenario in (
+                "smp-snapshot",
+                "restore-processors",
+                "platform-restore-processors",
+            ):
+                expected.append((scenario, [2, 1]))
+            elif scenario == "time-abi-conformance":
+                expected.append((scenario, [2]))
+            else:
+                expected.append((scenario, None))
+        self.assertCountEqual(
+            [(record["scenario"], record["processors"]) for record in executions],
+            expected,
+        )
+        for record in executions:
+            self.assertEqual(
+                (record["record"], record["guest"], record["backend"]),
+                ("scenario", "alpine", "whp"),
+            )
+            self.assertEqual(
+                (record["kernel"], record["outcome"], record["error"]),
+                ("default", "passed", None),
+            )
+        # The spans follow one another, so they add up to the run's time.
+        for record, following in itertools.pairwise(records[1:]):
+            started = datetime.fromisoformat(record["started_at"][:-1])
+            ended = datetime.fromisoformat(following["started_at"][:-1])
+            self.assertAlmostEqual(
+                (ended - started).total_seconds(), record["seconds"], delta=0.002
+            )
+
+    def test_runner_report_keeps_the_executions_before_a_failure(self):
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with tempfile.TemporaryDirectory() as temporary:
+            args = nvx.parse_args(
+                [
+                    "test-microvm",
+                    "--backend",
+                    "mshv",
+                    "--scenario",
+                    "virtio-net",
+                    "--scenario",
+                    "lifecycle",
+                    "--output-dir",
+                    temporary,
+                ]
+            )
+            with (
+                patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                patch.object(microvm_tests, "require_file", side_effect=require),
+                patch.object(microvm_tests, "run_lifecycle"),
+                patch.object(
+                    microvm_tests,
+                    "run_virtio_net",
+                    side_effect=RuntimeError("no virtio-net marker"),
+                ),
+                redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(RuntimeError, "no virtio-net marker"),
+            ):
+                microvm_tests.run(args)
+            records = _read_report(Path(temporary) / microvm_durations.REPORT_NAME)
+
+        error = "RuntimeError: no virtio-net marker"
+        self.assertEqual(
+            [
+                (record["record"], record.get("scenario"), record.get("outcome"))
+                for record in records
+            ],
+            [
+                ("run", None, None),
+                ("setup", None, "passed"),
+                ("scenario", "lifecycle", "passed"),
+                ("scenario", "virtio-net", "failed"),
+                ("teardown", None, "failed"),
+            ],
+        )
+        self.assertEqual(
+            [record.get("error") for record in records],
+            [None, None, None, error, error],
+        )
 
     def test_guest_runner_persists_full_output_on_failure(self):
         class FakeProcess:
@@ -9071,6 +14815,1685 @@ class MicrovmTests(unittest.TestCase):
                     )
 
             self.assertEqual(log_path.read_bytes(), b"complete raw output\n")
+
+
+class TimeHostCorrectionTests(unittest.TestCase):
+    """The time-host-correction scenario and its guest report."""
+
+    # Host UTC of the first sample, and the declared TSC rate; the samples are
+    # 5 s of the guest TSC apart.
+    UTC_NS = 1_790_841_600_000_000_000
+    TSC_HZ = 2_000_000_000
+
+    def report(
+        self,
+        *,
+        frequency_ppb: int = 199_500,
+        correction_ppb: int = 200_000,
+        limited: int = 0,
+        samples: Sequence[tuple[int, int]] = ((1_000, 13_107_200), (1_500, 13_107_200)),
+        host_ppm: float = 200.0,
+        flags: str = "0x08",
+        tsc_hz: int | None = None,
+        disruptions: Sequence[int] | None = None,
+        epsilons: Sequence[int] | None = None,
+        failures: Collection[int] = (),
+        state_windows: Sequence[
+            tuple[
+                dict[str, str | int],
+                dict[str, str | int],
+                dict[str, str | int],
+            ]
+        ]
+        | None = None,
+    ) -> str:
+        """Return the console output of a guest report whose state holds
+        ``frequency_ppb`` for the host's ``correction_ppb``, and whose samples,
+        5 s of the guest TSC apart, read ``(theta_ns, correction)`` each, with
+        the uncertainties ``epsilons``, 700 ns by default, while host UTC runs
+        ``host_ppm`` against the TSC. The samples whose indices ``failures``
+        holds failed to pair, as ``nvx-time sample`` then reports them."""
+        tsc_hz = self.TSC_HZ if tsc_hz is None else tsc_hz
+        state: dict[str, str | int] = {
+            "version": 1,
+            "generation": 0,
+            "tsc_hz": tsc_hz,
+            "frequency_ppb": frequency_ppb,
+            "frequency_limited": limited,
+            "host_status": "synchronized",
+            "host_correction_ppb": correction_ppb,
+            "host_correction_bound_ppb": 2,
+            "discontinuities": 0,
+            "last_step_realtime_ns": 0,
+            "samples": 17,
+        }
+        disruptions = disruptions or (0,) * len(samples)
+        epsilons = epsilons or (700,) * len(samples)
+        sample_lines: list[str] = []
+        for index, ((theta, correction), disruption, epsilon) in enumerate(
+            zip(samples, disruptions, epsilons, strict=True)
+        ):
+            elapsed_ns = index * 5_000_000_000
+            utc = self.UTC_NS + round(elapsed_ns * (1 + host_ppm / 1e6))
+            tsc = 1_000_000 + index * 5 * tsc_hz
+            line = (
+                f"{microvm_tests.TIME_HOST_CORRECTION_SAMPLE_PREFIX}index={index + 1} "
+                f"flags={flags} generation=0 status=synchronized "
+                f"utc_ns={utc} tsc={tsc} pairing_ns=640 "
+                f"disruption={disruption} correction={correction} correction_bound=66 "
+                f"max_error_us=unknown before={tsc - 100} after={tsc + 100} "
+                f"realtime_ns={utc - theta}"
+            )
+            if index not in failures:
+                line += (
+                    f" theta_ns={theta} epsilon_ns={epsilon} "
+                    f"frequency=13103527 frequency_limited={limited}"
+                )
+            sample_lines.append(line)
+        windows = max(1, (len(samples) + 1) // 2)
+        if state_windows is None:
+            state_windows = tuple(({}, {}, {}) for _ in range(windows))
+        if len(state_windows) != windows:
+            raise ValueError(
+                f"{len(state_windows)} state windows for {windows} windows"
+            )
+
+        def format_state(values: dict[str, str | int]) -> str:
+            return " ".join(f"{name}={value}" for name, value in values.items())
+
+        lines: list[str] = []
+        for window, (initial_changes, before_changes, after_changes) in enumerate(
+            state_windows, start=1
+        ):
+            initial = state.copy()
+            initial.update(initial_changes)
+            before = state.copy()
+            before.update(before_changes)
+            after = state.copy()
+            after.update(after_changes)
+            lines.append(
+                f"{microvm_tests.TIME_HOST_CORRECTION_STATE_PREFIX}attempt={window} "
+                f"point=initial {format_state(initial)}"
+            )
+            lines.append(
+                f"{microvm_tests.TIME_HOST_CORRECTION_STATE_PREFIX}attempt={window} "
+                f"point=before {format_state(before)}"
+            )
+            lines.extend(sample_lines[2 * (window - 1) : 2 * window])
+            lines.append(
+                f"{microvm_tests.TIME_HOST_CORRECTION_STATE_PREFIX}attempt={window} "
+                f"point=after {format_state(after)}"
+            )
+        return "\r\n".join(lines) + "\r\n"
+
+    def check(self, output: str, *, limit: bool = False) -> str:
+        return microvm_tests.check_time_host_correction(
+            output, context="phase", limit=limit
+        )
+
+    def test_a_guest_that_holds_the_published_correction_passes(self):
+        # The guest's clock lost 500 ns on host UTC in 5 s, so it ran at
+        # 199.9 ppm against its TSC, within 1 ppm and the 120 ns of its two
+        # realtime pairings.
+        summary = self.check(self.report())
+        self.assertEqual(
+            summary,
+            "phase: host_correction_ppb=200000 frequency_ppb=199500 "
+            "guest_ppm=+199.900 host_ppm=+200.000 published_ppm=+200.000 in 5.0 s",
+        )
+        script = microvm_tests.time_host_correction_script()
+        self.assertNotIn("@", script)
+        self.assertIn("sleep 5\n", script)
+        self.assertIn(
+            "sleep 0\n", microvm_tests.time_host_correction_script(spacing_seconds=0)
+        )
+        self.assertIn('while [ "$attempt" -le 3 ]', script)
+        self.assertNotIn("/sbin/adjtimex", script)
+        self.assertLess(script.index("initial_state="), script.index("clear-phase"))
+        self.assertLess(script.index("clear-phase"), script.index("sleep 2"))
+        self.assertLess(script.index("sleep 2"), script.index("before_state="))
+        self.assertIn(
+            "sleep 0\n", microvm_tests.time_host_correction_script(settle_seconds=0)
+        )
+        self.assertIn("last_step_realtime_ns samples", script)
+        self.assertIn("first_disruption=", script)
+        # The script retries a window whose samples the discipline would reject.
+        self.assertIn('[ "$epsilon" -le 100000 ]', script)
+        self.assertIn('within_bound "$first" && within_bound "$second"', script)
+        # A discarded sample precedes the report's samples.
+        self.assertLess(
+            script.index("nvx-time sample >/dev/null 2>&1 || true\n"),
+            script.index("first=$(nvx-time sample 2>&1)"),
+        )
+
+    def test_a_sub_ghz_tsc_gets_its_full_khz_rounding_allowance(self):
+        # The ABI admits 500 MHz. At 500,000,999 Hz, a +200 ppm host
+        # correction becomes +198,002 ppb after Linux rounds the TSC rate down
+        # to the kHz: 1,998 ppb away, which the old 1,001 ppb allowance rejected.
+        tsc_hz = 500_000_999
+        report = self.report(
+            frequency_ppb=198_002,
+            correction_ppb=200_000,
+            tsc_hz=tsc_hz,
+        )
+        self.assertIn("frequency_ppb=198002", self.check(report))
+        self.assertGreaterEqual(
+            microvm_tests.time_host_correction_frequency_allowance_ppb(tsc_hz, 200_000),
+            1_998,
+        )
+
+    def test_a_guest_that_does_not_run_at_the_published_rate_fails(self):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "holds a frequency correction of 0 ppb, not the host's correction of "
+            "200000 ppb",
+        ):
+            self.check(self.report(frequency_ppb=0))
+        # A guest whose clock doesn't run at the frequency correction that it
+        # holds drifts from host UTC by the hook's rate: 200 ppm over 5 s is
+        # 1 ms.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"the guest's clock ran at -0\.200 ppm against its TSC in 5\.0 s, not at "
+            r"the host's correction of \+200\.000 ppm that it holds, within 1\.024 ppm",
+        ):
+            self.check(self.report(samples=((0, 13_107_200), (1_001_000, 13_107_200))))
+        # The limit is 1 ppm plus the uncertainty of the two realtime pairings,
+        # 0.024 ppm, so a guest that ran 1.2 ppm off fails.
+        with self.assertRaisesRegex(RuntimeError, r"ran at \+198\.800 ppm"):
+            self.check(self.report(samples=((0, 13_107_200), (6_000, 13_107_200))))
+
+    def test_host_utc_must_run_at_its_published_correction(self):
+        # A hook that skewed the correction but not host UTC leaves the guest,
+        # which holds the correction, 1 ms behind host UTC in 5 s.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"host UTC ran at \+0\.000 ppm against the guest TSC in 5\.0 s, not at its "
+            r"published correction of \+200\.000 ppm, within 75\.256 ppm",
+        ):
+            self.check(
+                self.report(
+                    samples=((0, 13_107_200), (-1_000_000, 13_107_200)), host_ppm=0.0
+                )
+            )
+        # The time service may slew host UTC between the samples, as the guest's
+        # discipline absorbs.
+        slewed = self.report(
+            samples=((0, 13_107_200), (-350_000, 13_107_200)), host_ppm=130.0
+        )
+        self.assertIn("host_ppm=+130.000 published_ppm=+200.000", self.check(slewed))
+
+    def test_a_host_utc_disruption_retries_the_measurement_window(self):
+        correction = 13_107_200
+        samples = ((1_000, correction),) * 4
+        retried = self.report(
+            samples=samples,
+            disruptions=(0, 1, 1, 1),
+        )
+        self.assertIn(
+            "guest_ppm=+200.000 host_ppm=+200.000",
+            self.check(retried),
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "no measurement window was stable and conclusive: "
+            "window 1: host UTC's disruption counter changed; window 2: host "
+            "UTC's disruption counter changed; window 3: host UTC's disruption "
+            "counter changed",
+        ):
+            self.check(
+                self.report(
+                    samples=((1_000, correction),) * 6,
+                    disruptions=(0, 1, 1, 2, 2, 3),
+                )
+            )
+
+    def test_an_uncertain_sample_retries_the_measurement_window(self):
+        bound = microvm_tests.TIME_HOST_CORRECTION_SAMPLE_BOUND_NS
+        self.assertEqual(bound, 100_000)
+        correction = 13_107_200
+        # A guest that holds +200 ppm but whose clock runs at 0 ppm against its
+        # TSC falls 1 ms behind host UTC in 5 s. Two samples uncertain by
+        # 1,001,640 ns each would allow 401.4 ppm, so the window is retried
+        # rather than passed.
+        ignored = ((0, correction), (1_000_000, correction))
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "no measurement window was stable and conclusive: window 1: a "
+            "sample's uncertainty of 1001640 ns exceeds the 100000 ns bound",
+        ):
+            self.check(self.report(samples=ignored, epsilons=(700, 1_001_640)))
+        # The next window's samples lie within the bound, which then checks the
+        # guest's rate.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"the guest's clock ran at \+0\.000 ppm against its TSC in 5\.0 s, not "
+            r"at the host's correction of \+200\.000 ppm that it holds, within "
+            r"1\.024 ppm",
+        ):
+            self.check(
+                self.report(
+                    samples=(*ignored, *ignored),
+                    epsilons=(1_001_640, 700, 700, 700),
+                )
+            )
+        retried = self.report(
+            samples=((1_000, correction),) * 4,
+            epsilons=(bound + 1, 700, 700, bound),
+        )
+        self.assertIn("guest_ppm=+200.000 host_ppm=+200.000", self.check(retried))
+        # Every window's reason names what made it unusable.
+        unchanged: dict[str, str | int] = {}
+        polled: dict[str, str | int] = {"samples": 18}
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "window 1: host UTC's disruption counter changed; window 2: a sample's "
+            "uncertainty of 100001 ns exceeds the 100000 ns bound; window 3: the "
+            "discipline changed",
+        ):
+            self.check(
+                self.report(
+                    samples=((1_000, correction),) * 6,
+                    disruptions=(0, 1, 1, 1, 1, 1),
+                    epsilons=(700, 700, 700, bound + 1, 700, 700),
+                    state_windows=(
+                        (unchanged, unchanged, unchanged),
+                        (unchanged, unchanged, unchanged),
+                        (unchanged, unchanged, polled),
+                    ),
+                )
+            )
+
+    def test_a_failed_pairing_retries_the_measurement_window(self):
+        correction = 13_107_200
+        # nvx-time sample reports a sample that its TSC bracket rejects without
+        # theta_ns or epsilon_ns, and the guest script retries that window, so
+        # the checker takes the next one.
+        for failures in ((0,), (1,)):
+            with self.subTest(failures=failures):
+                retried = self.report(
+                    samples=((1_000, correction),) * 4, failures=failures
+                )
+                self.assertIn(
+                    "guest_ppm=+200.000 host_ppm=+200.000", self.check(retried)
+                )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "no measurement window was stable and conclusive: window 1: nvx-time "
+            "sample failed: index=1 flags=0x08 generation=0 .* realtime_ns=[0-9]+; "
+            "window 2: nvx-time sample failed: index=4 ",
+        ):
+            self.check(self.report(samples=((1_000, correction),) * 4, failures=(0, 3)))
+        # The limited phase takes one sample, which the script does not retry.
+        with self.assertRaisesRegex(
+            RuntimeError, "phase: nvx-time sample failed: index=1 "
+        ):
+            self.check(
+                self.report(
+                    frequency_ppb=500_000,
+                    correction_ppb=900_000,
+                    limited=1,
+                    samples=((0, 58_982_400),),
+                    failures=(0,),
+                ),
+                limit=True,
+            )
+
+    def test_an_allowance_beyond_half_the_held_correction_fails(self):
+        # Within the bound, two samples 5 s apart allow at most 41 ppm, below
+        # half of the smallest hook's 150 ppm. A correction near 0, which only a
+        # host near OpenVMM's hook range could leave, can't tell a guest that
+        # ignored it from one that applied it.
+        correction = round(2 * 65_536)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"the allowance of 1\.024 ppm for the guest's clock in 5\.0 s is not "
+            r"below 1\.000 ppm, half the host's correction of \+2\.000 ppm that it "
+            "holds, so its rate check is inconclusive",
+        ):
+            self.check(
+                self.report(
+                    frequency_ppb=1_500,
+                    correction_ppb=2_000,
+                    samples=((1_000, correction), (1_000, correction)),
+                    host_ppm=2.0,
+                )
+            )
+
+    def test_a_discipline_update_retries_with_fresh_state(self):
+        correction = 16_384_000
+        unchanged: dict[str, str | int] = {}
+        held: dict[str, str | int] = {
+            "frequency_ppb": 249_500,
+            "host_correction_ppb": 250_000,
+        }
+        retried = self.report(
+            frequency_ppb=199_500,
+            correction_ppb=200_000,
+            samples=((1_000, correction),) * 4,
+            host_ppm=250.0,
+            state_windows=((unchanged, unchanged, held), (held, held, held)),
+        )
+        self.assertIn(
+            "host_correction_ppb=250000 frequency_ppb=249500 "
+            "guest_ppm=+250.000 host_ppm=+250.000",
+            self.check(retried),
+        )
+
+    def test_a_phase_only_poll_retries_the_measurement_window(self):
+        correction = 13_107_200
+        unchanged: dict[str, str | int] = {}
+        polled: dict[str, str | int] = {"samples": 18}
+        for first_window in (
+            # A poll during the measurement changes only its accepted-sample count.
+            (unchanged, unchanged, polled),
+            # A poll between the initial state and phase cancellation is caught too.
+            (unchanged, polled, polled),
+        ):
+            with self.subTest(first_window=first_window):
+                retried = self.report(
+                    samples=((1_000, correction),) * 4,
+                    state_windows=(first_window, (polled, polled, polled)),
+                )
+                self.assertIn(
+                    "guest_ppm=+200.000 host_ppm=+200.000",
+                    self.check(retried),
+                )
+
+    def test_a_wandering_host_widens_the_allowance(self):
+        # The host's correction moved from 100 to 300 ppm between the samples:
+        # host UTC ran at their average, and half the change widens the limit
+        # by 100 ppm. The guest holds the first sample's 100 ppm.
+        wandering = ((0, 6_553_600), (500_000, 19_660_800))
+        self.assertIn(
+            "guest_ppm=+100.000 host_ppm=+200.000 published_ppm=+200.000",
+            self.check(
+                self.report(
+                    frequency_ppb=99_500, correction_ppb=100_000, samples=wandering
+                )
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeError, r"within 175\.256 ppm"):
+            self.check(
+                self.report(
+                    frequency_ppb=99_500,
+                    correction_ppb=100_000,
+                    samples=((0, 6_553_600), (1_400_000, 19_660_800)),
+                    host_ppm=380.0,
+                )
+            )
+
+    def test_a_stale_held_correction_fails(self):
+        # A boot step or repair that kept the guest's old correction, here 0,
+        # runs the guest at it while the samples publish, and host UTC runs at,
+        # -150 ppm: both rate checks pass, but the held correction is stale.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"holds the host's correction of 0 ppb, but its first stable sample publishes "
+            r"-150\.000 ppm, more than 75 ppm away: its boot step or restore repair "
+            "kept a stale correction",
+        ):
+            self.check(
+                self.report(
+                    frequency_ppb=0,
+                    correction_ppb=0,
+                    samples=((0, -9_830_400), (-750_000, -9_830_400)),
+                    host_ppm=-150.0,
+                )
+            )
+        # The host's own correction may have moved since the boot step or the
+        # repair: here by 60 ppm, which the guest's discipline follows later.
+        moved = self.report(
+            samples=((0, 17_039_360), (300_000, 17_039_360)), host_ppm=260.0
+        )
+        self.assertIn("guest_ppm=+200.000 host_ppm=+260.000", self.check(moved))
+
+    def test_the_limit_holds_and_is_reported(self):
+        limit = self.report(
+            frequency_ppb=500_000,
+            correction_ppb=900_000,
+            limited=1,
+            samples=((0, 58_982_400),),
+        )
+        self.assertEqual(
+            self.check(limit, limit=True),
+            "phase: host_correction_ppb=900000 frequency_ppb=500000 frequency_limited=1",
+        )
+        for frequency_ppb, limited in ((500_000, 0), (499_000, 1)):
+            with (
+                self.subTest(frequency_ppb=frequency_ppb, limited=limited),
+                self.assertRaisesRegex(RuntimeError, "exceeds its limit"),
+            ):
+                self.check(
+                    self.report(
+                        frequency_ppb=frequency_ppb,
+                        correction_ppb=900_000,
+                        limited=limited,
+                        samples=((0, 58_982_400),),
+                    ),
+                    limit=True,
+                )
+        negative = self.report(
+            frequency_ppb=-500_000,
+            correction_ppb=-650_000,
+            limited=1,
+            samples=((0, -42_598_400),),
+        )
+        self.assertIn("frequency_limited=1", self.check(negative, limit=True))
+        # The limit phase must exercise the limit: a host correction of
+        # -450 ppm and a +900 ppm hook would leave +450 ppm, unclamped.
+        unclamped = self.report(
+            frequency_ppb=449_500,
+            correction_ppb=450_000,
+            samples=((0, 29_491_200), (0, 29_491_200)),
+            host_ppm=450.0,
+        )
+        self.assertIn("guest_ppm=+450.000", self.check(unclamped))
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Linux's required correction of \+450\.000 ppm is within its limit, "
+            "so this phase does not exercise it",
+        ):
+            self.check(
+                self.report(
+                    frequency_ppb=449_500,
+                    correction_ppb=450_000,
+                    samples=((0, 29_491_200),),
+                    host_ppm=450.0,
+                ),
+                limit=True,
+            )
+        # And the other phases must not reach it, which leaves no rate to check.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"reaches its limit \(frequency_limited=1\), so this phase cannot "
+            "check the guest's rate",
+        ):
+            self.check(limit)
+
+    def test_a_report_without_the_hook_or_a_sample_fails(self):
+        with self.assertRaisesRegex(RuntimeError, "lack the test-hook flag"):
+            self.check(self.report(flags="0x00"))
+        with self.assertRaisesRegex(
+            RuntimeError, "reported 1 time samples for 1 measurement windows, not 2"
+        ):
+            self.check(self.report(samples=((0, 13_107_200),)))
+        with self.assertRaisesRegex(RuntimeError, "malformed guest report: KeyError"):
+            self.check(self.report().replace(f"tsc_hz={self.TSC_HZ} ", ""))
+        with self.assertRaisesRegex(RuntimeError, "no time state or sample"):
+            self.check("NVX-TIME-HOST-CORRECTION-SAMPLE: index=1 theta_ns=0\n")
+        failed = (
+            f"{microvm_tests.TIME_HOST_CORRECTION_STATE_PREFIX}frequency_ppb=0\n"
+            f"{microvm_tests.TIME_HOST_CORRECTION_SAMPLE_PREFIX}index=1 "
+            "nvx-time: portb\n"
+        )
+        with self.assertRaisesRegex(RuntimeError, "phase: "):
+            self.check(failed)
+
+    def test_the_probe_reads_the_hosts_own_correction(self):
+        probe = self.phase_report(-12.5, flags="0x00")
+        self.assertEqual(
+            microvm_tests.time_host_correction_host_ppm(probe, context="probe"), -12.5
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "probe: time sample flags 0x08 carry the test-hook flag, so a hook "
+            "altered the host's own correction",
+        ):
+            microvm_tests.time_host_correction_host_ppm(self.report(), context="probe")
+        failed = self.report(flags="0x00", failures=(0, 1))
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "probe: no measurement window was stable and conclusive: window 1: "
+            "nvx-time sample failed: index=1 flags=0x00 ",
+        ):
+            microvm_tests.time_host_correction_host_ppm(failed, context="probe")
+
+    def test_the_hooks_keep_the_ordinary_corrections_within_the_limit(self):
+        def hooks(host_ppm: float, tsc_hz: int = self.TSC_HZ) -> tuple[int, int, int]:
+            return microvm_tests.time_host_correction_hooks(host_ppm, tsc_hz)
+
+        self.assertEqual(hooks(0.0), (-200, -150, 900))
+        self.assertEqual(hooks(-12.4), (212, 162, -900))
+        self.assertEqual(hooks(400.0), (-600, -550, 900))
+        self.assertEqual(hooks(-400.0), (600, 550, -900))
+        # At OpenVMM's +/-10,000 ppm hook limit, use the boundary instead of
+        # generating the invalid -10,200 or +10,200 ppm hooks.
+        self.assertEqual(hooks(10_000.0), (-10_000, -10_000, 900))
+        self.assertEqual(hooks(-10_000.0), (10_000, 10_000, -900))
+        for host_ppm in (-499.9, -250.0, -150.0, -0.4, 0.4, 150.0, 250.0, 499.9):
+            boot, restore, limit = hooks(host_ppm)
+            for hook, size in ((boot, 200), (restore, 150)):
+                with self.subTest(host_ppm=host_ppm, hook=hook):
+                    # The published correction has the size, to the hook's
+                    # rounding, against the host's sign, and the hook is at
+                    # least as large.
+                    published = microvm_tests.time_host_correction_composed_ppm(
+                        host_ppm, hook
+                    )
+                    self.assertLessEqual(abs(abs(published) - size), 0.5)
+                    self.assertLess(published * host_ppm, 0)
+                    self.assertGreaterEqual(abs(hook), size)
+            with self.subTest(host_ppm=host_ppm, hook=limit):
+                # The limit phase's hook has the host's sign, and takes the
+                # published correction beyond Linux's limit.
+                self.assertGreater(limit * host_ppm, 0)
+                self.assertGreater(
+                    abs(
+                        microvm_tests.time_host_correction_composed_ppm(host_ppm, limit)
+                    ),
+                    500,
+                )
+                self.assertLessEqual(
+                    abs(limit), microvm_tests.OPENVMM_HOST_RATE_OFFSET_LIMIT_PPM
+                )
+        # Multiplication makes +10,500 with a -10,000 hook publish +395
+        # ppm, so it remains a valid ordinary phase. The negative boundary is
+        # asymmetric: -10,400 composed with +10,000 publishes -504 ppm.
+        self.assertEqual(hooks(10_500.0), (-10_000, -10_000, 900))
+        self.assertAlmostEqual(
+            microvm_tests.time_host_correction_composed_ppm(10_500.0, -10_000),
+            395.0,
+        )
+        self.assertEqual(hooks(-10_396.0), (10_000, 10_000, -900))
+        # At the ABI's minimum TSC rate, Linux's kHz rounding turns the
+        # otherwise valid -499.96 ppm boundary into -501.957 ppm.
+        with self.assertRaisesRegex(RuntimeError, "guest -501.957 ppm at 500000999 Hz"):
+            hooks(-10_396.0, 500_000_999)
+        # The opposite boundary publishes +500.930 ppm but needs only
+        # +498.931 ppm from Linux, so both the solver and checker accept it.
+        tsc_hz = 500_000_999
+        self.assertEqual(hooks(10_607.0, tsc_hz), (-10_000, -10_000, 900))
+        published = microvm_tests.time_host_correction_composed_ppm(10_607.0, -10_000)
+        required = microvm_tests.time_host_correction_guest_ppm(published, tsc_hz)
+        self.assertAlmostEqual(published, 500.93, places=3)
+        self.assertAlmostEqual(required, 498.931, places=3)
+        correction = round(published * 65_536)
+        boundary = self.report(
+            frequency_ppb=round(required * 1000),
+            correction_ppb=round(published * 1000),
+            samples=((1_000, correction), (1_000, correction)),
+            host_ppm=published,
+            tsc_hz=tsc_hz,
+        )
+        self.assertIn("frequency_ppb=498931", self.check(boundary))
+        for host_ppm in (10_607.0, -10_400.0):
+            with (
+                self.subTest(host_ppm=host_ppm),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "cannot be composed with Linux's rounded TSC rate below its "
+                    "500 ppm limit within OpenVMM's",
+                ),
+            ):
+                hooks(host_ppm)
+
+    def test_the_scenario_hooks_its_boot_and_each_restore(self):
+        # An unhooked cold boot's sample gives the host's own correction, against
+        # whose sign the cold boot and the first restore publish 200 and 150 ppm,
+        # within Linux's limit even on a host at 400 ppm, and with whose sign the
+        # limit phase's hook extends it past that limit.
+        for host_ppm, hooks in (
+            (0.0, (-200, -150, 900)),
+            (-100.0, (300, 250, -900)),
+            (400.0, (-600, -550, 900)),
+            (-400.0, (600, 550, -900)),
+            (10_000.0, (-10_000, -10_000, 900)),
+            (-10_000.0, (10_000, 10_000, -900)),
+            (10_500.0, (-10_000, -10_000, 900)),
+        ):
+            with self.subTest(host_ppm=host_ppm):
+                self.run_scenario(host_ppm, hooks)
+
+    def phase_report(self, ppm: float, *, flags: str = "0x08") -> str:
+        """Return the report of a guest that holds the published correction of
+        ``ppm``, within Linux's limit, and whose clock and host UTC run at it."""
+        correction = round(ppm * 65_536)
+        return self.report(
+            frequency_ppb=round(ppm * 1000) - 500,
+            correction_ppb=round(ppm * 1000),
+            samples=((1_000, correction), (1_000, correction)),
+            host_ppm=ppm,
+            flags=flags,
+        )
+
+    def run_scenario(self, host_ppm: float, hooks: tuple[int, int, int]) -> None:
+        commands: list[list[str]] = []
+        scripts: list[str] = []
+        limit_ppm = hooks[2]
+        limit_correction = round(
+            microvm_tests.time_host_correction_composed_ppm(host_ppm, limit_ppm)
+            * 65_536
+        )
+        held = 500_000 if limit_correction > 0 else -500_000
+
+        def published(command: Sequence[str]) -> float:
+            hook = command[command.index("--x-time-abi-test-hook") + 1]
+            return microvm_tests.time_host_correction_composed_ppm(
+                host_ppm, int(hook.removeprefix("host-rate-offset-ppm="))
+            )
+
+        def boot(
+            command: Sequence[str], script: str, *_args: object, **_kwargs: object
+        ) -> dict[str, str]:
+            commands.append(list(command))
+            scripts.append(script)
+            if "--x-time-abi-test-hook" not in command:
+                return {"output": self.phase_report(host_ppm, flags="0x00")}
+            return {"output": self.phase_report(published(command))}
+
+        def restore(command: Sequence[str], **_kwargs: object) -> bytes:
+            commands.append(list(command))
+            if f"host-rate-offset-ppm={limit_ppm}" in command:
+                return self.report(
+                    frequency_ppb=held,
+                    correction_ppb=round(limit_correction * 1000 / 65_536),
+                    limited=1,
+                    samples=((0, limit_correction),),
+                ).encode()
+            return self.phase_report(published(command)).encode()
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests, "run_guest_script", side_effect=boot),
+            patch.object(microvm_tests, "capture_snapshot") as capture,
+            patch.object(microvm_tests, "_measure_restore", side_effect=restore),
+            patch.object(microvm_tests, "_check_restore_warp") as warp,
+            patch.object(microvm_tests, "_check_restore_status") as status,
+            redirect_stdout(io.StringIO()) as stdout,
+        ):
+            microvm_tests.run_time_host_correction(
+                Path("openvmm"),
+                Path("vmlinux"),
+                Path("initrd"),
+                "kvm",
+                memory_mib=256,
+                timeout=60,
+                output_dir=Path(temporary),
+            )
+        # The probe boots without the hook and takes its samples at once.
+        self.assertEqual(len(commands), 4)
+        self.assertNotIn("--x-time-abi-test-hook", commands[0])
+        self.assertIn("sleep 0\n", scripts[0])
+        self.assertIn("sleep 5\n", scripts[1])
+        self.assertEqual(
+            [
+                command[command.index("--x-time-abi-test-hook") + 1]
+                for command in commands[1:]
+            ],
+            [f"host-rate-offset-ppm={hook}" for hook in hooks],
+        )
+        # The capture runs without the hook, and its guest reports again after
+        # every restore, then runs the restore checks.
+        captured = capture.call_args.args[0]
+        self.assertNotIn("--x-time-abi-test-hook", captured)
+        self.assertTrue(
+            capture.call_args.kwargs["post_restore_script"].startswith(
+                microvm_tests.time_host_correction_script()
+            )
+        )
+        self.assertIn("--restore-snapshot", commands[2])
+        self.assertEqual((warp.call_count, status.call_count), (2, 2))
+        self.assertIn(
+            f"the host's own correction is {host_ppm:+.3f} ppm", stdout.getvalue()
+        )
+        self.assertIn(f"frequency_ppb={held} frequency_limited=1", stdout.getvalue())
+
+
+class DurationReportTests(unittest.TestCase):
+    # 2027-01-15T08:00:00Z on the wall clock, which the tests' monotonic
+    # clock reads as 100.
+    EPOCH = 1_800_000_000.0
+    GITHUB = {
+        "GITHUB_ACTIONS": "true",
+        "GITHUB_REPOSITORY": "microsoft/nvx",
+        "GITHUB_WORKFLOW": "CI",
+        "GITHUB_RUN_ID": "39585909588",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_JOB": "test",
+        "GITHUB_EVENT_NAME": "pull_request",
+        "GITHUB_REF": "refs/pull/694/merge",
+        "GITHUB_SHA": "919a774c6" + "0" * 31,
+        "RUNNER_NAME": "azure-kvm-2",
+        "RUNNER_OS": "Linux",
+    }
+
+    def _report(
+        self, path: Path, readings: list[float]
+    ) -> microvm_durations.DurationReport:
+        """Open a report on a run that started at 100 on a clock that
+        returns `readings`, the first when the report opens."""
+        return microvm_durations.DurationReport(
+            path,
+            backend="kvm",
+            guest="alpine",
+            kernel="debug",
+            processors=[1, 8, 1],
+            scenarios=("smp", "lifecycle"),
+            clock=iter(readings).__next__,
+            wall_clock=lambda: self.EPOCH + readings[0] - 100,
+            started=100.0,
+        )
+
+    def test_spans_cover_the_run_from_the_process_start_without_gaps(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / microvm_durations.REPORT_NAME
+            written: list[int] = []
+            with (
+                patch.dict(os.environ, self.GITHUB),
+                redirect_stdout(io.StringIO()) as stdout,
+            ):
+                with self._report(path, [101.5, 102, 105.25, 110, 110.5]) as report:
+                    # Each record is on disk as soon as its span ends.
+                    written.append(len(_read_report(path)))
+                    report.start("smp", "Running smp", processors=[8, 8])
+                    written.append(len(_read_report(path)))
+                    report.start("lifecycle", "Running lifecycle")
+                    written.append(len(_read_report(path)))
+                    report.finish()
+                    written.append(len(_read_report(path)))
+            records = _read_report(path)
+            raw = path.read_bytes()
+
+        self.assertEqual(written, [1, 2, 3, 4])
+        self.assertNotIn(b"\r", raw)
+        self.assertEqual(stdout.getvalue(), "Running smp\nRunning lifecycle\n")
+        dimensions = {"guest": "alpine", "backend": "kvm", "kernel": "debug"}
+        passed = {"outcome": "passed", "error": None}
+        self.assertEqual(
+            records,
+            [
+                {
+                    "record": "run",
+                    "schema": "nvx-microvm-durations",
+                    "schema_version": 1,
+                    "started_at": "2027-01-15T08:00:00.000Z",
+                    **dimensions,
+                    "processors": [1, 8],
+                    "scenarios": ["smp", "lifecycle"],
+                    "github": {
+                        "repository": "microsoft/nvx",
+                        "workflow": "CI",
+                        "run_id": "39585909588",
+                        "run_attempt": "2",
+                        "job": "test",
+                        "event_name": "pull_request",
+                        "ref": "refs/pull/694/merge",
+                        "sha": self.GITHUB["GITHUB_SHA"],
+                        "runner_name": "azure-kvm-2",
+                        "runner_os": "Linux",
+                    },
+                },
+                {
+                    "record": "setup",
+                    "started_at": "2027-01-15T08:00:00.000Z",
+                    "seconds": 2.0,
+                    **passed,
+                },
+                {
+                    "record": "scenario",
+                    "scenario": "smp",
+                    **dimensions,
+                    "processors": [8],
+                    "started_at": "2027-01-15T08:00:02.000Z",
+                    "seconds": 3.25,
+                    **passed,
+                },
+                {
+                    "record": "scenario",
+                    "scenario": "lifecycle",
+                    **dimensions,
+                    "processors": None,
+                    "started_at": "2027-01-15T08:00:05.250Z",
+                    "seconds": 4.75,
+                    **passed,
+                },
+                {
+                    "record": "teardown",
+                    "started_at": "2027-01-15T08:00:10.000Z",
+                    "seconds": 0.5,
+                    **passed,
+                },
+            ],
+        )
+        self.assertEqual(sum(record["seconds"] for record in records[1:]), 10.5)
+
+    def test_a_failure_ends_its_scenario_and_the_run(self):
+        for error, outcome, message in (
+            (RuntimeError("no marker\nin the log"), "failed", None),
+            (TimeoutError(), "failed", "TimeoutError"),
+            (RuntimeError("x" * 5000), "failed", "RuntimeError: " + "x" * 986),
+            (KeyboardInterrupt(), "interrupted", None),
+        ):
+            with (
+                self.subTest(error=type(error).__name__),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                path = Path(temporary) / microvm_durations.REPORT_NAME
+                with (
+                    redirect_stdout(io.StringIO()),
+                    self.assertRaises(type(error)) as raised,
+                    self._report(path, [101, 102, 103, 104, 105]) as report,
+                ):
+                    report.start("smp", "Running smp", processors=[1])
+                    report.start("lifecycle", "Running lifecycle")
+                    raise error
+                records = _read_report(path)
+                self.assertIs(raised.exception, error)
+                if message is None and outcome == "failed":
+                    message = f"RuntimeError: {error}"
+                self.assertEqual(
+                    [
+                        (record["record"], record.get("scenario"), record["seconds"])
+                        for record in records[1:]
+                    ],
+                    [
+                        ("setup", None, 2),
+                        ("scenario", "smp", 1),
+                        ("scenario", "lifecycle", 1),
+                        ("teardown", None, 1),
+                    ],
+                )
+                self.assertEqual(
+                    [(record["outcome"], record["error"]) for record in records[1:]],
+                    [
+                        ("passed", None),
+                        ("passed", None),
+                        (outcome, message),
+                        (outcome, message),
+                    ],
+                )
+                self.assertLessEqual(
+                    len(records[-1]["error"] or ""),
+                    microvm_durations.ERROR_CHARACTERS,
+                )
+
+    def test_a_failure_before_the_first_scenario_ends_the_setup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / microvm_durations.REPORT_NAME
+            with (
+                self.assertRaisesRegex(ValueError, "no counts"),
+                self._report(path, [101, 102, 103]),
+            ):
+                raise ValueError("no counts")
+            records = _read_report(path)
+        self.assertEqual(
+            [
+                (record["record"], record["seconds"], record["outcome"])
+                for record in records[1:]
+            ],
+            [("setup", 2, "failed"), ("teardown", 1, "failed")],
+        )
+
+    def test_a_run_without_scenarios_has_only_setup_and_teardown(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / microvm_durations.REPORT_NAME
+            with self._report(path, [101, 102, 103]) as report:
+                report.finish()
+            records = _read_report(path)
+        self.assertEqual(
+            [
+                (record["record"], record["seconds"], record["outcome"])
+                for record in records[1:]
+            ],
+            [("setup", 2, "passed"), ("teardown", 1, "passed")],
+        )
+
+    def test_a_report_replaces_the_previous_runs_report(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / microvm_durations.REPORT_NAME
+            path.write_text('{"record":"stale"}\n' * 3, encoding="utf-8")
+            with self._report(path, [101, 102, 103]) as report:
+                report.finish()
+            records = _read_report(path)
+        self.assertEqual(
+            [record["record"] for record in records], ["run", "setup", "teardown"]
+        )
+
+    def test_a_report_that_cannot_end_keeps_the_runs_own_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "logs"
+            directory.mkdir()
+            path = directory / microvm_durations.REPORT_NAME
+            with (
+                redirect_stdout(io.StringIO()),
+                patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                self.assertRaisesRegex(RuntimeError, "no marker"),
+                self._report(path, [101, 102, 103, 104]) as report,
+            ):
+                report.start("smp", "Running smp")
+                shutil.rmtree(directory)
+                raise RuntimeError("no marker")
+            self.assertIn(f"warning: could not complete {path}: ", stderr.getvalue())
+            # Without an error of the run's own, the report's error stands.
+            directory.mkdir()
+            with (
+                self.assertRaises(OSError),
+                self._report(path, [101, 102]),
+            ):
+                shutil.rmtree(directory)
+
+    def test_github_identifies_the_job_only_in_github_actions(self):
+        self.assertIsNone(microvm_durations.github_job({}))
+        self.assertIsNone(
+            microvm_durations.github_job({**self.GITHUB, "GITHUB_ACTIONS": "false"})
+        )
+        self.assertEqual(
+            microvm_durations.github_job(
+                {"GITHUB_ACTIONS": "true", "GITHUB_RUN_ID": "39585909588"}
+            ),
+            {
+                name: "39585909588" if name == "run_id" else None
+                for name, _ in common.GITHUB_VARIABLES
+            },
+        )
+
+    def test_proc_start_follows_any_command_name(self):
+        # The command name may hold spaces and parentheses; starttime is the
+        # 22nd field.
+        fields = ["S", *map(str, range(4, 22)), "4321", *["0"] * 30]
+        stat = "1234 (nvx) (python 3) " + " ".join(fields) + "\n"
+        self.assertEqual(microvm_durations.proc_start_seconds(stat, 100), 43.21)
+
+    @unittest.skipUnless(sys.platform in ("linux", "win32"), "needs Linux or Windows")
+    def test_process_age_counts_from_the_process_start(self):
+        loaded = time.monotonic() - _LOADED
+        age = microvm_durations.process_age_seconds()
+        assert age is not None
+        # The process started before it loaded the tests, and not long ago.
+        self.assertGreaterEqual(age, loaded)
+        self.assertLess(age, 24 * 3600)
+
+
+def _write_durations(
+    path: Path,
+    backend: str,
+    executions: list[tuple[str, float, str]],
+    *,
+    guest: str = "alpine",
+    kernel: str = "default",
+    processors: list[int] | None = None,
+    run: str | None = "39792079980-1",
+    teardown: bool = True,
+) -> Path:
+    """Write a scenario duration report of (scenario, seconds, outcome)
+    executions, as test-microvm writes it."""
+    run_id, _, attempt = (run or "").partition("-")
+    records: list[dict[str, object]] = [
+        {
+            "record": "run",
+            "schema": microvm_durations.SCHEMA,
+            "schema_version": microvm_durations.SCHEMA_VERSION,
+            "started_at": "2026-10-22T14:10:03.792Z",
+            "guest": guest,
+            "backend": backend,
+            "kernel": kernel,
+            "processors": [1, 2, 4, 8] if processors is None else processors,
+            "scenarios": list(dict.fromkeys(name for name, _, _ in executions)),
+            "github": (
+                None
+                if run is None
+                else {"run_id": run_id, "run_attempt": attempt, "job": "test"}
+            ),
+        },
+        {"record": "setup", "seconds": 0.25, "outcome": "passed", "error": None},
+        *(
+            {
+                "record": "scenario",
+                "scenario": name,
+                "guest": guest,
+                "backend": backend,
+                "kernel": kernel,
+                "seconds": seconds,
+                "outcome": outcome,
+                "error": None,
+            }
+            for name, seconds, outcome in executions
+        ),
+    ]
+    if teardown:
+        records.append(
+            {"record": "teardown", "seconds": 0.1, "outcome": "passed", "error": None}
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    return path
+
+
+class MicrovmShardTests(unittest.TestCase):
+    """The checked-in partition of the default suite into the shards that CI
+    runs in parallel, the planner that writes it, and test-microvm --shard
+    (#696)."""
+
+    def _replace(
+        self, backend: str, shards: tuple[tuple[str, ...], ...]
+    ) -> microvm_shards.Partition:
+        """Return the checked-in partition with other shards of a backend."""
+        partition = microvm_shards.load_partition()
+        old = partition.backends[backend]
+        return microvm_shards.Partition(
+            partition.runs,
+            {
+                **partition.backends,
+                backend: microvm_shards.BackendShards(old.seconds, shards),
+            },
+        )
+
+    def _run_shard(
+        self,
+        output: Path,
+        *options: str,
+        partition: microvm_shards.Partition | None = None,
+    ) -> list[str]:
+        """Run test-microvm with every scenario stubbed, and return the
+        scenarios that its report times."""
+        args = nvx.parse_args(["test-microvm", *options, "--output-dir", str(output)])
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(microvm_tests, "validate_openvmm_test_backend")
+            )
+            stack.enter_context(
+                patch.object(microvm_tests, "require_file", side_effect=require)
+            )
+            runners = [
+                stack.enter_context(patch.object(microvm_tests, name))
+                for name in _scenario_runners()
+            ]
+            if partition is not None:
+                stack.enter_context(
+                    patch.object(
+                        microvm_tests, "load_partition", return_value=partition
+                    )
+                )
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            self.assertEqual(microvm_tests.run(args), 0)
+            self.assertTrue(any(runner.called for runner in runners))
+        records = _read_report(output / microvm_durations.REPORT_NAME)
+        executed = {
+            record["scenario"] for record in records if record["record"] == "scenario"
+        }
+        self.assertEqual(executed, set(records[0]["scenarios"]))
+        return records[0]["scenarios"]
+
+    def test_partition_puts_each_default_scenario_in_one_shard_of_each_backend(
+        self,
+    ):
+        partition = microvm_shards.load_partition()
+        suite = microvm_tests.default_suite()
+        self.assertEqual(microvm_shards.partition_problems(partition, suite), [])
+        self.assertEqual(tuple(partition.backends), microvm_tests.OPENVMM_TEST_BACKENDS)
+        self.assertTrue(partition.runs)
+        for backend, shards in partition.backends.items():
+            with self.subTest(backend=backend):
+                self.assertGreaterEqual(len(shards.shards), 2)
+                self.assertTrue(all(shards.shards))
+                self.assertEqual(
+                    sorted(scenario for shard in shards.shards for scenario in shard),
+                    sorted(suite),
+                )
+                self.assertEqual(set(shards.seconds), set(suite))
+
+    def test_partition_is_the_balanced_plan_of_its_durations(self):
+        # The file is the planner's output for its own durations: no move or
+        # swap shortens a longest shard by MINIMUM_GAIN_TENTHS, and each
+        # shard's duration is the sum of its scenarios'.
+        partition = microvm_shards.load_partition()
+        self.assertEqual(
+            microvm_shards.PARTITION_PATH.read_text(encoding="utf-8"),
+            microvm_shards.partition_json(partition),
+        )
+        self.assertEqual(
+            microvm_shards.plan_partition(
+                partition,
+                microvm_tests.default_suite(),
+                samples={},
+                runs=(),
+                estimates={},
+                counts={},
+            ),
+            partition,
+        )
+
+    def test_a_default_run_selects_the_default_suite_and_the_public_scenarios(self):
+        # CI runs the public sandbox scenarios beside the Ubuntu artifacts that
+        # they read, in its guest and sandbox jobs, and the rest of a default
+        # run in the shards of the default suite.
+        with tempfile.TemporaryDirectory() as temporary:
+            selected = self._run_shard(Path(temporary), "--backend", "kvm")
+        self.assertEqual(selected, list(microvm_tests.MICROVM_TEST_SCENARIOS))
+        self.assertEqual(
+            set(selected) - set(microvm_tests.default_suite()),
+            microvm_tests.PUBLIC_SANDBOX_SCENARIOS,
+        )
+        self.assertIn("managed-exec-config", selected)
+        self.assertNotIn("smp-lapic", selected)
+
+    def test_shards_run_each_default_scenario_once_on_each_backend(self):
+        partition = microvm_shards.load_partition()
+        suite = microvm_tests.default_suite()
+        for backend, shards in partition.backends.items():
+            ran: list[str] = []
+            for index, shard in enumerate(shards.shards, 1):
+                spec = f"{index}/{len(shards.shards)}"
+                with (
+                    self.subTest(backend=backend, shard=spec),
+                    tempfile.TemporaryDirectory() as temporary,
+                ):
+                    selected = self._run_shard(
+                        Path(temporary), "--backend", backend, "--shard", spec
+                    )
+                    # In suite order, as an unsharded run orders them.
+                    self.assertEqual(
+                        selected, [scenario for scenario in suite if scenario in shard]
+                    )
+                    ran.extend(selected)
+            with self.subTest(backend=backend):
+                self.assertEqual(sorted(ran), sorted(suite))
+
+    def test_shard_fails_before_any_scenario_unless_each_is_in_one_shard(self):
+        partition = microvm_shards.load_partition()
+        first, second, *_ = partition.backends["kvm"].shards
+        scenarios = microvm_tests.MICROVM_TEST_SCENARIOS
+        cases: list[tuple[str, dict[str, Any], str, str]] = [
+            # A new default scenario that no shard runs.
+            (
+                "new scenario",
+                {"scenarios": (*scenarios, "brand-new")},
+                "1/2",
+                r"kvm: brand-new is in no shard; .*whp: brand-new is in no shard",
+            ),
+            # A scenario that a change removes but a shard still lists.
+            (
+                "removed scenario",
+                {"scenarios": tuple(s for s in scenarios if s != "lifecycle")},
+                "1/2",
+                r"kvm: lifecycle is not a default scenario",
+            ),
+            (
+                "scenario in two shards",
+                {"partition": self._replace("kvm", (first, (*second, first[0])))},
+                "2/2",
+                rf"kvm: {first[0]} is in more than one shard: 1, 2",
+            ),
+            (
+                "scenario in no shard",
+                {"partition": self._replace("kvm", (first[1:], second))},
+                "1/2",
+                rf"kvm: {first[0]} is in no shard",
+            ),
+            (
+                "empty shard",
+                {"partition": self._replace("kvm", (first, second, ()))},
+                "1/3",
+                r"kvm shard 3 is empty",
+            ),
+            # CI runs fewer or more jobs than the backend has shards.
+            ("fewer jobs", {}, "1/1", r"splits the kvm suite into 2 shards, but"),
+            ("more jobs", {}, "3/3", r"this run is shard 3 of 3"),
+        ]
+
+        def require(path: Path, _description: str) -> Path:
+            return path
+
+        for name, changes, spec, message in cases:
+            with (
+                self.subTest(case=name),
+                tempfile.TemporaryDirectory() as temporary,
+                ExitStack() as stack,
+            ):
+                if "scenarios" in changes:
+                    stack.enter_context(
+                        patch.object(
+                            microvm_tests,
+                            "MICROVM_TEST_SCENARIOS",
+                            changes["scenarios"],
+                        )
+                    )
+                if "partition" in changes:
+                    stack.enter_context(
+                        patch.object(
+                            microvm_tests,
+                            "load_partition",
+                            return_value=changes["partition"],
+                        )
+                    )
+                stack.enter_context(
+                    patch.object(microvm_tests, "validate_openvmm_test_backend")
+                )
+                stack.enter_context(
+                    patch.object(microvm_tests, "require_file", side_effect=require)
+                )
+                runners = [
+                    stack.enter_context(patch.object(microvm_tests, runner))
+                    for runner in _scenario_runners()
+                ]
+                args = nvx.parse_args(
+                    [
+                        "test-microvm",
+                        "--backend",
+                        "kvm",
+                        "--shard",
+                        spec,
+                        "--output-dir",
+                        temporary,
+                    ]
+                )
+                with self.assertRaisesRegex(common.ScriptError, message) as raised:
+                    microvm_tests.run(args)
+                self.assertFalse(any(runner.called for runner in runners))
+                self.assertFalse(
+                    (Path(temporary) / microvm_durations.REPORT_NAME).exists()
+                )
+                if spec != "1/1" and spec != "3/3":
+                    self.assertIn("plan-microvm-shards", str(raised.exception))
+
+    def test_shard_takes_only_the_default_alpine_suite(self):
+        for options in (
+            ("--scenario", "smp"),
+            ("--debug-kernel",),
+            ("--guest", "ubuntu"),
+        ):
+            with self.subTest(options=options):
+                args = nvx.parse_args(
+                    ["test-microvm", "--backend", "kvm", "--shard", "1/2", *options]
+                )
+                with (
+                    patch.object(microvm_tests, "validate_openvmm_test_backend"),
+                    patch.object(microvm_tests, "require_file") as require,
+                    self.assertRaisesRegex(
+                        common.ScriptError, "--shard runs a shard of the default"
+                    ),
+                ):
+                    microvm_tests.run(args)
+                require.assert_not_called()
+        self.assertEqual(
+            nvx.parse_args(
+                ["test-microvm", "--backend", "whp", "--shard", "2/2"]
+            ).shard,
+            (2, 2),
+        )
+        self.assertIsNone(nvx.parse_args(["test-microvm", "--backend", "whp"]).shard)
+        for value in ("0/2", "3/2", "1", "1/0", "a/b", "1/2/3", "", "01/2"):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(SystemExit),
+                patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                nvx.parse_args(["test-microvm", "--backend", "kvm", "--shard", value])
+
+    def test_plan_balances_the_shards_of_the_previous_partition(self):
+        seconds = {"a": 10.0, "b": 9.0, "c": 2.0, "d": 1.0}
+        # The best change swaps a and c, which ties with swapping b and d.
+        self.assertEqual(
+            microvm_shards.plan_shards(seconds, 2, [("a", "b"), ("c", "d")]),
+            (("b", "c"), ("a", "d")),
+        )
+        # The order in which durations and shards list scenarios is no input.
+        self.assertEqual(
+            microvm_shards.plan_shards(
+                dict(reversed(seconds.items())), 2, [("b", "a"), ("d", "c")]
+            ),
+            (("b", "c"), ("a", "d")),
+        )
+
+    def test_plan_keeps_shards_that_no_change_shortens_by_a_second(self):
+        # Moving c shortens the longest shard by 0.8 s only.
+        self.assertEqual(
+            microvm_shards.plan_shards(
+                {"a": 10.0, "b": 9.0, "c": 0.8}, 2, [("a", "c"), ("b",)]
+            ),
+            (("a", "c"), ("b",)),
+        )
+        # By 1 s, it moves; the move comes before the swap of a and b that
+        # balances the shards as well.
+        self.assertEqual(
+            microvm_shards.plan_shards(
+                {"a": 10.0, "b": 9.0, "c": 1.2}, 2, [("a", "c"), ("b",)]
+            ),
+            (("a",), ("b", "c")),
+        )
+
+    def test_plan_places_scenarios_without_a_shard_longest_first(self):
+        # x is no longer a scenario; c, d, and e have no shard yet.
+        self.assertEqual(
+            microvm_shards.plan_shards(
+                {"a": 5.0, "b": 4.0, "c": 3.0, "d": 3.0, "e": 1.0},
+                2,
+                [("x", "a"), ("b",)],
+            ),
+            (("a", "d"), ("b", "c", "e")),
+        )
+        # A new plan starts from no shards at all.
+        self.assertEqual(
+            microvm_shards.plan_shards({"a": 5.0, "b": 4.0, "c": 3.0, "d": 2.0}, 2),
+            (("a", "d"), ("b", "c")),
+        )
+
+    def test_plan_fills_added_shards_and_rejects_more_than_scenarios(self):
+        seconds = {"a": 3.0, "b": 3.0, "c": 3.0}
+        self.assertEqual(
+            microvm_shards.plan_shards(seconds, 3, [("a", "b", "c")]),
+            (("c",), ("a",), ("b",)),
+        )
+        self.assertEqual(
+            microvm_shards.plan_shards(seconds, 1, [("a",), ("b",), ("c",)]),
+            (("a", "b", "c"),),
+        )
+        for count in (0, 4):
+            with (
+                self.subTest(count=count),
+                self.assertRaisesRegex(common.ScriptError, "cannot split 3 scenarios"),
+            ):
+                microvm_shards.plan_shards(seconds, count)
+
+    def test_plan_fills_every_shard_where_no_move_shortens_one_enough(self):
+        # No move of a scenario that takes no time, or less than a second,
+        # into an empty shard shortens a shard by a second, yet each shard
+        # takes one: the longest of the longest shard that has more than one.
+        self.assertEqual(
+            microvm_shards.plan_shards(
+                {"a": 5.0, "b": 0.5, "c": 0.0, "d": 0.3}, 4, [("a", "b", "c", "d")]
+            ),
+            (("c",), ("a",), ("b",), ("d",)),
+        )
+        # As many shards as the checked-in partition has scenarios.
+        partition = microvm_shards.load_partition()
+        suite = microvm_tests.default_suite()
+        planned = microvm_shards.plan_partition(
+            partition,
+            suite,
+            samples={},
+            runs=(),
+            estimates={},
+            counts=dict.fromkeys(partition.backends, len(suite)),
+        )
+        self.assertEqual(microvm_shards.partition_problems(planned, suite), [])
+        for backend, shards in planned.backends.items():
+            with self.subTest(backend=backend):
+                self.assertEqual(
+                    [len(shard) for shard in shards.shards], [1] * len(suite)
+                )
+
+    def test_reports_give_samples_of_the_default_suite_only(self):
+        suite = ("console-exit", "smp", "lifecycle")
+        console_exit = [("console-exit", 2.0, "passed")] * 4
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = _write_durations(
+                root / "1" / microvm_durations.REPORT_NAME,
+                "kvm",
+                [*console_exit, ("smp", 5.0, "passed"), ("lifecycle", 3.0, "failed")],
+                run="1-1",
+            )
+            _write_durations(
+                root / "2" / "shard" / microvm_durations.REPORT_NAME,
+                "kvm",
+                [
+                    ("console-exit", 3.0, "passed"),
+                    ("console-exit", 3.0, "passed"),
+                    ("console-exit", 3.0, "passed"),
+                    ("console-exit", 3.0, "passed"),
+                    ("smp", 7.0, "passed"),
+                    ("lifecycle", 1.5, "passed"),
+                ],
+                run="2-1",
+            )
+            # A console-exit that failed at its second processor count.
+            _write_durations(
+                root / "3" / microvm_durations.REPORT_NAME,
+                "kvm",
+                [("console-exit", 2.0, "passed"), ("console-exit", 9.0, "failed")],
+                run="3-1",
+            )
+            # Reports of other runs than the default suite's, and of a run
+            # that was killed.
+            smp = [("smp", 99.0, "passed")]
+            _write_durations(
+                root / "debug" / microvm_durations.REPORT_NAME,
+                "kvm",
+                smp,
+                kernel="debug",
+            )
+            _write_durations(
+                root / "ubuntu" / microvm_durations.REPORT_NAME,
+                "kvm",
+                smp,
+                guest="ubuntu",
+            )
+            _write_durations(
+                root / "one-processor" / microvm_durations.REPORT_NAME,
+                "kvm",
+                smp,
+                processors=[1],
+            )
+            _write_durations(
+                root / "killed" / microvm_durations.REPORT_NAME,
+                "kvm",
+                smp,
+                teardown=False,
+            )
+            _write_durations(
+                root / "whp" / microvm_durations.REPORT_NAME,
+                "whp",
+                [("smp", 9.0, "passed"), ("managed-exec-config", 5.0, "passed")],
+                run=None,
+            )
+            samples, runs = microvm_shards.read_reports(
+                # The same report, found twice, counts once.
+                [root, first],
+                suite=suite,
+                processors=(1, 2, 4, 8),
+            )
+            self.assertEqual(
+                {
+                    backend: {name: sorted(values) for name, values in found.items()}
+                    for backend, found in samples.items()
+                },
+                {
+                    "kvm": {
+                        "console-exit": [8.0, 12.0],
+                        "smp": [5.0, 7.0],
+                        "lifecycle": [1.5],
+                    },
+                    "whp": {"smp": [9.0]},
+                },
+            )
+            self.assertEqual(runs, {"1-1", "2-1"})
+
+            (root / "other").mkdir()
+            (root / "other" / microvm_durations.REPORT_NAME).write_text(
+                '{"record":"run","schema":"other","schema_version":1}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(common.ScriptError, "is not a scenario"):
+                microvm_shards.read_reports([root], suite=suite, processors=(1,))
+            with self.assertRaisesRegex(common.ScriptError, "neither a report"):
+                microvm_shards.read_reports(
+                    [root / "missing"], suite=suite, processors=(1,)
+                )
+
+    def test_plan_command_writes_and_updates_a_partition(self):
+        scenarios = ("console-exit", "smp", "lifecycle", "managed-exec-config")
+
+        def plan(*options: str) -> str:
+            args = nvx.parse_args(
+                ["plan-microvm-shards", "--partition", str(path), *options]
+            )
+            with redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(args.handler(args), 0)
+            return stdout.getvalue()
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(microvm_tests, "MICROVM_TEST_SCENARIOS", scenarios),
+        ):
+            root = Path(temporary)
+            path = root / "shards.json"
+            reports = root / "reports"
+            for run, factor in (("7-1", 1.0), ("8-2", 1.5), ("9-1", 2.0)):
+                for backend in ("kvm", "mshv", "whp"):
+                    _write_durations(
+                        reports / run / backend / microvm_durations.REPORT_NAME,
+                        backend,
+                        [
+                            *[("console-exit", 2.0 * factor, "passed")] * 4,
+                            ("smp", 6.0 * factor, "passed"),
+                            ("lifecycle", 1.0 * factor, "passed"),
+                        ],
+                        run=run,
+                    )
+            with self.assertRaisesRegex(
+                common.ScriptError, "the partition has no kvm shards"
+            ):
+                plan("--report", str(reports))
+            output = plan(
+                "--report",
+                str(reports),
+                "--shards",
+                "kvm=2",
+                "--shards",
+                "mshv=1",
+                "--shards",
+                "whp=2",
+            )
+            self.assertIn("kvm: 2 shards, 22.5 s in all", output)
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("\r", text)
+            partition = microvm_shards.load_partition(path)
+            self.assertEqual(partition.runs, ("7-1", "8-2", "9-1"))
+            for backend, count in (("kvm", 2), ("mshv", 1), ("whp", 2)):
+                shards = partition.backends[backend]
+                self.assertEqual(
+                    dict(shards.seconds),
+                    {"console-exit": 12.0, "smp": 9.0, "lifecycle": 1.5},
+                )
+                self.assertEqual(len(shards.shards), count)
+            self.assertEqual(
+                partition.backends["kvm"].shards,
+                (("console-exit",), ("lifecycle", "smp")),
+            )
+            self.assertEqual(partition.backends["kvm"].shard_seconds(), (12.0, 10.5))
+
+            # Without reports, the plan keeps the durations, runs, and shards.
+            plan()
+            self.assertEqual(path.read_text(encoding="utf-8"), text)
+            # An estimate replaces a duration on every backend.
+            output = plan("--seconds", "smp=20")
+            partition = microvm_shards.load_partition(path)
+            self.assertEqual(
+                {
+                    backend: shards.seconds["smp"]
+                    for backend, shards in partition.backends.items()
+                },
+                {"kvm": 20.0, "mshv": 20.0, "whp": 20.0},
+            )
+            self.assertEqual(
+                partition.backends["kvm"].shards,
+                (("console-exit", "lifecycle"), ("smp",)),
+            )
+            self.assertIn("  lifecycle: shard 2 -> shard 1", output)
+
+            # A scenario that nothing measures needs an estimate.
+            with patch.object(
+                microvm_tests, "MICROVM_TEST_SCENARIOS", (*scenarios, "brand-new")
+            ):
+                with self.assertRaisesRegex(
+                    common.ScriptError,
+                    "no report measures, and the partition has no duration of, "
+                    "brand-new on kvm, brand-new on mshv, brand-new on whp",
+                ):
+                    plan()
+                output = plan("--seconds", "brand-new=4")
+                self.assertIn("  brand-new: new -> shard", output)
+            for options, message in (
+                (("--seconds", "unknown=1"), "outside the default suite: unknown"),
+                (("--report", str(root / "empty")), "neither a report"),
+            ):
+                with (
+                    self.subTest(options=options),
+                    self.assertRaisesRegex(common.ScriptError, message),
+                ):
+                    plan(*options)
+            (root / "empty").mkdir()
+            with self.assertRaisesRegex(common.ScriptError, "no report of the default"):
+                plan("--report", str(root / "empty"))
+        for value in ("kvm", "kvm=0", "arm=2", "kvm=x"):
+            with (
+                self.subTest(shards=value),
+                self.assertRaises(SystemExit),
+                patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                nvx.parse_args(["plan-microvm-shards", "--shards", value])
+        for value in ("smp", "smp=-1", "=2", "smp=x", "smp=inf", "smp=nan"):
+            with (
+                self.subTest(seconds=value),
+                self.assertRaises(SystemExit),
+                patch("sys.stderr", new_callable=io.StringIO),
+            ):
+                nvx.parse_args(["plan-microvm-shards", "--seconds", value])
+
+    def test_partition_rejects_malformed_files(self):
+        valid = json.loads(microvm_shards.PARTITION_PATH.read_text(encoding="utf-8"))
+        cases: list[tuple[str, str, str]] = [
+            ("not JSON", "{", "is not valid JSON"),
+            (
+                "duplicate key",
+                '{"schema": 1, "schema": 2}',
+                "duplicate JSON property: schema",
+            ),
+            (
+                "other schema",
+                json.dumps({**valid, "schema_version": 2}),
+                "schema version 1",
+            ),
+            (
+                "malformed shard",
+                json.dumps(
+                    {
+                        **valid,
+                        "backends": {
+                            **valid["backends"],
+                            "kvm": {
+                                **valid["backends"]["kvm"],
+                                "shards": [{"seconds": 1, "scenarios": [1]}],
+                            },
+                        },
+                    }
+                ),
+                "malformed partition of kvm",
+            ),
+            (
+                "negative duration",
+                json.dumps(
+                    {
+                        **valid,
+                        "backends": {
+                            **valid["backends"],
+                            "whp": {
+                                **valid["backends"]["whp"],
+                                "seconds": {"smp": -1},
+                            },
+                        },
+                    }
+                ),
+                "malformed partition of whp",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "shards.json"
+            with self.assertRaisesRegex(common.ScriptError, "does not exist"):
+                microvm_shards.load_partition(path)
+            for name, text, message in cases:
+                with self.subTest(case=name):
+                    path.write_text(text, encoding="utf-8")
+                    with self.assertRaisesRegex(common.ScriptError, message):
+                        microvm_shards.load_partition(path)
 
 
 if __name__ == "__main__":

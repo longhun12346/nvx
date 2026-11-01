@@ -1,0 +1,225 @@
+//! Parses the kernel's hexadecimal socket addresses and classifies their reachability.
+
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+use super::diag::WildcardListener;
+use super::{FAMILY_IPV4, FAMILY_IPV6, PROTOCOL_TCP};
+use crate::guest::parse;
+
+/// Number of hexadecimal digits in which the kernel's socket tables render each 32-bit word of an
+/// address, with `%08X`: an IPv4 address is one word, and an IPv6 address four.
+const WORD_DIGITS: usize = 8;
+
+/// Address-family policy used while scanning one set of socket tables.
+pub(super) struct AddressContext<'a> {
+    /// Whether an unspecified IPv6 UDP socket accepts IPv4 by default.
+    pub(super) ipv6_dual_stack: bool,
+    /// Per-port IPv6 TCP socket diagnostics.
+    pub(super) wildcard_tcp: &'a [WildcardListener],
+}
+
+impl AddressContext<'_> {
+    /// Returns the families of an unspecified IPv6 socket.
+    fn wildcard_families(&self, protocol: u8, port: u16) -> u8 {
+        if protocol == PROTOCOL_TCP
+            && let Some(listener) = self
+                .wildcard_tcp
+                .iter()
+                .find(|listener| listener.port == port)
+        {
+            return if listener.dual_stack {
+                FAMILY_IPV4 | FAMILY_IPV6
+            } else {
+                FAMILY_IPV6
+            };
+        }
+        if self.ipv6_dual_stack {
+            FAMILY_IPV4 | FAMILY_IPV6
+        } else {
+            FAMILY_IPV6
+        }
+    }
+
+    /// Returns the families through which the kernel-rendered address is reachable.
+    ///
+    /// Loopback addresses, IPv6 link-local ones, and IPv4 loopback addresses mapped into IPv6 are
+    /// unreachable through the gateway, as the C program's `IN6_IS_ADDR_*` checks found them.
+    pub(super) fn reachable_families(
+        &self,
+        address: &[u8],
+        ipv6: bool,
+        protocol: u8,
+        port: u16,
+    ) -> u8 {
+        if !ipv6 {
+            return match decode_kernel_address::<4>(address).map(Ipv4Addr::from) {
+                Some(address) if !address.is_loopback() => FAMILY_IPV4,
+                _ => 0,
+            };
+        }
+
+        let Some(address) = decode_kernel_address::<16>(address).map(Ipv6Addr::from) else {
+            return 0;
+        };
+        if address.is_unspecified() {
+            return self.wildcard_families(protocol, port);
+        }
+        if address.is_loopback() || address.is_unicast_link_local() {
+            return 0;
+        }
+        match address.to_ipv4_mapped() {
+            Some(mapped) if mapped.is_loopback() => 0,
+            Some(_) => FAMILY_IPV4,
+            None => FAMILY_IPV6,
+        }
+    }
+}
+
+/// Decodes the kernel's rendering of an address of `N` bytes, each 32-bit word in `WORD_DIGITS`
+/// hexadecimal digits of its value as it lies in memory, into the address's bytes, or returns
+/// `None` for any other text.
+fn decode_kernel_address<const N: usize>(text: &[u8]) -> Option<[u8; N]> {
+    if text.len() != N / size_of::<u32>() * WORD_DIGITS {
+        return None;
+    }
+    let mut bytes = [0_u8; N];
+    for (digits, word) in text
+        .chunks_exact(WORD_DIGITS)
+        .zip(bytes.chunks_exact_mut(size_of::<u32>()))
+    {
+        let value = u32::try_from(parse::parse_hexadecimal(digits)?).ok()?;
+        word.copy_from_slice(&value.to_ne_bytes());
+    }
+    Some(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Reachability tests for IPv4, IPv6, and wildcard addresses.
+
+    use super::*;
+    use crate::guest::ingress::PROTOCOL_UDP;
+
+    /// Builds an address context for one test policy.
+    fn context<'a>(
+        ipv6_dual_stack: bool,
+        wildcard_tcp: &'a [WildcardListener],
+    ) -> AddressContext<'a> {
+        AddressContext {
+            ipv6_dual_stack,
+            wildcard_tcp,
+        }
+    }
+
+    /// Formats an IP address as Linux procfs renders its native-endian words.
+    fn kernel_address(address: std::net::IpAddr) -> String {
+        let octets = match address {
+            std::net::IpAddr::V4(address) => address.octets().to_vec(),
+            std::net::IpAddr::V6(address) => address.octets().to_vec(),
+        };
+        octets
+            .chunks(4)
+            .map(|word| format!("{:08X}", u32::from_ne_bytes(word.try_into().unwrap())))
+            .collect()
+    }
+
+    /// Verifies strict word parsing and IPv4 loopback exclusion.
+    #[test]
+    fn ipv4_requires_eight_hex_digits_and_excludes_loopback() {
+        let context = context(true, &[]);
+        assert_eq!(
+            context.reachable_families(b"00000000", false, PROTOCOL_TCP, 80),
+            FAMILY_IPV4
+        );
+        assert_eq!(
+            context.reachable_families(b"010200C0", false, PROTOCOL_TCP, 80),
+            FAMILY_IPV4
+        );
+        assert_eq!(
+            context.reachable_families(b"0100007F", false, PROTOCOL_TCP, 80),
+            0
+        );
+        // The kernel never signs or prefixes a word, as C's `strtoul` would have accepted.
+        for malformed in [
+            b"0".as_slice(),
+            b"000000000",
+            b"0000000g",
+            b"-0000001",
+            b"+0000001",
+            b"0x000001",
+            b" 0000001",
+        ] {
+            assert_eq!(
+                context.reachable_families(malformed, false, PROTOCOL_TCP, 80),
+                0,
+                "{}",
+                malformed.escape_ascii()
+            );
+        }
+    }
+
+    /// Verifies unreachable IPv6 classes and mapped-address family selection.
+    #[test]
+    fn ipv6_excludes_loopback_link_local_and_mapped_loopback() {
+        let context = context(true, &[]);
+        for excluded in ["::1", "fe80::1", "febf::abcd", "::ffff:127.0.0.1"] {
+            let address = kernel_address(excluded.parse().unwrap());
+            assert_eq!(
+                context.reachable_families(address.as_bytes(), true, PROTOCOL_TCP, 80),
+                0,
+                "{excluded}"
+            );
+        }
+        let mapped = kernel_address("::ffff:192.0.2.2".parse().unwrap());
+        assert_eq!(
+            context.reachable_families(mapped.as_bytes(), true, PROTOCOL_TCP, 80),
+            FAMILY_IPV4
+        );
+        let specific = kernel_address("fd00::a00:2".parse().unwrap());
+        assert_eq!(
+            context.reachable_families(specific.as_bytes(), true, PROTOCOL_TCP, 80),
+            FAMILY_IPV6
+        );
+        let mut signed_word = [b'0'; 32];
+        signed_word[..8].copy_from_slice(b"-0000001");
+        assert_eq!(
+            context.reachable_families(&signed_word, true, PROTOCOL_TCP, 80),
+            0
+        );
+    }
+
+    /// Verifies that TCP diagnostics override the global wildcard default only per port.
+    #[test]
+    fn wildcard_tcp_uses_diagnostics_then_the_sysctl_default() {
+        let listeners = [
+            WildcardListener {
+                port: 80,
+                dual_stack: false,
+                ipv6_only: true,
+            },
+            WildcardListener {
+                port: 81,
+                dual_stack: true,
+                ipv6_only: true,
+            },
+        ];
+        let wildcard = kernel_address("::".parse().unwrap());
+        let context = context(false, &listeners);
+        assert_eq!(
+            context.reachable_families(wildcard.as_bytes(), true, PROTOCOL_TCP, 80),
+            FAMILY_IPV6
+        );
+        assert_eq!(
+            context.reachable_families(wildcard.as_bytes(), true, PROTOCOL_TCP, 81),
+            FAMILY_IPV4 | FAMILY_IPV6
+        );
+        assert_eq!(
+            context.reachable_families(wildcard.as_bytes(), true, PROTOCOL_TCP, 82),
+            FAMILY_IPV6
+        );
+        assert_eq!(
+            context.reachable_families(wildcard.as_bytes(), true, PROTOCOL_UDP, 81),
+            FAMILY_IPV6
+        );
+    }
+}

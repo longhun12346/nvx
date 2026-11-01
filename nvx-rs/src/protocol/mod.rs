@@ -1,8 +1,8 @@
 //! Codec of the OpenVMM control-console protocol.
 //!
 //! OpenVMM brokers an authenticated stream of outer records (magic `NVXS`) between one host
-//! client and the guest agent. Data records carry application frames (magic `NVXC`) that belong
-//! to the guest agent in `guest/common/nvx-managed-agent.c`. All integers are little-endian.
+//! client and the Rust guest agent. Data records carry application frames (magic `NVXC`) that
+//! the host and guest share from this module. All integers are little-endian.
 //!
 //! - Outer records: [`encode_outer`] and [`decode_outer_header`], and the `OUTER_*` record types.
 //! - Application frames: [`encode_app`] and [`decode_app`], the `APP_*` request and response
@@ -15,57 +15,69 @@
 //! - [`GuestFeatures`]: the control features that a guest image advertises.
 //! - The kernel command-line tokens through which the host configures the guest agent at boot,
 //!   such as [`MAPS_TOKEN`].
+//! - [`cmdline`]: the kernel command line as Linux reads it, for the readers that need the
+//!   kernel's view of it: the parameters into which the kernel splits it, and the virtio-mmio
+//!   devices, of any type, that its `virtio_mmio.device` parameters describe; and the guest's DNS
+//!   server, which OpenVMM's `virtnet_dns=` token names, with the resolver file that names it.
+//! - [`root`]: the boot tokens of a layered root, which name its image's format and identity and
+//!   its upper, with the host's renderer and the guest's parser.
+//! - [`export`]: the boot tokens of the host export, the aggregate virtio-fs device from which a
+//!   guest maps host paths, and the guest's strict parser of them.
+//! - [`share`]: the guest targets that a sandbox's live shares may not take, which the host and
+//!   the guest both refuse.
+//! - [`nvxs`]: the NVXS session without I/O: validated records, incremental parsing, and the
+//!   state machines of the host's and the guest's roles, which carry application bytes of any
+//!   protocol.
+//! - [`status`]: the exit statuses with which a clone's guest ends its VM once its repair or its
+//!   activation failed, the time ABI's included, from which the host classifies a clone's end.
 //!
 //! The module depends on nothing outside the standard library, so the host, the guest, and test
-//! doubles share it. Its wire constants are those of the guest agent, which tests compare with
-//! the agent's source, and golden byte fixtures pin every record that both sides exchange.
+//! doubles share it. Tests pin its wire constants as literals, and its records, frames, and
+//! payloads with the conformance vectors of the crate's `tests/vectors/`, whose bytes no codec
+//! produced.
 
 use std::fmt;
 
 mod app;
 mod boot;
+pub mod cmdline;
 mod exec;
+pub mod export;
 mod features;
-mod guest_session;
-pub use guest_session::{
-    APP_SESSION_BIND, APP_SESSION_UNBIND, SessionMount, encode_session_mount,
-    encode_session_unmount, valid_session_mount_target,
-};
 mod maps;
+pub mod nvxs;
 mod outer;
+pub mod root;
+pub mod share;
+pub mod status;
 #[cfg(test)]
 mod tests;
 
 pub use app::{
     APP_CANCEL, APP_ERROR, APP_EXEC, APP_EXIT, APP_FEATURES, APP_HEADER_LEN, APP_MAGIC, APP_MAPS,
-    APP_UNMAP,
     APP_PING, APP_READY, APP_STDERR, APP_STDOUT, APP_STOP, APP_STOPPED, APP_VERSION, AppFrame,
     BUSY, CWD_FAILED, ExitCategory, INVALID_REQUEST, LAUNCH_FAILED, MAPPING_FAILED,
-    MAPPING_LIMIT, MAPPINGS_INCOMPLETE, UNSUPPORTED_OPERATION, decode_app, encode_app,
+    MAPPINGS_INCOMPLETE, UNSUPPORTED_OPERATION, decode_app, encode_app,
 };
-pub use boot::{MAPS_TOKEN, WORKLOAD_ACCOUNT_TOKEN};
+pub use boot::{MAPS_TOKEN, WORKLOAD_ACCOUNT_TOKEN, parse_host_mapping_count};
 pub use exec::{
-    EXEC_CWD_PRESENT, EXEC_ENVIRONMENT_PRESENT, EXEC_EXTENDED, EXEC_EXTENDED_V2,
-    EXEC_INHERIT_DEFAULT_ENV, ExecLimits, ExecPayload, MAX_ARGUMENT_BYTES, MAX_ARGUMENTS,
-    MAX_CWD_BYTES, MAX_ENVIRONMENT, MAX_EXEC_CPU_PERCENT, MAX_EXEC_MEMORY_MIB, MAX_EXEC_PIDS,
-    MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, Workload, WorkloadEnvironment, decode_exec_payload,
-    encode_exec_payload,
+    EXEC_CWD_PRESENT, EXEC_ENVIRONMENT_PRESENT, EXEC_EXTENDED, EXEC_INHERIT_DEFAULT_ENV,
+    ExecPayload, GuestExecPayload, MAX_ARGUMENT_BYTES, MAX_ARGUMENTS, MAX_CWD_BYTES,
+    MAX_ENVIRONMENT, MAX_GUEST_CWD_BYTES, MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS, Workload,
+    WorkloadEnvironment, decode_exec_payload, decode_guest_exec_payload, encode_exec_payload,
 };
 pub use features::GuestFeatures;
-pub use guest_session::{
-    APP_SESSION_CLOSE, APP_SESSION_EXEC, APP_SESSION_OPEN, GuestSessionSpec,
-    MAX_GUEST_SESSIONS, MAX_SESSION_PATH, SESSION_VERSION, SessionNetwork,
-    decode_session_open, encode_session_open, encode_session_request,
-};
 pub use maps::{
-    HostMap, MAP_ENTRY_HEADER_LEN, MAP_READ_ONLY, MAPS_HEADER_LEN, MAX_HOST_MAPPINGS,
-    MAX_MAP_PATH_BYTES, MapsPayload, decode_maps_payload, encode_maps_payloads,
-    encode_maps_payloads_from,
+    GuestHostMap, GuestMapsPayload, HostMap, MAP_ENTRY_HEADER_LEN, MAP_READ_ONLY, MAPS_HEADER_LEN,
+    MAX_HOST_MAPPINGS, MAX_MAP_PATH_BYTES, MapsPayload, decode_guest_maps_payload,
+    decode_maps_payload, encode_maps_payloads,
 };
 pub use outer::{
-    CAPABILITY_LEN, OUTER_DATA, OUTER_ERROR, OUTER_HEADER_LEN, OUTER_HOST_ATTACH, OUTER_MAGIC,
-    OUTER_MAX_PAYLOAD, OUTER_READY, OUTER_RESET, OUTER_VERSION, OUTER_WAIT, OuterHeader,
-    decode_outer_header, encode_outer,
+    CAPABILITY_LEN, OUTER_ACK, OUTER_CREDIT, OUTER_DATA, OUTER_ERROR, OUTER_GUEST_ATTACH,
+    OUTER_HEADER_LEN, OUTER_HOST_ATTACH, OUTER_MAGIC, OUTER_MAX_PAYLOAD, OUTER_MAX_RECEIVE_WINDOW,
+    OUTER_MIN_RECEIVE_WINDOW, OUTER_READY, OUTER_RECEIVE_WINDOW, OUTER_RESET, OUTER_VERSION,
+    OUTER_WAIT, OuterHeader, decode_ack_payload, decode_credit_payload, decode_outer_header,
+    encode_ack_payload, encode_credit_payload, encode_outer,
 };
 
 /// Protocol violation detected while encoding or decoding.

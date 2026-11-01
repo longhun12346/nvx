@@ -1,6 +1,6 @@
 //! Network primitives that do not depend on the host: IP networks in CIDR notation and their
-//! subtraction, which egress rules use, and the forms of a VM's hostname and guest network
-//! address.
+//! subtraction, which egress rules use, the forms of a VM's hostname and guest network address,
+//! and the gateway of a guest network.
 
 pub mod cidr;
 
@@ -22,22 +22,28 @@ pub fn is_valid_hostname(hostname: &str) -> bool {
 /// `ADDRESS/PREFIX` with a /1 to /30 prefix and an address other than the network's own, its
 /// broadcast address, and the gateway, which is its first address.
 pub fn is_valid_guest_network(value: &str) -> bool {
-    let Some((address, prefix_text)) = value.split_once('/') else {
-        return false;
-    };
-    let (Ok(address), Some(prefix)) = (
-        address.parse::<std::net::Ipv4Addr>(),
-        cidr::parse_prefix_length(prefix_text),
-    ) else {
-        return false;
-    };
-    if !(1..=30).contains(&prefix) {
-        return false;
-    }
+    guest_address(value).is_some()
+}
+
+/// Returns the gateway of a static guest address that [`is_valid_guest_network`] accepts: the
+/// first address of its network, at which OpenVMM presents the guest's gateway. Returns `None`
+/// for any other value.
+pub fn guest_gateway(value: &str) -> Option<std::net::Ipv4Addr> {
+    let (address, mask) = guest_address(value)?;
+    Some(std::net::Ipv4Addr::from((address & mask) + 1))
+}
+
+/// Returns the address and the network mask of a static guest address that
+/// [`is_valid_guest_network`] accepts.
+fn guest_address(value: &str) -> Option<(u32, u32)> {
+    let (address, prefix_text) = value.split_once('/')?;
+    let address = address.parse::<std::net::Ipv4Addr>().ok()?;
+    let prefix =
+        cidr::parse_prefix_length(prefix_text).filter(|prefix| (1..=30).contains(prefix))?;
     let mask = u32::MAX << (32 - u32::from(prefix));
     let host = u32::from(address);
     let network = host & mask;
-    ![network, network | !mask, network + 1].contains(&host)
+    (![network, network | !mask, network + 1].contains(&host)).then_some((host, mask))
 }
 
 #[cfg(test)]
@@ -60,6 +66,23 @@ mod tests {
             "fd00::2/64",
         ] {
             assert!(!is_valid_guest_network(invalid), "{invalid}");
+            assert_eq!(guest_gateway(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn the_gateway_is_the_first_address_of_the_guest_network() {
+        for (network, gateway) in [
+            ("10.0.0.2/24", [10, 0, 0, 1]),
+            ("192.168.7.10/30", [192, 168, 7, 9]),
+            ("172.16.0.200/16", [172, 16, 0, 1]),
+            ("10.255.255.254/8", [10, 0, 0, 1]),
+        ] {
+            assert_eq!(
+                guest_gateway(network),
+                Some(std::net::Ipv4Addr::from(gateway)),
+                "{network}"
+            );
         }
     }
 

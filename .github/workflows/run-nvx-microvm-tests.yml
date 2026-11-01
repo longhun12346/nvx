@@ -19,6 +19,10 @@ on:
         description: Base name of the compatible OpenVMM artifacts
         required: true
         type: string
+      nvx-rs-artifact:
+        description: Base name of the nvx-rs artifacts for the runner's OS
+        required: true
+        type: string
       debug-kernel:
         description: >-
           Run the same-host restore scenarios on the CI debug kernel instead
@@ -27,6 +31,34 @@ on:
         required: false
         type: boolean
         default: false
+      guests-and-sandboxes:
+        description: >-
+          Run the steps that follow the default suite instead of it, in a
+          second job of the backend beside the default suite: the public
+          managed sandbox acceptance, the Ubuntu and Azure Linux guest tests,
+          the Ubuntu sandbox steps, and the runtime adapter scenarios. Not for
+          the debug-kernel jobs, which skip these steps
+        required: false
+        type: boolean
+        default: false
+      shard:
+        description: >-
+          Run only this shard, from 1 to shard-count, of the default suite,
+          as scripts/nvx_tools/microvm_shards.json splits it for the backend
+          (doc/ci.md#microvm-test-shards); 0 runs all of a default run, the
+          public sandbox scenarios among them, which also read the Ubuntu
+          distro layer and the sandbox scratch template. Only for the
+          default-suite jobs
+        required: false
+        type: number
+        default: 0
+      shard-count:
+        description: >-
+          How many shards of the default suite the caller runs, one job each;
+          test-microvm fails unless the partition has as many for the backend
+        required: false
+        type: number
+        default: 0
     secrets:
       OPENVMM_DEPLOY_KEY:
         description: SSH deploy key used to checkout OpenVMM
@@ -34,6 +66,11 @@ on:
 
 permissions:
   contents: read
+
+# The jobs test the artifacts that the build jobs made, so nvx-rs must never
+# replace missing ones with those of a release.
+env:
+  NVX_AUTO_DOWNLOAD: "0"
 
 jobs:
   test:
@@ -54,10 +91,23 @@ jobs:
       - name: Set up retrying curl
         uses: ./.github/actions/setup-curl
 
-      - name: Download guest artifacts
+      # The guest artifacts that the steps below boot or read. Every job
+      # qualifies its runner with the kernel and the Alpine initramfs, the
+      # shards of the default suite boot only those, and the debug-kernel jobs
+      # run only Alpine scenarios on the debug kernel, so only the guest and
+      # sandbox steps take the Ubuntu and Azure Linux artifacts, and an
+      # unsharded default run the Ubuntu distro layer of its public sandbox
+      # scenarios.
+      - name: Download guest kernel
         uses: actions/download-artifact@v8
         with:
-          name: guest-artifacts
+          name: guest-kernel
+          path: build
+
+      - name: Download Alpine initramfs
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-alpine
           path: build
 
       - name: Download guest debug kernel
@@ -65,6 +115,36 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: guest-debug-kernel
+          path: build
+
+      - name: Download Ubuntu initramfs
+        if: ${{ inputs.guests-and-sandboxes && !inputs.debug-kernel }}
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-ubuntu
+          path: build
+
+      - name: Download Ubuntu distro layer
+        if: ${{ inputs.guests-and-sandboxes && !inputs.debug-kernel }}
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-ubuntu-distro
+          path: build
+
+      # The layer, its manifest, and the sandbox scratch template, which the
+      # public sandbox scenarios of an unsharded default run read.
+      - name: Download Ubuntu distro layer for the whole default run
+        if: ${{ !inputs.guests-and-sandboxes && !inputs.debug-kernel && !inputs.shard }}
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-ubuntu-distro
+          path: build
+
+      - name: Download Azure Linux initramfs
+        if: ${{ inputs.guests-and-sandboxes && !inputs.debug-kernel }}
+        uses: actions/download-artifact@v8
+        with:
+          name: guest-azurelinux
           path: build
 
       - name: Download OpenVMM executable
@@ -84,6 +164,20 @@ jobs:
         shell: bash
         run: chmod +x openvmm/target/release/openvmm
 
+      # The scenarios and the steps below run their sandboxes and microVMs
+      # with nvx-rs, which they find where `cargo build --release` puts it,
+      # and whose artifact root is then this checkout.
+      - name: Download nvx-rs executable
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.nvx-rs-artifact }}-executable
+          path: nvx-rs/target/release
+
+      - name: Make nvx-rs executable
+        if: runner.os != 'Windows'
+        shell: bash
+        run: chmod +x nvx-rs/target/release/nvx-rs
+
       # Qualification verifies the downloaded OpenVMM's time ABI preflight.
       - name: Validate runner
         uses: ./.github/actions/validate-runner
@@ -91,49 +185,58 @@ jobs:
           backend: ${{ inputs.backend }}
           verify-openvmm: "true"
 
+      # The runner signals only a step's shell when the job is cancelled, so
+      # the Linux steps exec the test harness, which can then stop OpenVMM and
+      # remove its scratch directories (doc/ci.md#cancellation).
       - name: Run NVX microVM tests on Linux
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && !inputs.guests-and-sandboxes
         shell: bash
         run: >-
-          python3 scripts/nvx.py test-microvm
+          exec python3 scripts/nvx.py test-microvm
           --backend "${{ inputs.backend }}"
           ${{ inputs.debug-kernel && '--debug-kernel' || '' }}
+          ${{ inputs.shard && format('--shard {0}/{1}', inputs.shard, inputs.shard-count) || '' }}
           --output-dir "build/test-results/microvm-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}"
 
       - name: Run NVX microVM tests on Windows
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !inputs.guests-and-sandboxes
         shell: powershell
         run: >-
           python scripts\nvx.py test-microvm
           --backend "${{ inputs.backend }}"
           ${{ inputs.debug-kernel && '--debug-kernel' || '' }}
+          ${{ inputs.shard && format('--shard {0}/{1}', inputs.shard, inputs.shard-count) || '' }}
           --output-dir "build/test-results/microvm-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}"
 
       - name: Run public managed sandbox acceptance on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: >-
-          python3 scripts/nvx.py test-microvm
+          exec python3 scripts/nvx.py test-microvm
           --backend "${{ inputs.backend }}"
           --scenario managed-exec-config
           --scenario sandbox-lifecycle
+          --scenario sandbox-proxy-only
+          --scenario sandbox-ram-upper
           --output-dir "build/test-results/public-exec-${{ inputs.backend }}"
 
       - name: Run public managed sandbox acceptance on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: >-
           python scripts\nvx.py test-microvm
           --backend "${{ inputs.backend }}"
           --scenario managed-exec-config
           --scenario sandbox-lifecycle
+          --scenario sandbox-proxy-only
+          --scenario sandbox-ram-upper
           --output-dir "build/test-results/public-exec-${{ inputs.backend }}"
 
       - name: Run Ubuntu guest smoke tests on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: >-
-          python3 scripts/nvx.py test-microvm
+          exec python3 scripts/nvx.py test-microvm
           --backend "${{ inputs.backend }}"
           --guest ubuntu
           --processors 1
@@ -146,7 +249,7 @@ jobs:
           --output-dir "build/test-results/ubuntu-${{ inputs.backend }}"
 
       - name: Run Ubuntu guest smoke tests on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: >-
           python scripts\nvx.py test-microvm
@@ -162,10 +265,10 @@ jobs:
           --output-dir "build/test-results/ubuntu-${{ inputs.backend }}"
 
       - name: Run Azure Linux guest smoke tests on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: >-
-          python3 scripts/nvx.py test-microvm
+          exec python3 scripts/nvx.py test-microvm
           --backend "${{ inputs.backend }}"
           --guest azurelinux
           --processors 1
@@ -179,7 +282,7 @@ jobs:
           --output-dir "build/test-results/azurelinux-${{ inputs.backend }}"
 
       - name: Run Azure Linux guest smoke tests on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: >-
           python scripts\nvx.py test-microvm
@@ -196,10 +299,10 @@ jobs:
           --output-dir "build/test-results/azurelinux-${{ inputs.backend }}"
 
       - name: Run extended Ubuntu guest tests on Linux/KVM
-        if: inputs.backend == 'kvm' && !inputs.debug-kernel
+        if: inputs.backend == 'kvm' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: >-
-          python3 scripts/nvx.py test-microvm
+          exec python3 scripts/nvx.py test-microvm
           --backend kvm
           --guest ubuntu
           --scenario managed-lifecycle
@@ -210,7 +313,7 @@ jobs:
           --output-dir "build/test-results/ubuntu-kvm-extended"
 
       - name: Run Ubuntu sandbox layer smoke test on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -221,7 +324,7 @@ jobs:
           cp --reflink=auto build/ubuntu-smoke-scratch.ext4 "${scratch}"
           # The probe checks the security profile and that the 32 MiB memory
           # and 8-process limits hold.
-          python3 scripts/nvx.py sandbox \
+          nvx-rs/target/release/nvx-rs sandbox \
             --hypervisor "${{ inputs.backend }}" \
             --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
             --scratch "${scratch}" \
@@ -235,7 +338,7 @@ jobs:
             --memory-mib 256
 
       - name: Run Ubuntu sandbox live-share smoke test on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -254,7 +357,7 @@ jobs:
           printf 'secret\n' >"${share}/nvx-denied/secret"
           printf 'host-outside\n' >"${outside}"
           chmod 0777 "${share}" "${share}/nvx-links"
-          python3 scripts/nvx.py sandbox \
+          nvx-rs/target/release/nvx-rs sandbox \
             --hypervisor "${{ inputs.backend }}" \
             --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
             --scratch "${scratch}" \
@@ -280,7 +383,7 @@ jobs:
           rm -rf "${share}/nvx-guest-marker" "${share}/nvx-guest-directory" \
             "${share}/nvx-tool" "${share}/nvx-links"
           cp --reflink=auto build/ubuntu-smoke-scratch.ext4 "${scratch}"
-          python3 scripts/nvx.py sandbox \
+          nvx-rs/target/release/nvx-rs sandbox \
             --hypervisor "${{ inputs.backend }}" \
             --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
             --scratch "${scratch}" \
@@ -296,7 +399,7 @@ jobs:
           rm -rf "${share}" "${scratch}" "${outside}"
 
       - name: Run Ubuntu sandbox managed live-share smoke test on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -310,7 +413,7 @@ jobs:
           state=$(mktemp -d)
           cleanup() {
             if [ -f "${state}/runtime.json" ]; then
-              python3 scripts/nvx.py sandbox stop --state-dir "${state}" --timeout 30 || true
+              nvx-rs/target/release/nvx-rs sandbox stop --state-dir "${state}" --timeout 30 || true
             fi
             mkdir -p "${logs}"
             cp "${state}/openvmm.log" "${logs}/managed-share-openvmm.log" 2>/dev/null || true
@@ -324,7 +427,7 @@ jobs:
           printf 'secret\n' >"${share}/nvx-denied/secret"
           printf 'host-outside\n' >"${outside}"
           chmod 0777 "${share}" "${share}/nvx-links"
-          python3 scripts/nvx.py sandbox provision \
+          nvx-rs/target/release/nvx-rs sandbox provision \
             --state-dir "${state}" \
             --hypervisor "${{ inputs.backend }}" \
             --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
@@ -332,13 +435,13 @@ jobs:
             --mount "/workspace,${share},rw" \
             --mount-deny nvx-denied \
             --workload-user 65534:65534
-          python3 scripts/nvx.py sandbox start --state-dir "${state}"
-          python3 scripts/nvx.py sandbox exec \
+          nvx-rs/target/release/nvx-rs sandbox start --state-dir "${state}"
+          nvx-rs/target/release/nvx-rs sandbox exec \
             --state-dir "${state}" \
             --entrypoint /sbin/nvx-sandbox-smoke \
             --arg /workspace \
             --arg rw
-          python3 scripts/nvx.py sandbox stop --state-dir "${state}"
+          nvx-rs/target/release/nvx-rs sandbox stop --state-dir "${state}"
           # A clean ext4 journal shows that stop unmounted the share, overlay,
           # and scratch in order instead of powering off with them mounted.
           python3 - "${state}/outcome.json" "${scratch}" <<'EOF'
@@ -366,11 +469,11 @@ jobs:
           test ! -L "${share}/nvx-links/marker"
           test "$(cat "${outside}")" = host-outside
           test "$(cat "${share}/nvx-denied/secret")" = secret
-          python3 scripts/nvx.py sandbox deprovision --state-dir "${state}"
+          nvx-rs/target/release/nvx-rs sandbox deprovision --state-dir "${state}"
           rm -rf "${share}" "${scratch}" "${outside}"
 
       - name: Run Ubuntu sandbox caller-owned live-share test on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -384,7 +487,7 @@ jobs:
           state=$(mktemp -d)
           cleanup() {
             if [ -f "${state}/runtime.json" ]; then
-              python3 scripts/nvx.py sandbox stop --state-dir "${state}" --timeout 30 || true
+              nvx-rs/target/release/nvx-rs sandbox stop --state-dir "${state}" --timeout 30 || true
             fi
             mkdir -p "${logs}"
             cp "${state}/openvmm.log" "${logs}/caller-share-openvmm.log" 2>/dev/null || true
@@ -400,7 +503,7 @@ jobs:
           # with EPERM instead of running as the runner. The OpenVMM unit tests
           # cover the identity of each request, including guest root squash.
           cp --reflink=auto build/ubuntu-smoke-scratch.ext4 "${scratch}"
-          python3 scripts/nvx.py sandbox \
+          nvx-rs/target/release/nvx-rs sandbox \
             --hypervisor "${{ inputs.backend }}" \
             --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
             --scratch "${scratch}" \
@@ -412,9 +515,12 @@ jobs:
             --workload-user 65534:65534 \
             --memory-mib 256
           test "$(ls -A "${share}")" = nvx-host-marker
-          # A managed sandbox persists the ownership mode and applies it on start.
+          # A managed sandbox persists the ownership mode and applies it on
+          # start. Its guest agent reaches the share as guest root, which the
+          # mode squashes to the share's owner, before any workload runs, so
+          # that request fails with EPERM too, and the sandbox never starts.
           cp --reflink=auto build/ubuntu-smoke-scratch.ext4 "${scratch}"
-          python3 scripts/nvx.py sandbox provision \
+          nvx-rs/target/release/nvx-rs sandbox provision \
             --state-dir "${state}" \
             --hypervisor "${{ inputs.backend }}" \
             --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
@@ -428,22 +534,23 @@ jobs:
 
           with open(sys.argv[1], encoding="utf-8") as stream:
               config = json.load(stream)
-          if config["format"] != 3 or config["mount"]["owner"] != "caller":
+          if config["format"] != 8 or config["export"]["owner"] != "caller":
               sys.exit(f"managed sandbox did not persist caller ownership: {config}")
           EOF
-          python3 scripts/nvx.py sandbox start --state-dir "${state}"
-          python3 scripts/nvx.py sandbox exec \
-            --state-dir "${state}" \
-            --entrypoint /sbin/nvx-sandbox-smoke \
-            --arg /workspace \
-            --arg eperm
-          python3 scripts/nvx.py sandbox stop --state-dir "${state}"
+          if nvx-rs/target/release/nvx-rs sandbox start --state-dir "${state}"; then
+            echo "the caller-owned managed sandbox reached its share as the runner" >&2
+            exit 1
+          fi
+          grep -q 'virtio-fs request cannot run as its caller; failing it with EPERM' \
+            "${state}/openvmm.log"
+          grep -q 'NVX-MANAGED-ERROR: stage=host-mappings' "${state}/openvmm.log"
+          test ! -e "${state}/runtime.json"
           test "$(ls -A "${share}")" = nvx-host-marker
-          python3 scripts/nvx.py sandbox deprovision --state-dir "${state}"
+          nvx-rs/target/release/nvx-rs sandbox deprovision --state-dir "${state}"
           rm -rf "${share}" "${scratch}"
 
       - name: Run Ubuntu sandbox concurrent read-write and read-only shares on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -460,7 +567,7 @@ jobs:
           state=$(mktemp -d)
           cleanup() {
             if [ -f "${state}/runtime.json" ]; then
-              python3 scripts/nvx.py sandbox stop --state-dir "${state}" --timeout 30 || true
+              nvx-rs/target/release/nvx-rs sandbox stop --state-dir "${state}" --timeout 30 || true
             fi
             mkdir -p "${logs}"
             cp "${state}/openvmm.log" "${logs}/shares-openvmm.log" 2>/dev/null || true
@@ -519,7 +626,7 @@ jobs:
             --arg /results/output.txt --arg file-rw
           )
           prepare_shares
-          python3 scripts/nvx.py sandbox \
+          nvx-rs/target/release/nvx-rs sandbox \
             --hypervisor "${{ inputs.backend }}" \
             --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
             --scratch "${scratch}" \
@@ -530,7 +637,7 @@ jobs:
           check_shares
           # A managed sandbox persists every share and reattaches them on start.
           prepare_shares
-          python3 scripts/nvx.py sandbox provision \
+          nvx-rs/target/release/nvx-rs sandbox provision \
             --state-dir "${state}" \
             --hypervisor "${{ inputs.backend }}" \
             --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
@@ -539,32 +646,39 @@ jobs:
             --workload-user 65534:65534
           python3 - "${state}/config.json" <<'EOF'
           import json
+          import os
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as stream:
               config = json.load(stream)
-          shares = [
-              (
-                  mount["guest_target"],
-                  mount["access"],
-                  mount["denied_paths"],
-                  mount["kind"],
+          # The export plan binds each share's root, in the order of the
+          # targets' depth, then the targets.
+          export = config["export"]
+          shares = []
+          for bind in export["binds"]:
+              child = export["children"][bind["child"]]
+              shares.append(
+                  (
+                      bind["target"],
+                      bind["source"],
+                      "ro" if bind["readOnly"] else "rw",
+                      [os.path.relpath(path, child["root"]) for path in child["denied"]],
+                      "file" if child.get("file") else "directory",
+                  )
               )
-              for mount in config["mounts"]
-          ]
           expected = [
-              ("/workspace", "rw", ["nvx-denied"], "directory"),
-              ("/opt/hostedtoolcache", "ro", ["nvx-denied"], "directory"),
-              ("/config/settings.json", "ro", [], "file"),
-              ("/results/output.txt", "rw", [], "file"),
+              ("/workspace", "", "rw", ["nvx-denied"], "directory"),
+              ("/config/settings.json", "", "ro", [], "file"),
+              ("/opt/hostedtoolcache", "", "ro", ["nvx-denied"], "directory"),
+              ("/results/output.txt", "", "rw", [], "file"),
           ]
-          if config["format"] != 6 or "mount" in config or shares != expected:
+          if config["format"] != 8 or "mounts" in config or shares != expected:
               sys.exit(f"managed sandbox did not persist every share: {config}")
           EOF
-          python3 scripts/nvx.py sandbox start --state-dir "${state}"
-          python3 scripts/nvx.py sandbox exec --state-dir "${state}" \
+          nvx-rs/target/release/nvx-rs sandbox start --state-dir "${state}"
+          nvx-rs/target/release/nvx-rs sandbox exec --state-dir "${state}" \
             "${smoke_arguments[@]}"
-          python3 scripts/nvx.py sandbox stop --state-dir "${state}"
+          nvx-rs/target/release/nvx-rs sandbox stop --state-dir "${state}"
           # A clean ext4 journal shows that stop unmounted every share, the
           # overlay, and scratch in order.
           python3 - "${state}/outcome.json" "${scratch}" <<'EOF'
@@ -583,11 +697,11 @@ jobs:
                   sys.exit("managed stop left the scratch filesystem mounted")
           EOF
           check_shares
-          python3 scripts/nvx.py sandbox deprovision --state-dir "${state}"
+          nvx-rs/target/release/nvx-rs sandbox deprovision --state-dir "${state}"
           rm -rf "${workspace}" "${toolcache}" "${files}" "${scratch}" "${outside}"
 
       - name: Run Ubuntu sandbox share access policy on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: |
           set -euo pipefail
@@ -601,7 +715,7 @@ jobs:
           state=$(mktemp -d)
           cleanup() {
             if [ -f "${state}/runtime.json" ]; then
-              python3 scripts/nvx.py sandbox stop --state-dir "${state}" --timeout 30 || true
+              nvx-rs/target/release/nvx-rs sandbox stop --state-dir "${state}" --timeout 30 || true
             fi
             mkdir -p "${logs}"
             cp "${state}/openvmm.log" "${logs}/policy-openvmm.log" 2>/dev/null || true
@@ -644,7 +758,7 @@ jobs:
             --arg /workspace --arg policy
           )
           prepare_share
-          python3 scripts/nvx.py sandbox \
+          nvx-rs/target/release/nvx-rs sandbox \
             --hypervisor "${{ inputs.backend }}" \
             --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
             --scratch "${scratch}" \
@@ -656,7 +770,7 @@ jobs:
           # A managed sandbox persists the access policy and reapplies it on
           # start.
           prepare_share
-          python3 scripts/nvx.py sandbox provision \
+          nvx-rs/target/release/nvx-rs sandbox provision \
             --state-dir "${state}" \
             --hypervisor "${{ inputs.backend }}" \
             --layer "distro,build/ubuntu-distro.erofs,${uuid}" \
@@ -665,20 +779,26 @@ jobs:
             --workload-user 65534:65534
           python3 - "${state}/config.json" <<'EOF'
           import json
+          import os
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as stream:
               config = json.load(stream)
-          shares = [
-              (
-                  mount["guest_target"],
-                  mount["access"],
-                  mount["denied_paths"],
-                  mount["allowed_paths"],
-                  mount["writable_paths"],
+          # The export plan holds the policy paths resolved inside the share.
+          export = config["export"]
+          shares = []
+          for bind in export["binds"]:
+              child = export["children"][bind["child"]]
+              shares.append(
+                  (
+                      bind["target"],
+                      "ro" if bind["readOnly"] else "rw",
+                      *(
+                          [os.path.relpath(path, child["root"]) for path in child[name]]
+                          for name in ("denied", "allowed", "write")
+                      ),
+                  )
               )
-              for mount in config["mounts"]
-          ]
           expected = [
               (
                   "/workspace",
@@ -688,13 +808,13 @@ jobs:
                   ["nvx-writable"],
               ),
           ]
-          if config["format"] != 5 or "mount" in config or shares != expected:
+          if config["format"] != 8 or "mounts" in config or shares != expected:
               sys.exit(f"managed sandbox did not persist the access policy: {config}")
           EOF
-          python3 scripts/nvx.py sandbox start --state-dir "${state}"
-          python3 scripts/nvx.py sandbox exec --state-dir "${state}" \
+          nvx-rs/target/release/nvx-rs sandbox start --state-dir "${state}"
+          nvx-rs/target/release/nvx-rs sandbox exec --state-dir "${state}" \
             "${smoke_arguments[@]}"
-          python3 scripts/nvx.py sandbox stop --state-dir "${state}"
+          nvx-rs/target/release/nvx-rs sandbox stop --state-dir "${state}"
           # A clean ext4 journal shows that stop unmounted the share, the
           # overlay, and scratch in order.
           python3 - "${state}/outcome.json" "${scratch}" <<'EOF'
@@ -713,11 +833,11 @@ jobs:
                   sys.exit("managed stop left the scratch filesystem mounted")
           EOF
           check_share
-          python3 scripts/nvx.py sandbox deprovision --state-dir "${state}"
+          nvx-rs/target/release/nvx-rs sandbox deprovision --state-dir "${state}"
           rm -rf "${share}" "${scratch}"
 
       - name: Run Ubuntu sandbox layer smoke test on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: |
           $manifest = Get-Content -Raw build\ubuntu-distro.erofs.manifest.json |
@@ -726,7 +846,7 @@ jobs:
           Copy-Item build\ubuntu-smoke-scratch.ext4 $scratch
           # The probe checks the security profile and that the 32 MiB memory
           # and 8-process limits hold.
-          python scripts\nvx.py sandbox `
+          nvx-rs\target\release\nvx-rs.exe sandbox `
             --hypervisor "${{ inputs.backend }}" `
             --layer "distro,build\ubuntu-distro.erofs,$($manifest.uuid)" `
             --scratch $scratch `
@@ -740,7 +860,7 @@ jobs:
             --memory-mib 256
 
       - name: Run Ubuntu sandbox live-share smoke test on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -757,7 +877,7 @@ jobs:
           [IO.File]::WriteAllText((Join-Path $share "nvx-host-marker"), "host-to-guest`n")
           [IO.File]::WriteAllText((Join-Path $share "nvx-denied\secret"), "secret`n")
           [IO.File]::WriteAllText($outside, "host-outside`n")
-          python scripts\nvx.py sandbox `
+          nvx-rs\target\release\nvx-rs.exe sandbox `
             --hypervisor "${{ inputs.backend }}" `
             --layer "distro,build\ubuntu-distro.erofs,$($manifest.uuid)" `
             --scratch $scratch `
@@ -800,7 +920,7 @@ jobs:
           if ([IO.File]::ReadAllText((Join-Path $share "nvx-denied\secret")) -ne "secret`n") { throw "a guest link reached a denied file" }
           Remove-Item -Recurse -Force (Join-Path $share "nvx-guest-marker"), (Join-Path $share "nvx-guest-directory"), (Join-Path $share "nvx-tool"), (Join-Path $share "nvx-links")
           Copy-Item -Force build\ubuntu-smoke-scratch.ext4 $scratch
-          python scripts\nvx.py sandbox `
+          nvx-rs\target\release\nvx-rs.exe sandbox `
             --hypervisor "${{ inputs.backend }}" `
             --layer "distro,build\ubuntu-distro.erofs,$($manifest.uuid)" `
             --scratch $scratch `
@@ -817,14 +937,14 @@ jobs:
           Remove-Item -Recurse -Force $share, $scratch, $outside
 
       - name: Run Ubuntu sandbox managed live-share smoke test on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           function Invoke-Nvx {
-              python scripts\nvx.py @args
+              nvx-rs\target\release\nvx-rs.exe @args
               if ($LASTEXITCODE -ne 0) {
-                  throw "nvx.py $($args[0]) $($args[1]) failed with exit code $LASTEXITCODE"
+                  throw "nvx-rs $($args[0]) $($args[1]) failed with exit code $LASTEXITCODE"
               }
           }
           $manifest = Get-Content -Raw build\ubuntu-distro.erofs.manifest.json |
@@ -860,7 +980,7 @@ jobs:
               Invoke-Nvx sandbox stop --state-dir $state
           } finally {
               if (Test-Path (Join-Path $state "runtime.json")) {
-                  python scripts\nvx.py sandbox stop --state-dir $state --timeout 30
+                  nvx-rs\target\release\nvx-rs.exe sandbox stop --state-dir $state --timeout 30
               }
               New-Item -ItemType Directory -Force $logs | Out-Null
               $log = Join-Path $state "openvmm.log"
@@ -913,14 +1033,14 @@ jobs:
           Remove-Item -Recurse -Force $share, $scratch, $outside
 
       - name: Run Ubuntu sandbox concurrent read-write and read-only shares on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           function Invoke-Nvx {
-              python scripts\nvx.py @args
+              nvx-rs\target\release\nvx-rs.exe @args
               if ($LASTEXITCODE -ne 0) {
-                  throw "nvx.py $($args[0]) $($args[1]) failed with exit code $LASTEXITCODE"
+                  throw "nvx-rs $($args[0]) $($args[1]) failed with exit code $LASTEXITCODE"
               }
           }
           $manifest = Get-Content -Raw build\ubuntu-distro.erofs.manifest.json |
@@ -1003,8 +1123,17 @@ jobs:
           Initialize-Shares
           Invoke-Nvx sandbox provision --state-dir $state --hypervisor "${{ inputs.backend }}" --layer $layer --scratch $scratch @shareOptions --workload-user 65534:65534
           $config = Get-Content -Raw (Join-Path $state "config.json") | ConvertFrom-Json
-          $shares = ($config.mounts | ForEach-Object { "$($_.guest_target),$($_.access),$($_.kind)" }) -join " "
-          if ($config.format -ne 6 -or $shares -ne "/workspace,rw,directory /opt/hostedtoolcache,ro,directory /config/settings.json,ro,file /results/output.txt,rw,file") {
+          # The export plan binds each share's root, in the order of the
+          # targets' depth, then the targets.
+          $shares = ($config.export.binds | ForEach-Object {
+              $bind = $_
+              $child = $config.export.children[$bind.child]
+              $mode = if ($bind.readOnly) { "ro" } else { "rw" }
+              $kind = if ($child.file) { "file" } else { "directory" }
+              $denied = ($child.denied | ForEach-Object { $_.Substring($child.root.Length + 1).Replace("\", "/") }) -join ";"
+              "$($bind.target),$($bind.source),$mode,$denied,$kind"
+          }) -join " "
+          if ($config.format -ne 8 -or $shares -ne "/workspace,,rw,nvx-denied,directory /config/settings.json,,ro,,file /opt/hostedtoolcache,,ro,nvx-denied,directory /results/output.txt,,rw,,file") {
               throw "managed sandbox did not persist every share: $($config | ConvertTo-Json -Compress -Depth 5)"
           }
           try {
@@ -1013,7 +1142,7 @@ jobs:
               Invoke-Nvx sandbox stop --state-dir $state
           } finally {
               if (Test-Path (Join-Path $state "runtime.json")) {
-                  python scripts\nvx.py sandbox stop --state-dir $state --timeout 30
+                  nvx-rs\target\release\nvx-rs.exe sandbox stop --state-dir $state --timeout 30
               }
               New-Item -ItemType Directory -Force $logs | Out-Null
               $log = Join-Path $state "openvmm.log"
@@ -1041,14 +1170,14 @@ jobs:
           Remove-Item -Recurse -Force $workspace, $toolcache, $files, $scratch, $outside
 
       - name: Run Ubuntu sandbox share access policy on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           function Invoke-Nvx {
-              python scripts\nvx.py @args
+              nvx-rs\target\release\nvx-rs.exe @args
               if ($LASTEXITCODE -ne 0) {
-                  throw "nvx.py $($args[0]) $($args[1]) failed with exit code $LASTEXITCODE"
+                  throw "nvx-rs $($args[0]) $($args[1]) failed with exit code $LASTEXITCODE"
               }
           }
           $manifest = Get-Content -Raw build\ubuntu-distro.erofs.manifest.json |
@@ -1109,8 +1238,13 @@ jobs:
           Initialize-Share
           Invoke-Nvx sandbox provision --state-dir $state --hypervisor "${{ inputs.backend }}" --layer $layer --scratch $scratch @shareOptions --workload-user 65534:65534
           $config = Get-Content -Raw (Join-Path $state "config.json") | ConvertFrom-Json
-          $mount = $config.mounts[0]
-          if ($config.format -ne 5 -or $config.mounts.Count -ne 1 -or $mount.access -ne "rw" -or ($mount.denied_paths -join ",") -ne "nvx-denied" -or ($mount.allowed_paths -join ",") -ne "nvx-denied/nvx-allowed" -or ($mount.writable_paths -join ",") -ne "nvx-writable") {
+          # The export plan holds the policy paths resolved inside the share.
+          $child = @($config.export.children)[0]
+          $bind = @($config.export.binds)[0]
+          function Get-Relative($paths) {
+              ($paths | ForEach-Object { $_.Substring($child.root.Length + 1).Replace("\", "/") }) -join ","
+          }
+          if ($config.format -ne 8 -or @($config.export.children).Count -ne 1 -or @($config.export.binds).Count -ne 1 -or $bind.target -ne "/workspace" -or $bind.readOnly -or (Get-Relative $child.denied) -ne "nvx-denied" -or (Get-Relative $child.allowed) -ne "nvx-denied/nvx-allowed" -or (Get-Relative $child.write) -ne "nvx-writable") {
               throw "managed sandbox did not persist the access policy: $($config | ConvertTo-Json -Compress -Depth 5)"
           }
           try {
@@ -1119,7 +1253,7 @@ jobs:
               Invoke-Nvx sandbox stop --state-dir $state
           } finally {
               if (Test-Path (Join-Path $state "runtime.json")) {
-                  python scripts\nvx.py sandbox stop --state-dir $state --timeout 30
+                  nvx-rs\target\release\nvx-rs.exe sandbox stop --state-dir $state --timeout 30
               }
               New-Item -ItemType Directory -Force $logs | Out-Null
               $log = Join-Path $state "openvmm.log"
@@ -1146,27 +1280,59 @@ jobs:
           Invoke-Nvx sandbox deprovision --state-dir $state
           Remove-Item -Recurse -Force $share, $scratch
 
-      - name: Run aci_edge_sandboxes lifecycle test on Linux
-        if: runner.os != 'Windows' && !inputs.debug-kernel
+      # The runtime adapter's consolidated suite on this backend: each scenario
+      # that tests/runtime-adapter/scenarios.txt names, by name, in its
+      # host-only configuration, whose VM scenarios are its ignored tests and
+      # read the backend through `nvx::Hypervisor::from_env_or_default`. The
+      # command fails once a scenario names a test that its target does not
+      # have, a named target has a test that no scenario names, the library or
+      # another target has an ignored test, or a named test does not run and
+      # pass. Its host program launches VMs of the artifacts above, with the
+      # runtime identity that their build provenance gives, whose initramfs runs
+      # the adapter's guest agent in place of NVX's agents. Later processes of
+      # the host program reattach to a VM, as after a restart of the
+      # orchestrator, and stop it. The layered scenarios boot the Ubuntu EROFS
+      # image over a copy of the scratch template, from the guest artifacts, as
+      # the sandbox steps above do, and the guest agent's worker assembles the
+      # root outside PID 1. The guest agent is a static musl executable: Linux
+      # builds it, and Windows takes the one that distro-artifacts builds on
+      # Linux, as it takes the Ubuntu and Azure Linux images.
+      - name: Build the runtime adapter's guest agent on Linux
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
+        shell: bash
+        working-directory: tests/runtime-adapter
+        run: >-
+          cargo build --locked --release --features guest
+          --target x86_64-unknown-linux-musl --bin runtime-adapter-guest
+
+      - name: Run runtime adapter scenarios on Linux
+        if: runner.os != 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: bash
         run: >-
-          python3 scripts/nvx.py test-aci-edge-sandboxes
+          python3 scripts/nvx.py test-runtime-adapter
           --backend "${{ inputs.backend }}"
-          --output-dir "build/test-results/aci-edge-sandboxes-${{ inputs.backend }}"
+          --guest-agent tests/runtime-adapter/target/x86_64-unknown-linux-musl/release/runtime-adapter-guest
 
-      - name: Run aci_edge_sandboxes lifecycle test on Windows
-        if: runner.os == 'Windows' && !inputs.debug-kernel
+      - name: Download the runtime adapter's guest agent on Windows
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
+        uses: actions/download-artifact@v8
+        with:
+          name: runtime-adapter-guest
+          path: build/runtime-adapter
+
+      - name: Run runtime adapter scenarios on Windows
+        if: runner.os == 'Windows' && inputs.guests-and-sandboxes && !inputs.debug-kernel
         shell: powershell
         run: >-
-          python scripts\nvx.py test-aci-edge-sandboxes
+          python scripts\nvx.py test-runtime-adapter
           --backend "${{ inputs.backend }}"
-          --output-dir "build/test-results/aci-edge-sandboxes-${{ inputs.backend }}"
+          --guest-agent build\runtime-adapter\runtime-adapter-guest
 
       - name: Upload NVX microVM failure logs
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: nvx-microvm-tests-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}
+          name: nvx-microvm-tests-${{ inputs.backend }}${{ inputs.debug-kernel && '-debug' || '' }}${{ inputs.guests-and-sandboxes && '-guests' || '' }}${{ inputs.shard && format('-shard-{0}', inputs.shard) || '' }}
           path: |
             build/test-results/public-exec-${{ inputs.backend }}
             build/test-results/microvm-${{ inputs.backend }}
@@ -1174,5 +1340,17 @@ jobs:
             build/test-results/ubuntu-${{ inputs.backend }}
             build/test-results/ubuntu-kvm-extended
             build/test-results/azurelinux-${{ inputs.backend }}
-            build/test-results/aci-edge-sandboxes-${{ inputs.backend }}
           if-no-files-found: warn
+
+      # Each job and attempt keeps the scenario duration report of every
+      # test-microvm step (doc/usage.md#scenario-duration-report), whether the
+      # job passes, fails, or is cancelled; each shard of the default suite
+      # keeps its own.
+      - name: Upload NVX microVM scenario durations
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nvx-microvm-durations-${{ runner.os }}-${{ inputs.backend }}-${{ inputs.debug-kernel && 'debug' || 'default' }}${{ inputs.guests-and-sandboxes && '-guests' || '' }}${{ inputs.shard && format('-shard-{0}', inputs.shard) || '' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/test-results/*/scenario-durations.jsonl
+          if-no-files-found: warn
+          retention-days: 30

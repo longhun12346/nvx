@@ -3,8 +3,8 @@
   "repository": "microsoft/nvx",
   "trusted_branch": "dev",
   "submodule": "openvmm",
-  "source_url": "https://github.com/nanvix/openvmm.git",
-  "source_branch": "main",
+  "source_url": "https://github.com/microsoft/openvmm.git",
+  "source_branch": "feature/microvm/dev",
   "state_root": "/mnt/data/openvmm-verification",
   "specula_binary": "/opt/specula-venv/bin/specula",
   "specula_source": "/opt/specula-src",
@@ -13,5 +13,5 @@
   "specula_min_version": "1.2.0",
   "specula_max_version_exclusive": "2.0.0",
   "agent_config": "agents.json",
-  "target": "pedro-microvm|nanvix/openvmm|Rust|NVX guest-requested microVM snapshot and restore"
+  "target": "pedro-microvm|microsoft/openvmm|Rust|NVX guest-requested microVM snapshot and restore"
 }

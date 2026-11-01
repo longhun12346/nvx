@@ -1,5 +1,11 @@
 # nvxd
 
+> **Status: not buildable at the moment.** The `aci_edge_sandboxes` crate this sidecar was built
+> on was removed upstream; the sidecar is being ported onto the `nvx` library in `nvx-rs`
+> (`tools/nvxd/reference/` keeps the removed control-client sources for that port). The text
+> below describes the sidecar as it was before the port.
+
+
 `nvxd` is the NVX sidecar. It owns the stdio frame protocol,
 session lifecycle, live-share reconciliation, and the OpenVMM-backed execution
 adapter used by the Windows sandbox host.

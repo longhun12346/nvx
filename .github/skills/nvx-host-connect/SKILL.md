@@ -168,40 +168,49 @@ as-is or create an isolated checkout. Never silently test a different revision.
 
 Choose artifact preparation according to the task:
 
-- For packaged NVX artifacts, use `download` with the explicit backend. It
-  installs that backend's package from the release built from `HEAD` when
+- For packaged NVX artifacts, use `nvx-rs download` with the explicit backend.
+  It installs that backend's package from the release built from `HEAD` when
   available, otherwise from the nearest released first-parent ancestor that has
   the package. Report the selected release as the artifact provenance.
 - For guest, OpenVMM, or build changes, use the relevant `build-guest`,
   `build-openvmm`, or `build` command.
+- `nvx-rs`, which downloads releases and runs NVX's microVMs and sandboxes,
+  never comes with the package: build it with Cargo from the repository root
+  first, and again after `nvx-rs` changes.
 - For coordinator-only changes, existing matching release artifacts may be reused
   after reporting their provenance.
 
 Linux examples:
 
 ```bash
-python3 scripts/nvx.py download --hypervisor kvm
-python3 scripts/nvx.py download --hypervisor mshv
+cargo build --release --locked --features cli --manifest-path nvx-rs/Cargo.toml \
+    --target-dir nvx-rs/target
+nvx-rs/target/release/nvx-rs download --hypervisor kvm
+nvx-rs/target/release/nvx-rs download --hypervisor mshv
 python3 scripts/nvx.py build
 ```
 
 Windows examples:
 
 ```powershell
-python scripts\nvx.py download --hypervisor whp
+cargo build --release --locked --features cli --manifest-path nvx-rs/Cargo.toml `
+    --target-dir nvx-rs/target
+nvx-rs\target\release\nvx-rs.exe download --hypervisor whp
 python scripts\nvx.py build
 ```
 
-Do not download over artifacts the user wants to preserve. Verify the generated
-command and required files without starting a VM:
+Do not download over artifacts the user wants to preserve: `download` replaces
+them all. `nvx-rs run` and `sandbox` download a release only into a checkout
+that holds no artifacts; `NVX_AUTO_DOWNLOAD=0` turns that off. Verify the
+generated command and required files without starting a VM:
 
 ```bash
 backend=kvm # Use the resolved profile backend.
-python3 scripts/nvx.py run --hypervisor "$backend" --dry-run
+nvx-rs/target/release/nvx-rs run --hypervisor "$backend" --dry-run
 ```
 
 ```powershell
-python scripts\nvx.py run --hypervisor whp --dry-run
+nvx-rs\target\release\nvx-rs.exe run --hypervisor whp --dry-run
 ```
 
 ## Handoff

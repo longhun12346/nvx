@@ -8,6 +8,8 @@ import ctypes
 import hashlib
 import json
 import os
+import queue
+import shutil
 import signal
 import socket
 import subprocess
@@ -16,13 +18,14 @@ import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock, call, patch
 
 from nvx_tools.adversarial import (
     LOCAL_EXECUTOR_STATE_ROOT,
+    SCHEMA_VERSION,
     CampaignConfig,
     CopilotController,
     ExecutorClient,
@@ -33,6 +36,7 @@ from nvx_tools.adversarial import (
     _minimize_failure,
     _positive_float,
     _prefix_reproduces,
+    _validate_artifact_evidence,
     _validate_replay_manifest,
     local_executor_environment,
     run_campaign,
@@ -58,14 +62,17 @@ from nvx_tools.adversarial_executor import (
     sanitized_environment,
 )
 from nvx_tools.adversarial_oracles import (
+    _OWNED_EXEC,
     BoundedProcessResult,
     NetworkCanary,
     OracleSession,
+    ProcessTreeContainment,
     _freeze_linux_process_tree,
     _linux_process_exited,
     _reap_linux_children,
     _reap_linux_descendants,
     _WindowsJob,
+    killed_with_parent,
     run_bounded_process,
     terminate_process_tree,
 )
@@ -78,6 +85,7 @@ from nvx_tools.build_constants import (
     ReleaseBuildConstants,
 )
 from nvx_tools.common import ScriptError
+from nvx_tools.nvx_rs import find_binary as find_nvx_rs
 
 
 def _executor_result(
@@ -227,6 +235,8 @@ def _fake_executor_client_type(
                             "openvmm",
                             "kernel_provenance",
                             "openvmm_provenance",
+                            "nvx_rs",
+                            "nvx_rs_provenance",
                         )
                     },
                     "verify": {
@@ -1257,6 +1267,394 @@ class AdversarialOracleTests(unittest.TestCase):
                 unrelated.kill()
                 unrelated.wait()
 
+    def test_only_main_thread_commands_end_with_their_parent(self) -> None:
+        # #946: the kernel sends a parent-death signal when the thread that
+        # started the process exits, so only the main thread, which lives as
+        # long as its process, ties a process to its own.
+        command = ["openvmm", "--hypervisor", "kvm"]
+        containment = ProcessTreeContainment()
+        self.addCleanup(containment.abort_spawn)
+
+        def from_thread(start: Callable[[], list[str]]) -> list[str]:
+            started: list[list[str]] = []
+            thread = threading.Thread(target=lambda: started.append(start()))
+            thread.start()
+            thread.join()
+            return started[0]
+
+        with (
+            patch("nvx_tools.adversarial_oracles.sys.platform", "linux"),
+            patch(
+                "nvx_tools.adversarial_oracles.shutil.which",
+                return_value="/usr/bin/setpriv",
+            ) as which,
+        ):
+            self.assertEqual(
+                killed_with_parent(command),
+                [
+                    "/usr/bin/setpriv",
+                    "--pdeathsig",
+                    "KILL",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    _OWNED_EXEC,
+                    "sh",
+                    str(os.getpid()),
+                    *command,
+                ],
+            )
+            which.assert_called_once_with("setpriv")
+            self.assertEqual(from_thread(lambda: killed_with_parent(command)), command)
+            supervised = containment.command(command)
+            self.assertEqual(supervised[:2], [sys.executable, "-I"])
+            self.assertEqual(Path(supervised[2]).name, "process_supervisor.py")
+            self.assertEqual(supervised[3:], [str(os.getpid()), "--", *command])
+            self.assertEqual(
+                from_thread(lambda: containment.command(command))[3:],
+                ["--", *command],
+            )
+        with (
+            patch("nvx_tools.adversarial_oracles.sys.platform", "linux"),
+            patch("nvx_tools.adversarial_oracles.shutil.which", return_value=None),
+        ):
+            self.assertEqual(killed_with_parent(command), command)
+        with patch("nvx_tools.adversarial_oracles.sys.platform", "win32"):
+            self.assertEqual(killed_with_parent(command), command)
+            self.assertEqual(containment.command(command), command)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux parent-death signal")
+    def test_a_killed_owner_takes_its_interactive_processes_along(self) -> None:
+        # #946: the runner's orphan cleanup kills the test harness of a
+        # cancelled job outright, and a VM that the harness had started after
+        # the cleanup listed the job's processes ran on for days (#768). What
+        # InteractiveProcess starts ends with its owner all the same: OpenVMM
+        # by its parent-death signal, and a contained tree, descendants that
+        # leave its session included, by its supervisor.
+        owner_script = (
+            "import os, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from nvx_tools.benchmark import InteractiveProcess\n"
+            "interaction = InteractiveProcess(\n"
+            "    sys.argv[3:],\n"
+            "    dict(os.environ),\n"
+            "    contain_process_tree=sys.argv[2] == 'contained',\n"
+            ")\n"
+            "print(interaction.process.pid, flush=True)\n"
+            "sys.stdin.read()\n"
+        )
+        for contained in (False, True):
+            with (
+                self.subTest(contained=contained),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                if not contained and shutil.which("setpriv") is None:
+                    self.skipTest("needs setpriv")
+                root = Path(temporary)
+                pid_paths = [root / "command.pid"]
+                script = (
+                    "import os, pathlib, subprocess, sys, time\n"
+                    "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                )
+                if contained:
+                    pid_paths.append(root / "descendant.pid")
+                    script += (
+                        "child = subprocess.Popen([sys.executable, '-c', "
+                        "'import os, time; os.setsid(); time.sleep(60)'])\n"
+                        "pathlib.Path(sys.argv[2]).write_text(str(child.pid))\n"
+                    )
+                script += "time.sleep(60)\n"
+                owner = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        owner_script,
+                        str(Path(__file__).resolve().parent),
+                        "contained" if contained else "direct",
+                        sys.executable,
+                        "-c",
+                        script,
+                        *(str(path) for path in pid_paths),
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                )
+                owned: list[int] = []
+                try:
+                    assert owner.stdout is not None
+                    line = owner.stdout.readline()
+                    self.assertTrue(line, "the owner exited before it started")
+                    owned.append(int(line))
+                    deadline = time.monotonic() + 30
+                    for path in pid_paths:
+                        while True:
+                            self.assertLess(time.monotonic(), deadline)
+                            try:
+                                owned.append(int(path.read_text(encoding="utf-8")))
+                                break
+                            except (FileNotFoundError, ValueError):
+                                time.sleep(0.01)
+                    owner.kill()
+                    owner.wait()
+                    deadline = time.monotonic() + 10
+                    while not all(_process_exited(pid) for pid in owned):
+                        self.assertLess(
+                            time.monotonic(),
+                            deadline,
+                            f"processes {owned} outlived their owner",
+                        )
+                        time.sleep(0.05)
+                finally:
+                    for pid in owned:
+                        if _process_running(pid):
+                            with contextlib.suppress(ProcessLookupError):
+                                os.kill(pid, 9)
+                    if owner.poll() is None:
+                        owner.kill()
+                        owner.wait()
+                    for stream in (owner.stdin, owner.stdout):
+                        if stream is not None:
+                            stream.close()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux parent-death signal")
+    def test_a_command_whose_owner_exited_never_starts(self) -> None:
+        # #946: an owner that dies before setpriv arms the parent-death signal
+        # sends none, and the orphaned command is then another process's
+        # child, as it is here, where a shell starts it. It must not start.
+        if shutil.which("setpriv") is None:
+            self.skipTest("needs setpriv")
+        with tempfile.TemporaryDirectory() as temporary:
+            started = Path(temporary) / "started"
+            command = killed_with_parent(
+                [
+                    sys.executable,
+                    "-c",
+                    "import pathlib, sys; pathlib.Path(sys.argv[1]).touch()",
+                    str(started),
+                ]
+            )
+            orphaned = subprocess.run(
+                ["/bin/sh", "-c", '"$@"; exit "$?"', "sh", *command],
+                timeout=30,
+                check=False,
+            )
+            self.assertNotEqual(orphaned.returncode, 0)
+            self.assertFalse(started.exists())
+            # Its owner starts it.
+            owned = subprocess.run(command, timeout=30, check=False)
+            self.assertEqual(owned.returncode, 0)
+            self.assertTrue(started.exists())
+
+    def test_supervisors_run_without_the_runners_tracking_id(self) -> None:
+        # #946: the runner's orphan cleanup kills the processes whose
+        # environment names the job in RUNNER_TRACKING_ID. The supervisor runs
+        # without it, so that the cleanup can't kill it before it ends its
+        # tree, and gives it back to its command, which the cleanup tracks.
+        containment = ProcessTreeContainment()
+        self.addCleanup(containment.abort_spawn)
+        environment = {"RUNNER_TRACKING_ID": "github_1234", "NVX_MARKER": "kept"}
+        with patch("nvx_tools.adversarial_oracles.sys.platform", "linux"):
+            self.assertEqual(
+                containment.environment(environment),
+                {
+                    "NVX_SUPERVISED_RUNNER_TRACKING_ID": "github_1234",
+                    "NVX_MARKER": "kept",
+                },
+            )
+            self.assertEqual(
+                containment.environment({"NVX_MARKER": "kept"}),
+                {"NVX_MARKER": "kept"},
+            )
+        with patch("nvx_tools.adversarial_oracles.sys.platform", "win32"):
+            self.assertEqual(containment.environment(environment), environment)
+        self.assertEqual(environment["RUNNER_TRACKING_ID"], "github_1234")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process ownership")
+    def test_the_orphan_cleanup_leaves_a_contained_tree_to_its_supervisor(
+        self,
+    ) -> None:
+        # #946: the runner's orphan cleanup lists the processes whose
+        # environment names the job in RUNNER_TRACKING_ID and then kills them,
+        # the test harness first. A process that the harness's contained tree
+        # starts after the listing, such as OpenVMM, escapes the list, and the
+        # supervisor, which the cleanup doesn't list, ends it.
+        tracking = f"nvx-test-{os.getpid()}-{time.monotonic_ns()}"
+        owner_script = (
+            "import os, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from nvx_tools.benchmark import InteractiveProcess\n"
+            "interaction = InteractiveProcess(\n"
+            "    sys.argv[2:], dict(os.environ), contain_process_tree=True\n"
+            ")\n"
+            "print(interaction.process.pid, flush=True)\n"
+            "sys.stdin.read()\n"
+        )
+        command_script = (
+            "import os, pathlib, subprocess, sys, time\n"
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+            "while not pathlib.Path(sys.argv[2]).exists():\n"
+            "    time.sleep(0.01)\n"
+            "late = subprocess.Popen([sys.executable, '-c', "
+            "'import os, time; os.setsid(); time.sleep(60)'])\n"
+            "pathlib.Path(sys.argv[3]).write_text(str(late.pid))\n"
+            "time.sleep(60)\n"
+        )
+
+        def listed() -> list[int]:
+            tracked = f"RUNNER_TRACKING_ID={tracking}".encode()
+            found: list[int] = []
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    environment = (entry / "environ").read_bytes().split(b"\0")
+                except OSError:
+                    continue
+                if tracked in environment:
+                    found.append(int(entry.name))
+            return sorted(found)
+
+        def read_pid(path: Path) -> int:
+            deadline = time.monotonic() + 30
+            while True:
+                self.assertLess(time.monotonic(), deadline)
+                try:
+                    return int(path.read_text(encoding="utf-8"))
+                except (FileNotFoundError, ValueError):
+                    time.sleep(0.01)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            go = root / "go"
+            owner = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    owner_script,
+                    str(Path(__file__).resolve().parent),
+                    sys.executable,
+                    "-c",
+                    command_script,
+                    str(root / "command.pid"),
+                    str(go),
+                    str(root / "late.pid"),
+                ],
+                env=dict(os.environ, RUNNER_TRACKING_ID=tracking),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+            )
+            owned: list[int] = []
+            try:
+                assert owner.stdout is not None
+                line = owner.stdout.readline()
+                self.assertTrue(line, "the owner exited before it started")
+                supervisor = int(line)
+                owned.append(supervisor)
+                command = read_pid(root / "command.pid")
+                owned.append(command)
+                snapshot = listed()
+                self.assertIn(owner.pid, snapshot)
+                self.assertIn(command, snapshot)
+                self.assertNotIn(supervisor, snapshot)
+                go.touch()
+                owned.append(read_pid(root / "late.pid"))
+                for pid in snapshot:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(pid, 9)
+                owner.wait()
+                deadline = time.monotonic() + 10
+                while not all(_process_exited(pid) for pid in owned):
+                    self.assertLess(
+                        time.monotonic(),
+                        deadline,
+                        f"processes {owned} outlived the cleanup",
+                    )
+                    time.sleep(0.05)
+            finally:
+                for pid in owned:
+                    if _process_running(pid):
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(pid, 9)
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait()
+                for stream in (owner.stdin, owner.stdout):
+                    if stream is not None:
+                        stream.close()
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process ownership")
+    def test_a_supervisor_whose_parent_exited_starts_nothing(self) -> None:
+        # A parent that exited before the supervisor set its parent-death
+        # signal sends no signal, so the supervisor checks its parent first.
+        exited = subprocess.Popen([sys.executable, "-c", ""])
+        exited.wait()
+        supervisor = (
+            Path(__file__).resolve().parent / "nvx_tools" / "process_supervisor.py"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            started = Path(temporary) / "started"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(supervisor),
+                    str(exited.pid),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "import pathlib, sys; pathlib.Path(sys.argv[1]).touch()",
+                    str(started),
+                ],
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(result.returncode, -signal.SIGTERM)
+            self.assertFalse(started.exists())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process ownership")
+    def test_a_supervisor_forwards_signals_while_its_parent_lives(self) -> None:
+        # The command handles the forwarded SIGTERM and exits with status 7,
+        # which a supervisor that took its parent for dead would have killed.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pid_path = root / "command.pid"
+            stopped = root / "stopped"
+            script = (
+                "import os, pathlib, signal, sys, time\n"
+                "def stop(signum, frame):\n"
+                "    pathlib.Path(sys.argv[2]).touch()\n"
+                "    sys.exit(7)\n"
+                "signal.signal(signal.SIGTERM, stop)\n"
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                "time.sleep(60)\n"
+            )
+            containment = ProcessTreeContainment()
+            supervisor = subprocess.Popen(
+                containment.command(
+                    [sys.executable, "-c", script, str(pid_path), str(stopped)]
+                )
+            )
+            command_pid: int | None = None
+            try:
+                deadline = time.monotonic() + 30
+                while command_pid is None:
+                    self.assertLess(time.monotonic(), deadline)
+                    try:
+                        command_pid = int(pid_path.read_text(encoding="utf-8"))
+                    except (FileNotFoundError, ValueError):
+                        time.sleep(0.01)
+                supervisor.send_signal(signal.SIGTERM)
+                self.assertEqual(supervisor.wait(timeout=30), 7)
+                self.assertTrue(stopped.exists())
+                self.assertTrue(_process_exited(command_pid))
+            finally:
+                if command_pid is not None and _process_running(command_pid):
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(command_pid, 9)
+                if supervisor.poll() is None:
+                    supervisor.kill()
+                    supervisor.wait()
+
     def test_network_canary_counts_connections_queued_at_close(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             canary = NetworkCanary(Path(temporary) / "network-canary.jsonl")
@@ -2128,11 +2526,101 @@ class CopilotContainmentTests(unittest.TestCase):
         self.assertNotIn("SSH_AUTH_SOCK", environment)
         self.assertNotIn("UNRELATED_SECRET", environment)
 
+    def test_executor_environment_locates_nvx_rs_and_the_rust_toolchain(self) -> None:
+        # Scenarios run NVX_RS, or build nvx-rs and run the managed-lifecycle
+        # test with the toolchain that CARGO_HOME and RUSTUP_HOME locate.
+        # rust-toolchain.toml still selects the Rust release, and no other
+        # Cargo setting or credential passes.
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "test-path",
+                "NVX_RS": "test-nvx-rs",
+                "CARGO_HOME": "test-cargo-home",
+                "RUSTUP_HOME": "test-rustup-home",
+                "RUSTUP_TOOLCHAIN": "nightly",
+                "CARGO_TARGET_DIR": "test-target",
+                "RUSTFLAGS": "-Ctarget-cpu=native",
+                "CARGO_REGISTRY_TOKEN": "registry-secret",
+            },
+            clear=True,
+        ):
+            environment = sanitized_environment()
+        self.assertEqual(
+            environment,
+            {
+                "PATH": "test-path",
+                "NVX_RS": str(Path("test-nvx-rs").absolute()),
+                "CARGO_HOME": "test-cargo-home",
+                "RUSTUP_HOME": "test-rustup-home",
+                "PYTHONUNBUFFERED": "1",
+            },
+        )
+
+    def test_scenarios_run_the_relative_nvx_rs_that_the_executor_validated(
+        self,
+    ) -> None:
+        # The executor validates a relative NVX_RS in its own working
+        # directory, and the scenarios run in another, the repository root,
+        # so the environment that they inherit names that executable.
+        previous = Path.cwd()
+        self.addCleanup(os.chdir, previous)
+        with tempfile.TemporaryDirectory() as temporary:
+            executor_directory = Path(temporary)
+            executable = executor_directory / "bin" / "nvx-rs"
+            executable.parent.mkdir()
+            executable.write_bytes(b"")
+            os.chdir(executor_directory)
+            try:
+                with patch.dict(os.environ, {"NVX_RS": os.path.join("bin", "nvx-rs")}):
+                    validated = find_nvx_rs()
+                    environment = sanitized_environment()
+            finally:
+                os.chdir(previous)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from nvx_tools import nvx_rs; print(nvx_rs.find_binary())",
+                ],
+                cwd=Path(__file__).resolve().parent,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(validated, executable.absolute())
+        self.assertEqual(completed.stdout.strip(), str(validated))
+
+    def test_scenarios_find_nvx_rs_with_the_executor_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            nvx_rs = Path(temporary) / "nvx-rs"
+            nvx_rs.write_bytes(b"")
+            with patch.dict(os.environ, {"NVX_RS": str(nvx_rs)}):
+                environment = sanitized_environment()
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from nvx_tools import nvx_rs; print(nvx_rs.find_binary())",
+                ],
+                cwd=Path(__file__).resolve().parent,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), str(nvx_rs.absolute()))
+
     def test_executor_resolves_build_artifacts_with_shared_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             openvmm = root / OpenVMMBuildConstants.BINARY_NAME
             openvmm.write_bytes(b"openvmm")
+            nvx_rs_executable = root / "nvx-rs"
+            nvx_rs_executable.write_bytes(b"nvx-rs")
 
             def artifact_path(name: str) -> Path:
                 path = root / name
@@ -2148,11 +2636,41 @@ class CopilotContainmentTests(unittest.TestCase):
                     "nvx_tools.adversarial_executor.openvmm_binary_path",
                     return_value=openvmm,
                 ),
+                # The nvx-rs that nvx.py runs, which NVX_RS may name.
+                patch(
+                    "nvx_tools.adversarial_executor.nvx_rs.find_binary",
+                    return_value=nvx_rs_executable,
+                ),
                 patch(
                     "nvx_tools.adversarial_executor.validate_runtime_artifact_provenance"
-                ),
+                ) as validate,
             ):
-                _artifact_metadata()
+                artifacts = _artifact_metadata()
+
+            validate.assert_called_once_with()
+            _validate_artifact_evidence(artifacts)
+            for name in ("nvx_rs", "nvx_rs_provenance"):
+                incomplete = artifacts.copy()
+                incomplete.pop(name)
+                with (
+                    self.subTest(missing=name),
+                    self.assertRaisesRegex(
+                        ScriptError, "executor artifact evidence has invalid properties"
+                    ),
+                ):
+                    _validate_artifact_evidence(incomplete)
+            self.assertEqual(
+                artifacts["nvx_rs"],
+                {
+                    "path": str(nvx_rs_executable),
+                    "sha256": hashlib.sha256(b"nvx-rs").hexdigest(),
+                    "size": len(b"nvx-rs"),
+                },
+            )
+            self.assertEqual(
+                cast(dict[str, object], artifacts["nvx_rs_provenance"])["path"],
+                str(root / "nvx-rs.provenance.json"),
+            )
 
         self.assertEqual(
             [entry.args[0] for entry in resolve.call_args_list],
@@ -2163,8 +2681,48 @@ class CopilotContainmentTests(unittest.TestCase):
                 InitramfsBuildConstants.PROVENANCE_NAME,
                 KernelBuildConstants.PROVENANCE_NAME,
                 OpenVMMBuildConstants.PROVENANCE_NAME,
+                "nvx-rs.provenance.json",
             ],
         )
+
+    def test_executor_requires_the_nvx_rs_that_the_scenarios_run(self) -> None:
+        # Without NVX_RS, the scenarios run nvx-rs/target/release/nvx-rs,
+        # which nvx.py would otherwise build during a scenario's timeout.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def artifact_path(name: str) -> Path:
+                path = root / name
+                path.write_bytes(name.encode())
+                return path
+
+            missing = root / "missing" / "nvx-rs"
+            with (
+                patch(
+                    "nvx_tools.adversarial_executor.artifact_path",
+                    side_effect=artifact_path,
+                ),
+                patch(
+                    "nvx_tools.adversarial_executor.openvmm_binary_path",
+                    return_value=artifact_path("openvmm"),
+                ),
+                patch(
+                    "nvx_tools.adversarial_executor.nvx_rs.find_binary",
+                    return_value=None,
+                ),
+                patch(
+                    "nvx_tools.adversarial_executor.nvx_rs.binary_path",
+                    return_value=missing,
+                ),
+                patch(
+                    "nvx_tools.adversarial_executor.validate_runtime_artifact_provenance"
+                ) as validate,
+                self.assertRaisesRegex(
+                    ScriptError, f"nvx-rs executable not found: .*{missing.name}"
+                ),
+            ):
+                _artifact_metadata()
+            validate.assert_not_called()
 
     def test_external_executor_also_drops_controller_credentials(self) -> None:
         process = MagicMock()
@@ -2598,6 +3156,83 @@ class CopilotContainmentTests(unittest.TestCase):
         repair_prompt = observed_prompts[1].decode("utf-8")
         self.assertIn("allowed_case_ids", repair_prompt)
         self.assertIn(case_id, repair_prompt)
+
+
+class ExecutorCloseTests(unittest.TestCase):
+    def test_close_is_bounded_when_a_surviving_child_holds_executor_stdout(self):
+        # The wrapper exits after starting a child that inherits its stdout, so the protocol
+        # reader stays blocked. Closing must not wait for that child to exit.
+        with tempfile.TemporaryDirectory(prefix="nvx-executor-close-") as temporary:
+            root = Path(temporary)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            pid_file = root / "child.pid"
+            child = (
+                f'"{sys.executable}" -c "import os, sys, time; '
+                "open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(20)\""
+                f' "{pid_file}"'
+            )
+            if os.name == "nt":
+                wrapper = root / "wrapper.cmd"
+                wrapper.write_bytes(f'@echo off\r\nstart "" /B {child}\r\n'.encode())
+            else:
+                wrapper = root / "wrapper.sh"
+                wrapper.write_bytes(f"#!/bin/sh\n{child} &\n".encode())
+                wrapper.chmod(0o755)
+            client = ExecutorClient(
+                run_dir=run_dir,
+                command=str(wrapper),
+                label="surviving-child",
+            )
+            try:
+                with self.assertRaises(ExecutorUnavailableError):
+                    client.request(
+                        {"schema_version": SCHEMA_VERSION, "operation": "shutdown"},
+                        timeout=0.5,
+                    )
+                started = time.monotonic()
+                # If the wrapper exited before request() flushed stdin, close() can see the
+                # buffered stdin data fail with BrokenPipeError instead of the stdout ScriptError.
+                with self.assertRaises((ScriptError, BrokenPipeError)):
+                    client.close()
+                self.assertLess(time.monotonic() - started, 8.0)
+            finally:
+                # The surviving child holds the log and must not outlive the test.
+                deadline = time.monotonic() + 5.0
+                while not pid_file.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if pid_file.exists():
+                    pid = pid_file.read_text(encoding="utf-8")
+                    if os.name == "nt":
+                        subprocess.run(
+                            ["taskkill.exe", "/PID", pid, "/T", "/F"],
+                            check=False,
+                            capture_output=True,
+                        )
+                    else:
+                        os.kill(int(pid), signal.SIGKILL)
+
+    def test_reader_closes_its_stream_when_the_output_ends(self):
+        client = ExecutorClient.__new__(ExecutorClient)
+        client._stdout = MagicMock()
+        client._stdout.readline.side_effect = [b'{"ok": true}\n', b""]
+        client._responses = queue.Queue()
+        client._abandoned = False
+        client._read_responses()
+        client._stdout.close.assert_called_once_with()
+        self.assertEqual(client._responses.get_nowait(), b'{"ok": true}\n')
+        self.assertIsNone(client._responses.get_nowait())
+
+    def test_abandoned_reader_drains_output_without_retaining_it(self):
+        client = ExecutorClient.__new__(ExecutorClient)
+        client._stdout = MagicMock()
+        client._stdout.readline.side_effect = [b"late\n", b"later\n", b""]
+        client._responses = queue.Queue()
+        client._abandoned = True
+        client._read_responses()
+        client._stdout.close.assert_called_once_with()
+        self.assertIsNone(client._responses.get_nowait())
+        self.assertTrue(client._responses.empty())
 
 
 if __name__ == "__main__":

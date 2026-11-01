@@ -17,6 +17,26 @@ pub struct Cidr {
 impl Cidr {
     /// Parses `ADDRESS` or `ADDRESS/PREFIX`. Host bits must be zero.
     pub fn parse(value: &str) -> Result<Self, String> {
+        let cidr = Self::parse_with(value, parse_prefix_length)?;
+        if cidr.network() != cidr.address {
+            return Err(format!("{value:?} has host bits set"));
+        }
+        Ok(cidr)
+    }
+
+    /// Parses `ADDRESS` or `ADDRESS/PREFIX` as OpenVMM reads the destination of an egress rule,
+    /// and clears the host bits. The prefix length is read as `u8::from_str` reads it.
+    pub fn parse_masked(value: &str) -> Result<Self, String> {
+        let cidr = Self::parse_with(value, |prefix| prefix.parse().ok())?;
+        Ok(Self {
+            address: cidr.network(),
+            prefix: cidr.prefix,
+        })
+    }
+
+    /// Parses `ADDRESS` or `ADDRESS/PREFIX`, reading the prefix length with `prefix_length`,
+    /// without checking the host bits.
+    fn parse_with(value: &str, prefix_length: fn(&str) -> Option<u8>) -> Result<Self, String> {
         let (address, prefix) = match value.split_once('/') {
             Some((address, prefix)) => (address, Some(prefix)),
             None => (value, None),
@@ -30,15 +50,11 @@ impl Cidr {
         };
         let prefix = match prefix {
             None => width,
-            Some(prefix) => parse_prefix_length(prefix)
+            Some(prefix) => prefix_length(prefix)
                 .filter(|prefix| *prefix <= width)
                 .ok_or_else(|| format!("{value:?} has an invalid prefix length"))?,
         };
-        let cidr = Self { address, prefix };
-        if cidr.network() != address {
-            return Err(format!("{value:?} has host bits set"));
-        }
-        Ok(cidr)
+        Ok(Self { address, prefix })
     }
 
     /// Returns the network of every address of one family: `::/0` with `ipv6`, and `0.0.0.0/0`
@@ -213,6 +229,32 @@ mod tests {
             "fe80::1%eth0",
         ] {
             assert!(Cidr::parse(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn masked_parsing_clears_host_bits_as_openvmm_does() {
+        let masked = |value: &str| Cidr::parse_masked(value).unwrap().to_string();
+        assert_eq!(masked("10.0.0.1/8"), "10.0.0.0/8");
+        assert_eq!(masked("192.0.2.7"), "192.0.2.7/32");
+        assert_eq!(masked("2001:db8::1/32"), "2001:db8::/32");
+        assert_eq!(masked("2001:db8::1"), "2001:db8::1/128");
+        assert_eq!(masked("::ffff:192.0.2.1/96"), "::ffff:0.0.0.0/96");
+        // OpenVMM reads the prefix length as `u8::from_str` does.
+        assert_eq!(masked("10.0.0.0/08"), "10.0.0.0/8");
+        assert_eq!(masked("10.0.0.0/+8"), "10.0.0.0/8");
+        for invalid in [
+            "10.0.0.0/33",
+            "2001:db8::/129",
+            "10.0.0.0/",
+            "10.0.0.0/-1",
+            "10.0.0.0/255.0.0.0",
+            "10.0.0.0/8/8",
+            "010.0.0.0/8",
+            "example.com",
+            "fe80::1%eth0",
+        ] {
+            assert!(Cidr::parse_masked(invalid).is_err(), "{invalid}");
         }
     }
 

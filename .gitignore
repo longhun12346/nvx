@@ -16,3 +16,4 @@ __pycache__/
 .DS_Store
 Thumbs.db
 /tools/nvxd-guest/target/
+/tools/nvxd-guest/target-diagnostic/

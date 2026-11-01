@@ -71,10 +71,13 @@ jobs:
           test -n "${channel}"
           rustup toolchain install "${channel}" --profile minimal --target x86_64-unknown-linux-musl
 
-      - name: Build the Ubuntu initramfs and distro layer
+      # nvxd boots NVX's base initramfs with its own guest agent added, and the Ubuntu root as an
+      # EROFS layer, so it needs the base initramfs and the layer; the Ubuntu initramfs of
+      # `build-initramfs --guest ubuntu` is a different boot flavour that the sidecar cannot attach to.
+      - name: Build the base initramfs and the Ubuntu distro layer
         run: |
           set -euo pipefail
-          python3 scripts/nvx.py build-initramfs --guest ubuntu
+          python3 scripts/nvx.py build-initramfs
           python3 scripts/nvx.py build-distro-layer --guest ubuntu --output build/ubuntu-distro.erofs
 
       - name: Collect the assets the sidecar uses
@@ -84,7 +87,7 @@ jobs:
           mkdir -p "${out}"
           for file in vmlinux vmlinux.config vmlinux.provenance.json \
               ubuntu-distro.erofs ubuntu-distro.erofs.manifest.json \
-              initramfs-ubuntu.cpio.gz initramfs-ubuntu.cpio.gz.packages.json; do
+              initramfs.cpio.gz initramfs.cpio.gz.packages.json; do
             cp "build/${file}" "${out}/"
           done
           (cd "${out}" && sha256sum * > SHA256SUMS && cat SHA256SUMS)

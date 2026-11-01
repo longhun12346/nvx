@@ -141,6 +141,7 @@ dependencies = [
 name = "nvxd-guest"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nix",
  "nvx",
  "serde_json",

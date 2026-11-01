@@ -90,6 +90,9 @@ pub(super) struct Executions {
     /// Fork extension: the resource limits that the host announced for the executions it has not
     /// started yet, by ID.
     limits: BTreeMap<u64, Resources>,
+    /// Fork extension: the isolated session that the host named for the executions it has not
+    /// started yet, by ID.
+    sessions: BTreeMap<u64, u64>,
     /// Fork extension: whether the worker exempted itself from the kernel's out-of-memory killer,
     /// so that it lifts the exemption while it spawns a program, which would inherit it.
     exempt: bool,
@@ -277,6 +280,7 @@ impl Executions {
             history: VecDeque::new(),
             buffer: vec![0; MAX_CHUNK as usize],
             limits: BTreeMap::new(),
+            sessions: BTreeMap::new(),
             exempt: false,
         }
     }
@@ -287,6 +291,18 @@ impl Executions {
         let (id, resources) = Resources::parse(body)
             .ok_or_else(|| ServeError::Execution("malformed execution limits".to_owned()))?;
         self.limits.insert(id, resources);
+        Ok(())
+    }
+
+    /// Fork extension: keeps the isolated session that the host named in `body`, `id\nsession`,
+    /// until it starts the execution `id`.
+    pub(super) fn set_session(&mut self, body: &[u8]) -> Result<(), ServeError> {
+        let parsed = std::str::from_utf8(body).ok().and_then(|text| {
+            let (id, session) = text.split_once(char::from(10u8))?;
+            Some((id.parse::<u64>().ok()?, session.parse::<u64>().ok()?))
+        });
+        let (id, session) = parsed.ok_or_else(|| ServeError::Execution("malformed execution session".to_owned()))?;
+        self.sessions.insert(id, session);
         Ok(())
     }
 
@@ -662,10 +678,27 @@ impl Executions {
         operations: &mut dyn EntryOperations,
     ) -> io::Result<(Execution, Option<Child>, Option<ExecutionCgroup>)> {
         let resources = self.limits.remove(&start.key.id()).unwrap_or_default();
-        let entrance = self.entrance(start)?;
-        let prepared = operations
-            .prepare(&entrance)
-            .map_err(|error| io::Error::from(refusal(&error)))?;
+        let session = self.sessions.remove(&start.key.id());
+        let launch = match session {
+            // Fork extension: an isolated session's program enters its keeper's namespaces through
+            // the agent's own helper, which keeps the cgroup, process group and pipes below.
+            Some(session) => {
+                let directory = start
+                    .working_directory
+                    .as_deref()
+                    .map_or_else(|| "/workspace".to_owned(), |bytes| String::from_utf8_lossy(bytes).into_owned());
+                let helper = operations.session_enter(session, &directory).map_err(io::Error::from_raw_os_error)?;
+                Launch::Session { helper }
+            }
+            None => {
+                operations.unscoped_exec().map_err(io::Error::from_raw_os_error)?;
+                let entrance = self.entrance(start)?;
+                let prepared = operations
+                    .prepare(&entrance)
+                    .map_err(|error| io::Error::from(refusal(&error)))?;
+                Launch::Entry { prepared, operations }
+            }
+        };
         let exempt = self.exempt;
         let Some(cgroups) = &self.cgroups else {
             // Fork extension: limits that the worker cannot apply refuse the execution, which
@@ -674,7 +707,7 @@ impl Executions {
                 return Err(Errno::EOPNOTSUPP.into());
             }
             let _lifted = Unexempt::lift(exempt);
-            let (execution, program) = spawn(start, prepared, None, operations, &mut self.reaping)
+            let (execution, program) = spawn(start, launch, None, &mut self.reaping)
                 .map_err(|unstarted| unstarted.error)?;
             return Ok((execution, program, None));
         };
@@ -684,13 +717,7 @@ impl Executions {
         let files: Vec<(&str, &str)> = files.iter().map(|(file, value)| (*file, value.as_str())).collect();
         let cgroup = ExecutionCgroup::prepare(cgroups, Some(&name), &files)?;
         let _lifted = Unexempt::lift(exempt);
-        match spawn(
-            start,
-            prepared,
-            Some(&cgroup),
-            operations,
-            &mut self.reaping,
-        ) {
+        match spawn(start, launch, Some(&cgroup), &mut self.reaping) {
             Ok((execution, program)) => Ok((execution, program, Some(cgroup))),
             Err(Unstarted { error, spawned }) => {
                 if spawned || cgroup.remove().is_err() {
@@ -878,6 +905,18 @@ impl From<io::Error> for Unstarted {
     }
 }
 
+/// How the program of an execution starts.
+enum Launch<'a> {
+    /// In the sandbox root, as the entry that `prepared` prepared describes.
+    Entry {
+        prepared: Prepared,
+        operations: &'a mut dyn EntryOperations,
+    },
+    /// Fork extension: through the helper that joins an isolated session; `helper` is the
+    /// helper's command line up to the `--` that precedes the program.
+    Session { helper: Vec<String> },
+}
+
 /// Spawns the program of `start` with pipes, in a process group of its own, and in `cgroup`, if
 /// any, through `operations`, whose spawn enters the root as `prepared` prepared it, which makes
 /// the program lead a session of its own, and returns its execution. The program starts in the
@@ -890,9 +929,8 @@ impl From<io::Error> for Unstarted {
 /// the failure then tells that the worker spawned the program.
 fn spawn(
     start: &Start,
-    prepared: Prepared,
+    launch: Launch<'_>,
     cgroup: Option<&ExecutionCgroup>,
-    operations: &mut dyn EntryOperations,
     reaping: &mut Vec<u32>,
 ) -> Result<(Execution, Option<Child>), Unstarted> {
     let strings = |items: &[Vec<u8>]| {
@@ -902,9 +940,27 @@ fn spawn(
             .collect::<Result<Vec<_>, _>>()
             .map_err(io::Error::from)
     };
-    let arguments = strings(&start.arguments)?;
-    let environment = strings(&start.environment)?;
-    let program = arguments.first().cloned().unwrap_or_default();
+    let mut arguments = strings(&start.arguments)?;
+    let mut environment = strings(&start.environment)?;
+    let mut helper_program = None;
+    if let Launch::Session { helper } = &launch {
+        // Fork extension: the program is the agent's own helper; the real program follows `--`.
+        let executable = std::env::current_exe().map_err(io::Error::from)?;
+        let mut command_line = vec![CString::new("nvxd-guest").map_err(io::Error::from)?];
+        for item in helper {
+            command_line.push(CString::new(item.as_str()).map_err(io::Error::from)?);
+        }
+        command_line.append(&mut arguments);
+        arguments = command_line;
+        helper_program = Some(CString::new(executable.as_os_str().as_encoded_bytes()).map_err(io::Error::from)?);
+        for default in ["HOME=/home/session", "USER=session", "LOGNAME=session", "LANG=C.UTF-8"] {
+            let name = default.split('=').next().unwrap_or_default();
+            if !environment.iter().any(|item| item.as_bytes().starts_with(format!("{name}=").as_bytes())) {
+                environment.push(CString::new(default).map_err(io::Error::from)?);
+            }
+        }
+    }
+    let program = helper_program.unwrap_or_else(|| arguments.first().cloned().unwrap_or_default());
     let (pipes, ends) = Pipes::new(start.input)?;
     let stdin = match ends.stdin {
         Some(stdin) => stdin,
@@ -916,14 +972,18 @@ fn spawn(
         .stderr(ends.stderr)
         .new_process_group()
         .environment(environment);
-    if let Some(directory) = &start.working_directory {
+    // A session's helper enters the working directory itself, inside the session's root.
+    if let (Some(directory), Launch::Entry { .. }) = (&start.working_directory, &launch) {
         let directory = CString::new(directory.as_slice()).map_err(io::Error::from)?;
         command = command.working_directory(directory);
     }
     if let Some(cgroup) = cgroup {
         command = command.cgroup(cgroup.placement()?);
     }
-    let spawned = operations.spawn(command, prepared)?;
+    let spawned = match launch {
+        Launch::Entry { prepared, operations } => operations.spawn(command, prepared)?,
+        Launch::Session { .. } => command.spawn()?,
+    };
     let id = spawned.id();
     let options = match cgroup {
         Some(cgroup) => Options::new().cgroup(cgroup, Scope::Execution),

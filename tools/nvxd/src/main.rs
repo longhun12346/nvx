@@ -65,6 +65,7 @@ struct Args {
     work_workers: usize,
     session_ttl_secs: u64,
     idle_trim_secs: u64,
+    session_isolation: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -91,6 +92,7 @@ fn parse_args() -> Result<Args, String> {
         work_workers: DEFAULT_WORK_WORKERS,
         session_ttl_secs: 0,
         idle_trim_secs: 0,
+        session_isolation: false,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -133,9 +135,7 @@ fn parse_args() -> Result<Args, String> {
             "--exec-memory-mb" => args.exec_memory_mb = number(value()?)?,
             "--exec-cpu-percent" => args.exec_cpu_percent = number(value()?)?,
             "--exec-pids" => args.exec_pids = number(value()?)?,
-            "--session-isolation" => {
-                return Err("--session-isolation is not served by this build yet".to_owned());
-            }
+            "--session-isolation" => args.session_isolation = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -230,6 +230,7 @@ fn run() -> Result<(), String> {
     let (writer, writer_thread) = outbound::spawn(Box::new(std::io::stdout()), args.outbound_capacity);
     let writer = Arc::new(writer);
     let settings = Settings {
+        session_isolation: args.session_isolation,
         max_queue: args.max_queue,
         max_sessions: args.max_sessions,
         max_running: args.max_running,

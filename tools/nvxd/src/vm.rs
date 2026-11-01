@@ -89,8 +89,13 @@ pub enum Command {
         environment: Vec<Vec<u8>>,
         timeout: Option<Duration>,
         resources: Resources,
+        /// The isolated guest session the execution runs in, if any.
+        session: Option<u64>,
         reply: Sender<Result<(), String>>,
     },
+    /// Sends a session request (open, close, bind, unbind); the guest answers `SessionOk` or
+    /// `SessionFailed`.
+    Session { message: Message, reply: Sender<Result<(), String>> },
     /// Binds a child of the host export at a target in the guest root.
     Mount { source: String, target: String, read_only: bool, reply: Sender<Result<(), String>> },
     /// Unmounts a target that a `Mount` bound.
@@ -205,6 +210,7 @@ impl Vm {
         environment: Vec<Vec<u8>>,
         timeout: Option<Duration>,
         resources: Resources,
+        session: Option<u64>,
     ) -> Result<(), String> {
         let (reply, answer) = mpsc::channel();
         self.commands
@@ -215,12 +221,47 @@ impl Vm {
                 environment,
                 timeout,
                 resources,
+                session,
                 reply,
             })
             .map_err(|_| "the VM is gone".to_owned())?;
         answer
             .recv_timeout(SESSION_TIMEOUT)
             .map_err(|_| "the VM did not answer".to_owned())?
+    }
+
+    fn session_request(&self, message: Message) -> Result<(), String> {
+        let (reply, answer) = mpsc::channel();
+        self.commands
+            .send(Command::Session { message, reply })
+            .map_err(|_| "the VM is gone".to_owned())?;
+        answer.recv_timeout(SESSION_TIMEOUT).unwrap_or_else(|_| Err("the VM did not answer".to_owned()))
+    }
+
+    /// Creates the isolated guest session `id` over the workspace mounted at the root path
+    /// `workspace`, with the VM's own network if `share_network`.
+    pub fn session_open(&self, id: u64, workspace: &str, share_network: bool) -> Result<(), String> {
+        let nl = char::from(10u8);
+        let body = format!("{id}{nl}{}{nl}{workspace}", u8::from(share_network));
+        self.session_request(Message::SessionOpen(body.into_bytes()))
+    }
+
+    /// Destroys the isolated guest session `id`.
+    pub fn session_close(&self, id: u64) -> Result<(), String> {
+        self.session_request(Message::SessionClose(id.to_string().into_bytes()))
+    }
+
+    /// Attaches the root path `source` to the session `id` at `target`.
+    pub fn session_bind(&self, id: u64, source: &str, target: &str, read_only: bool) -> Result<(), String> {
+        let nl = char::from(10u8);
+        let body = format!("{id}{nl}{}{nl}{source}{nl}{target}", if read_only { "ro" } else { "rw" });
+        self.session_request(Message::SessionBind(body.into_bytes()))
+    }
+
+    /// Strictly detaches the session mount at `target`.
+    pub fn session_unbind(&self, id: u64, target: &str) -> Result<(), String> {
+        let nl = char::from(10u8);
+        self.session_request(Message::SessionUnbind(format!("{id}{nl}{target}").into_bytes()))
     }
 
     /// Exports the host directory `host` as the aggregate child `child` and binds it at `target` in
@@ -606,13 +647,21 @@ fn pump(client: &mut Client, commands: &Receiver<Command>, events: &impl Fn(Even
                         }
                     }
                 }
+                Ok(Command::Session { message, reply }) => {
+                    match client.send(&message, Some(Instant::now() + SESSION_TIMEOUT)) {
+                        Ok(()) => mounting.push_back(reply),
+                        Err(error) => {
+                            let _ = reply.send(Err(error.to_string()));
+                        }
+                    }
+                }
                 Ok(Command::Cancel { id }) => {
                     let now = Instant::now();
                     for entry in running.values_mut().filter(|entry| entry.name == id) {
                         entry.peer.cancel(now);
                     }
                 }
-                Ok(Command::Exec { id, arguments, working_directory, environment, timeout, resources, reply }) => {
+                Ok(Command::Exec { id, arguments, working_directory, environment, timeout, resources, session, reply }) => {
                     let key = Key::new(base.wrapping_add(next), identity.epoch);
                     next += 1;
                     let mut timers = Timers::new(EXEC_GRACE, EXEC_SETTLEMENT);
@@ -629,6 +678,15 @@ fn pump(client: &mut Client, commands: &Receiver<Command>, events: &impl Fn(Even
                     let answer = Start::decode(&start.encode())
                         .map_err(|e| e.problem().to_owned())
                         .and_then(|_| {
+                            if let Some(session) = session {
+                                let nl = char::from(10u8);
+                                client
+                                    .send(
+                                        &Message::ExecSession(format!("{}{nl}{session}", key.id()).into_bytes()),
+                                        Some(Instant::now() + SESSION_TIMEOUT),
+                                    )
+                                    .map_err(|e| e.to_string())?;
+                            }
                             // The limits go first: the guest keeps them for the start that follows.
                             if resources.any() {
                                 let nl = char::from(10u8);
@@ -677,9 +735,14 @@ fn pump(client: &mut Client, commands: &Receiver<Command>, events: &impl Fn(Even
                     let _ = reply.send(Ok(()));
                 }
             }
-            Ok(Message::MountFailed(body)) => {
+            Ok(Message::MountFailed(body)) | Ok(Message::SessionFailed(body)) => {
                 if let Some(reply) = mounting.pop_front() {
                     let _ = reply.send(Err(String::from_utf8_lossy(&body).into_owned()));
+                }
+            }
+            Ok(Message::SessionOk) => {
+                if let Some(reply) = mounting.pop_front() {
+                    let _ = reply.send(Ok(()));
                 }
             }
             Ok(Message::ExecOom(body)) => {

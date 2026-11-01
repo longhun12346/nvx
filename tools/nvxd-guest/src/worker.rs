@@ -432,6 +432,19 @@ pub trait EntryOperations {
     /// Spawns `command`, whose child enters the execution that `prepared` prepared. A fake that
     /// cannot enter a root spawns the command in its own root instead, as its own identity.
     fn spawn(&mut self, command: spawn::Command, prepared: Prepared) -> io::Result<Spawned>;
+
+    /// Fork extension: the command line, up to the `--` that precedes the program, of the helper
+    /// that runs a program inside the isolated session `session`, with the working directory
+    /// `directory` in the session's root. Fails with an `errno`.
+    fn session_enter(&mut self, _session: u64, _directory: &str) -> Result<Vec<String>, i32> {
+        Err(libc::ENOSYS)
+    }
+
+    /// Fork extension: notes that a program starts outside every session. Fails with an `errno`
+    /// once the VM has had sessions, as it must not run both kinds of program.
+    fn unscoped_exec(&mut self) -> Result<(), i32> {
+        Ok(())
+    }
 }
 
 /// The operations of a layered root that the worker runs: those of `nvx::guest::root` in a VM, in
@@ -486,6 +499,27 @@ pub trait RootOperations: EntryOperations {
     /// [`bind_live`](Self::bind_live) bound. Fails with the problem, as text.
     fn unbind_live(&mut self, _target: &str) -> Result<(), String> {
         Err("this root cannot unbind live mounts".to_owned())
+    }
+
+    /// Fork extension: creates the isolated session `id` whose workspace is `workspace`, a path
+    /// below the root, with the VM's own network if `share_network`.
+    fn session_open(&mut self, _id: u64, _workspace: &str, _share_network: bool) -> Result<(), String> {
+        Err("this root cannot hold isolated sessions".to_owned())
+    }
+
+    /// Fork extension: destroys the isolated session `id`.
+    fn session_close(&mut self, _id: u64) -> Result<(), String> {
+        Err("this root cannot hold isolated sessions".to_owned())
+    }
+
+    /// Fork extension: attaches the root path `source` to the session `id` at `target`.
+    fn session_bind(&mut self, _id: u64, _source: &str, _target: &str, _read_only: bool) -> Result<(), String> {
+        Err("this root cannot hold isolated sessions".to_owned())
+    }
+
+    /// Fork extension: detaches the session mount at `target`.
+    fn session_unbind(&mut self, _id: u64, _target: &str) -> Result<(), String> {
+        Err("this root cannot hold isolated sessions".to_owned())
     }
 
     /// Fork extension: binds the guest's runtime files, the time status of the guest's time daemon
@@ -1041,6 +1075,47 @@ fn serve_root<S: Read + Write + AsFd>(
         Message::MountRemove(body) if order.is_started() => {
             Step::Continue(vec![live_unmount(operations, &body)])
         }
+        // Fork extension: isolated sessions, created and changed after the start.
+        Message::SessionOpen(body) if order.is_started() => {
+            Step::Continue(vec![session_request(&body, |fields| {
+                let [id, network, workspace] = fields else {
+                    return Err("session open needs id, network and workspace".to_owned());
+                };
+                let id = id.parse().map_err(|_| "bad session id".to_owned())?;
+                operations.session_open(id, workspace, *network == "1")
+            })])
+        }
+        Message::SessionClose(body) if order.is_started() => {
+            Step::Continue(vec![session_request(&body, |fields| {
+                let [id] = fields else { return Err("session close needs an id".to_owned()) };
+                operations.session_close(id.parse().map_err(|_| "bad session id".to_owned())?)
+            })])
+        }
+        Message::SessionBind(body) if order.is_started() => {
+            Step::Continue(vec![session_request(&body, |fields| {
+                let [id, mode, source, target] = fields else {
+                    return Err("session bind needs id, mode, source and target".to_owned());
+                };
+                let read_only = match *mode {
+                    "ro" => true,
+                    "rw" => false,
+                    other => return Err(format!("unknown mode {other:?}")),
+                };
+                operations.session_bind(id.parse().map_err(|_| "bad session id".to_owned())?, source, target, read_only)
+            })])
+        }
+        Message::SessionUnbind(body) if order.is_started() => {
+            Step::Continue(vec![session_request(&body, |fields| {
+                let [id, target] = fields else {
+                    return Err("session unbind needs an id and a target".to_owned());
+                };
+                operations.session_unbind(id.parse().map_err(|_| "bad session id".to_owned())?, target)
+            })])
+        }
+        Message::ExecSession(body) if order.is_started() => {
+            executions.set_session(&body)?;
+            Step::Continue(Vec::new())
+        }
         // Fork extension: the limits of an execution come just before its start, without an answer.
         Message::ExecLimits(body) if order.is_started() => {
             executions.set_limits(&body)?;
@@ -1061,6 +1136,19 @@ fn serve_root<S: Read + Write + AsFd>(
         }
         message => return Err(ServeError::Unexpected(message.kind())),
     })
+}
+
+/// Fork extension: answers a session request whose newline separated fields `run` handles.
+fn session_request(body: &[u8], run: impl FnOnce(&[&str]) -> Result<(), String>) -> Message {
+    let failed = |problem: String| Message::SessionFailed(truncated(&problem, MAX_TEXT_BODY).as_bytes().to_vec());
+    let Ok(text) = std::str::from_utf8(body) else {
+        return failed("the session request is not UTF-8".to_owned());
+    };
+    let fields: Vec<&str> = text.split(char::from(10u8)).collect();
+    match run(&fields) {
+        Ok(()) => Message::SessionOk,
+        Err(problem) => failed(problem),
+    }
 }
 
 /// Fork extension: answers a [`Message::MountAdd`] whose body is `source\ntarget\nro|rw`.
@@ -1235,6 +1323,8 @@ pub struct LibraryRoot {
     /// The binds of the runtime files that [`RootOperations::bind_runtime`] made, which the
     /// teardown removes first.
     runtime_binds: Option<nvx::guest::entry::RuntimeBinds>,
+    /// Fork extension: the isolated sessions, destroyed before the root's teardown.
+    sessions: crate::session::Sessions,
 }
 
 /// A root that the worker assembled: a cold boot's, from its root configuration, or a clone's,
@@ -1283,6 +1373,14 @@ impl Assembled {
 }
 
 impl LibraryRoot {
+    /// The path of the assembled root.
+    fn root_path(&self) -> Result<PathBuf, String> {
+        self.root
+            .as_ref()
+            .map(|assembled| assembled.root().path().to_owned())
+            .ok_or_else(|| "the worker holds no root".to_owned())
+    }
+
     /// Returns the operations, with the process ID of PID 1's unrelated child, if any.
     pub fn new(sibling: Option<u32>) -> Self {
         Self {
@@ -1293,6 +1391,7 @@ impl LibraryRoot {
             root: None,
             live: Vec::new(),
             runtime_binds: None,
+            sessions: crate::session::Sessions::new(),
         }
     }
 }
@@ -1510,6 +1609,10 @@ impl RootOperations for LibraryRoot {
     }
 
     fn teardown(&mut self) -> Result<(), String> {
+        self.sessions.destroy_all();
+        if self.sessions.is_broken() {
+            return Err("session isolation failed: a session could not be torn down".to_owned());
+        }
         if let Some(binds) = self.runtime_binds.take() {
             // Best effort: a bind that is gone already is no failure of the teardown.
             let _ = binds.remove();
@@ -1524,6 +1627,24 @@ impl RootOperations for LibraryRoot {
             Some(root) => root.teardown(),
             None => Ok(()),
         }
+    }
+
+    fn session_open(&mut self, id: u64, workspace: &str, share_network: bool) -> Result<(), String> {
+        let root = self.root_path()?;
+        self.sessions.open(&root, id, workspace, share_network)
+    }
+
+    fn session_close(&mut self, id: u64) -> Result<(), String> {
+        self.sessions.close(id)
+    }
+
+    fn session_bind(&mut self, id: u64, source: &str, target: &str, read_only: bool) -> Result<(), String> {
+        let root = self.root_path()?;
+        self.sessions.bind(&root, id, source, target, read_only)
+    }
+
+    fn session_unbind(&mut self, id: u64, target: &str) -> Result<(), String> {
+        self.sessions.unbind(id, target)
     }
 
     /// Lends the pidfd of the announcer that a clone's application started, through
@@ -1587,6 +1708,18 @@ impl EntryOperations for LibraryRoot {
     /// Spawns `command`, whose child enters the execution with `Command::enter`.
     fn spawn(&mut self, command: spawn::Command, prepared: Prepared) -> io::Result<Spawned> {
         command.enter(prepared).spawn()
+    }
+
+    fn session_enter(&mut self, session: u64, directory: &str) -> Result<Vec<String>, i32> {
+        self.sessions.enter_arguments(session, directory)
+    }
+
+    fn unscoped_exec(&mut self) -> Result<(), i32> {
+        if self.sessions.ever_used() {
+            return Err(libc::EXDEV);
+        }
+        self.sessions.note_unscoped_exec();
+        Ok(())
     }
 }
 

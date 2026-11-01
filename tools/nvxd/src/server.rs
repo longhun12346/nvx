@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -115,6 +115,8 @@ struct SessionInfo {
     workspace_share: Option<plan::Share>,
     /// The mounts that are live for this session, as of its last applied snapshot.
     shares: Vec<plan::Share>,
+    /// In isolated mode, the ID of the session's guest-side keeper.
+    guest_session: Option<u64>,
 }
 
 /// An export that could not be taken back yet; retried in the maintenance pass.
@@ -179,6 +181,12 @@ pub struct Context {
     max_sessions: usize,
     max_running: usize,
     ingress_host_loopback: bool,
+    /// Whether sessions are isolated from each other inside the VM; fixed for the sidecar's life.
+    session_isolation: bool,
+    /// Identities of guest sessions, never reused within a sidecar.
+    guest_session_counter: Mutex<u64>,
+    /// Guest sessions whose close is in progress, for `diagnostics`.
+    closing_guest_sessions: AtomicUsize,
     /// Deployment limits of each execution (memory MiB, CPU percent, pids), 0 for none.
     exec_defaults: (u64, u64, u64),
     /// Ports `port.allocate` handed out lately, so concurrent callers do not get the same one.
@@ -202,6 +210,8 @@ pub struct Context {
 
 /// The settings of the control plane (the VM's own are in [`VmConfig`]).
 pub struct Settings {
+    /// Whether every session runs inside its own guest namespaces (`--session-isolation`).
+    pub session_isolation: bool,
     pub max_queue: usize,
     pub max_sessions: usize,
     pub max_running: usize,
@@ -231,6 +241,9 @@ impl Context {
             max_sessions: settings.max_sessions,
             max_running,
             ingress_host_loopback: settings.ingress_host_loopback,
+            session_isolation: settings.session_isolation,
+            guest_session_counter: Mutex::new(0),
+            closing_guest_sessions: AtomicUsize::new(0),
             exec_defaults: (settings.exec_memory_mb, settings.exec_cpu_percent, settings.exec_pids),
             allocated_ports: Mutex::new(std::collections::VecDeque::new()),
             capability,
@@ -367,7 +380,7 @@ impl Context {
         match text("op") {
             protocol::OP_PROBE => self.probe(head),
             protocol::OP_SESSION_OPEN => {
-                reject_unsupported_session_options(head)?;
+                validate_session_policy(head, self.session_isolation)?;
                 let memory = match head.get("memoryMiB") {
                     None => protocol::DEFAULT_MEMORY_MIB,
                     Some(value) => number(Some(value)).ok_or_else(|| {
@@ -434,7 +447,12 @@ impl Context {
     fn probe(&self, head: &Value) -> Result<Value, Failure> {
         let wait = number(head.get("waitMs")).map_or(PROBE_WAIT, Duration::from_millis);
         self.ensure_capable(Some(wait))?;
-        let generation = self.inner.lock().unwrap().registry.generation();
+        let (generation, vm_present) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.registry.generation(), inner.vm_present)
+        };
+        // Isolation is advertised by a VM that is up: only then is it known that the guest serves it.
+        let isolated = self.session_isolation && vm_present;
         Ok(json!({
             "backend": "nvx-whp",
             "provenance": self.provenance,
@@ -444,8 +462,8 @@ impl Context {
                 "parallelExec": self.max_running > 1,
                 "maxRunningPerVm": self.max_running,
                 "maxRunningPerSession": self.max_running,
-                "guestFeatures": 953,
-                "sessionIsolation": false,
+                "guestFeatures": if isolated { 953 | (1u64 << 10) } else { 953 },
+                "sessionIsolation": isolated,
             },
         }))
     }
@@ -502,7 +520,7 @@ impl Context {
             "maxRunningPerSession": inner.registry.max_running_per_session(),
             "queued": inner.registry.queued_len(),
             "cleanupPending": inner.removals.len(),
-            "closingGuestSessions": 0,
+            "closingGuestSessions": self.closing_guest_sessions.load(Ordering::Relaxed),
             "cleanupOldestMs": 0,
             "outbound": {
                 "frames": writer.frames(),
@@ -554,7 +572,13 @@ impl Context {
             if !inner.registry.open_session(name) {
                 return Err(fail(protocol::REASON_PROTOCOL, "session already open"));
             }
-            let prefix = safe_name(name);
+            // A reopened name is a new authorization instance in isolated mode: its paths are never
+            // those of an earlier one.
+            let prefix = if self.session_isolation {
+                format!("{}-s{}", safe_name(name), self.next_id())
+            } else {
+                safe_name(name)
+            };
             let mut workspace_guest = format!("/sessions/{prefix}/workspace");
             let mut suffix = 1;
             while inner.guest_targets.contains(&workspace_guest) {
@@ -571,23 +595,58 @@ impl Context {
                     workspace_guest,
                     workspace_share: None,
                     shares: Vec::new(),
+                    guest_session: None,
                 },
             );
         }
         if let Err(failure) = self.ensure_workspace_export(&vm, name) {
             return Err(failure);
         }
-        self.spawn_worker();
         let workspace_guest = {
             let inner = self.inner.lock().unwrap();
             inner.sessions.get(name).map(|info| info.workspace_guest.clone()).unwrap_or_default()
         };
+        if self.session_isolation {
+            let id = {
+                let mut counter = self.guest_session_counter.lock().unwrap();
+                *counter += 1;
+                *counter
+            };
+            if let Err(problem) = vm.vm.session_open(id, &workspace_guest, false) {
+                let lost = vm_is_gone(&problem);
+                self.rollback_open_session(&vm, name);
+                if lost {
+                    self.mark_vm_lost(vm.generation, problem.clone());
+                    return Err(fail(protocol::REASON_BACKEND_UNAVAILABLE, problem));
+                }
+                return Err(fail("E_SESSION_OPEN_FAILED", problem));
+            }
+            if let Some(info) = self.inner.lock().unwrap().sessions.get_mut(name) {
+                info.guest_session = Some(id);
+            }
+        }
+        self.spawn_worker();
         Ok(json!({
-            "workspaceGuestPath": workspace_guest,
+            "workspaceGuestPath": if self.session_isolation { "/workspace" } else { workspace_guest.as_str() },
             "runtimeId": vm.runtime_id,
             "vmGeneration": vm.generation,
             "sharedVm": true,
         }))
+    }
+
+    /// Takes back a session whose guest side could not be created: the registration and the
+    /// workspace export. An export that cannot be taken back costs the VM.
+    fn rollback_open_session(&self, vm: &Arc<VmEntry>, name: &str) {
+        let share = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.registry.close_session(name);
+            inner.sessions.remove(name).and_then(|info| info.workspace_share)
+        };
+        if let Some(share) = share {
+            if let Err((_, message)) = vm.vm.mount_remove(name, &share.mount.id, &share.child, &share.source_target) {
+                self.mark_vm_lost(vm.generation, format!("isolated session rollback failed: {message}"));
+            }
+        }
     }
 
     /// Exports the session's workspace and mounts it in the guest. A session that cannot reach its
@@ -614,7 +673,8 @@ impl Context {
                         mount: plan::Mount { id: "workspace".to_owned(), host_path: host, read_only: false, guest_path: None },
                         child,
                         source_target: target.clone(),
-                        target,
+                        // Inside an isolated session the workspace is simply /workspace.
+                        target: if self.session_isolation { "/workspace".to_owned() } else { target },
                     });
                 }
                 let _ = prefix;
@@ -637,13 +697,13 @@ impl Context {
 
     /// Applies a session's mount snapshot: removes what it no longer lists, adds what is new.
     fn apply_mounts(&self, vm: &Arc<VmEntry>, name: &str, desired: &[plan::Mount]) -> Result<(), Failure> {
-        let (prefix, mut shares) = {
+        let (prefix, mut shares, guest_session) = {
             let inner = self.inner.lock().unwrap();
             let info = inner
                 .sessions
                 .get(name)
                 .ok_or_else(|| fail(protocol::REASON_SESSION_UNKNOWN, format!("unknown session {name}")))?;
-            (info.prefix.clone(), info.shares.clone())
+            (info.prefix.clone(), info.shares.clone(), info.guest_session)
         };
         let mut outcome = Ok(());
         let steps = plan::plan(&shares, desired);
@@ -658,10 +718,30 @@ impl Context {
         for step in steps {
             match step {
                 plan::Step::Remove(share) => {
-                    match vm.vm.mount_remove(name, &share.mount.id, &share.child, &share.target) {
+                    if let Some(id) = guest_session {
+                        // The private attachment goes first, strictly: an unmount that cannot be
+                        // proven is an isolation fault and costs the VM.
+                        if let Err(problem) = vm.vm.session_unbind(id, &share.target) {
+                            self.mark_vm_lost(
+                                vm.generation,
+                                format!("isolated session unmount failed for {}: {problem}", share.target),
+                            );
+                            outcome = Err(fail("E_SESSION_UNMOUNT_FAILED", problem));
+                            break;
+                        }
+                    }
+                    match vm.vm.mount_remove(name, &share.mount.id, &share.child, &share.source_target) {
                         Ok(()) => self.stats.lock().unwrap().shares_removed += 1,
                         Err((_, message)) => {
                             self.stats.lock().unwrap().shares_remove_failed += 1;
+                            if guest_session.is_some() {
+                                self.mark_vm_lost(
+                                    vm.generation,
+                                    format!("isolated source export {} cleanup failed: {message}", share.child),
+                                );
+                                outcome = Err(fail("E_SESSION_UNMOUNT_FAILED", message));
+                                break;
+                            }
                             if vm_is_gone(&message) {
                                 outcome = Err(fail(protocol::REASON_BACKEND_UNAVAILABLE, message));
                                 break;
@@ -673,7 +753,7 @@ impl Context {
                                 session: name.to_owned(),
                                 mount_id: share.mount.id.clone(),
                                 child: share.child.clone(),
-                                target: share.target.clone(),
+                                target: share.source_target.clone(),
                                 generation: vm.generation,
                             });
                         }
@@ -681,21 +761,29 @@ impl Context {
                     shares.retain(|other| other.child != share.child);
                 }
                 plan::Step::Add(mount) => {
-                    let (child, target) = {
+                    let (child, target, source_target) = {
                         let mut inner = self.inner.lock().unwrap();
                         inner.next_child += 1;
                         let child = format!("{prefix}-m{}", inner.next_child);
                         let preferred = plan::guest_target_for(&mount);
-                        let target = if inner.guest_targets.contains(&preferred) {
-                            format!("/sessions/{prefix}/mounts/{}", mount.id)
+                        if guest_session.is_some() {
+                            // Isolated sessions own distinct mount namespaces: the same /workspace
+                            // path in two sessions is two different mounts. The agent keeps the
+                            // authorized source at a path of its own.
+                            let source = format!("/sessions/{prefix}/mounts/{child}");
+                            (child, preferred, source)
                         } else {
-                            preferred
-                        };
-                        inner.guest_targets.insert(target.clone());
-                        (child, target)
+                            let target = if inner.guest_targets.contains(&preferred) {
+                                format!("/sessions/{prefix}/mounts/{}", mount.id)
+                            } else {
+                                preferred
+                            };
+                            inner.guest_targets.insert(target.clone());
+                            (child, target.clone(), target)
+                        }
                     };
                     if let Err((code, message)) =
-                        vm.vm.mount_add(name, &mount.id, &child, &mount.host_path, &target, mount.read_only)
+                        vm.vm.mount_add(name, &mount.id, &child, &mount.host_path, &source_target, mount.read_only)
                     {
                         outcome = Err(if vm_is_gone(&message) {
                             fail(protocol::REASON_BACKEND_UNAVAILABLE, message)
@@ -705,7 +793,28 @@ impl Context {
                         break;
                     }
                     self.stats.lock().unwrap().shares_added += 1;
-                    shares.push(plan::Share { mount, child, source_target: target.clone(), target });
+                    if let Some(id) = guest_session {
+                        if let Err(problem) = vm.vm.session_bind(id, &source_target, &target, mount.read_only) {
+                            // The export exists before the private bind; if the bind fails, it must
+                            // not stay behind as an untracked child.
+                            match vm.vm.mount_remove(name, &mount.id, &child, &source_target) {
+                                Ok(()) => {
+                                    self.stats.lock().unwrap().shares_removed += 1;
+                                    eprintln!("nvxd: rolled back unbound export {child}");
+                                }
+                                Err((_, cleanup)) => {
+                                    self.mark_vm_lost(
+                                        vm.generation,
+                                        format!("isolated bind rollback for {child} failed: {cleanup}"),
+                                    );
+                                }
+                            }
+                            outcome = Err(fail("E_SESSION_MOUNT_FAILED", problem));
+                            break;
+                        }
+                    }
+                    self.stats.lock().unwrap().shares_added += 1;
+                    shares.push(plan::Share { mount, child, source_target, target });
                 }
             }
         }
@@ -967,9 +1076,12 @@ impl Context {
         let (finished_tx, finished) = mpsc::channel::<ExitOutcome>();
         self.inner.lock().unwrap().waiters.insert(id.to_owned(), finished_tx);
         vm.touch();
-        let (arguments, environment) = guest_command(spec.argv, spec.env);
+        let guest_session = self.inner.lock().unwrap().sessions.get(&session).and_then(|info| info.guest_session);
+        let (arguments, environment) = guest_command(spec.argv, spec.env, guest_session.is_some());
         let cwd = self.guest_cwd(&session, spec.cwd.as_deref()).map(String::into_bytes);
-        if let Err(message) = vm.vm.exec(id.to_owned(), arguments, cwd, environment, spec.timeout, spec.resources) {
+        if let Err(message) =
+            vm.vm.exec(id.to_owned(), arguments, cwd, environment, spec.timeout, spec.resources, guest_session)
+        {
             self.inner.lock().unwrap().waiters.remove(id);
             self.finish_and_emit(id, Terminal::new("failed", None, message.clone()));
             if vm_is_gone(&message) {
@@ -1008,7 +1120,7 @@ impl Context {
                 return Some(cwd.to_owned());
             }
         }
-        Some(info.workspace_guest.clone())
+        Some(if info.guest_session.is_some() { "/workspace".to_owned() } else { info.workspace_guest.clone() })
     }
 
     /// Marks an execution terminal and emits exactly one exit event for it.
@@ -1334,18 +1446,42 @@ impl Context {
             }
         }
         if let (Some(info), Some(vm)) = (removed, self.vm_now()) {
+            let guest_session = info.guest_session;
+            if let Some(id) = guest_session {
+                // A session that is still working past the deadline keeps its namespaces: the
+                // caller is told, rather than a keeper being killed under a running command.
+                if cleanup_pending {
+                    return Err(fail("E_SESSION_CLOSE_FAILED", "isolated session cleanup timed out"));
+                }
+                // The namespace is destroyed before its exports are taken back.
+                self.closing_guest_sessions.fetch_add(1, Ordering::Relaxed);
+                let closed = vm.vm.session_close(id);
+                self.closing_guest_sessions.fetch_sub(1, Ordering::Relaxed);
+                if let Err(problem) = closed {
+                    self.mark_vm_lost(vm.generation, format!("isolated session {name} close failed: {problem}"));
+                    return Err(fail("E_SESSION_CLOSE_FAILED", problem));
+                }
+            }
             let mut leftovers = info.shares;
             leftovers.extend(info.workspace_share);
             for share in leftovers {
                 let gone = !cleanup_pending
-                    && vm.vm.mount_remove(name, &share.mount.id, &share.child, &share.target).is_ok();
+                    && vm.vm.mount_remove(name, &share.mount.id, &share.child, &share.source_target).is_ok();
                 if !gone {
                     cleanup_pending = true;
+                    if guest_session.is_some() {
+                        // An export that cannot be taken back in an isolated session is a fault of
+                        // the whole group: its source must not stay reachable.
+                        self.mark_vm_lost(
+                            vm.generation,
+                            format!("isolated export cleanup failed for {}", share.child),
+                        );
+                    }
                     self.inner.lock().unwrap().removals.push(Removal {
                         session: name.to_owned(),
                         mount_id: share.mount.id.clone(),
                         child: share.child.clone(),
-                        target: share.target.clone(),
+                        target: share.source_target.clone(),
                         generation: vm.generation,
                     });
                 }
@@ -1497,9 +1633,10 @@ impl Context {
 
 /// A request cannot change the mode selected for this sidecar's VM lifecycle. Validated before any
 /// VM boot so a refused policy has no effects. This build serves the shared, non-isolated mode:
-/// session isolation and a network policy are refused the way a sidecar started without them
-/// refuses them.
-fn reject_unsupported_session_options(head: &Value) -> Result<(), Failure> {
+/// Refuses, before any VM boot, a session policy that does not match how this sidecar was started:
+/// the isolation mode is a startup property, the network is the VM's (none, here), and the kernel is
+/// shared.
+fn validate_session_policy(head: &Value, isolated: bool) -> Result<(), Failure> {
     // The C++ side writes scalar JSON values as strings.
     let boolean = |value: &Value| match value {
         Value::Bool(value) => Some(*value),
@@ -1508,18 +1645,22 @@ fn reject_unsupported_session_options(head: &Value) -> Result<(), Failure> {
         _ => None,
     };
     if let Some(mode) = head.get("sessionIsolation") {
-        if boolean(mode) != Some(false) {
+        if boolean(mode) != Some(isolated) {
             return Err(fail(
                 "E_SESSION_MODE_MISMATCH",
                 "sessionIsolation must match the startup mode; drain and recreate the backend to migrate",
             ));
         }
     }
-    if head.get("networkPolicy").is_some() {
-        return Err(fail(
-            "E_SESSION_NETWORK_UNSUPPORTED",
-            "isolated sessions here support only networkPolicy=deny",
-        ));
+    if let Some(network) = head.get("networkPolicy") {
+        // The network is a property of the VM, not of one session, and this VM has none: an isolated
+        // session has its own empty namespace. Asking for another policy is refused, not granted.
+        if !isolated || network.as_str() != Some("deny") {
+            return Err(fail(
+                "E_SESSION_NETWORK_UNSUPPORTED",
+                "isolated sessions here support only networkPolicy=deny",
+            ));
+        }
     }
     if let Some(independent) = head.get("independentKernel") {
         if boolean(independent) != Some(false) {
@@ -1540,7 +1681,7 @@ fn vm_is_gone(message: &str) -> bool {
 /// The guest takes the program as an absolute path and exactly the environment it is given: a bare
 /// program name is resolved by the guest shell, which keeps `argv` exact, and PATH and HOME get
 /// defaults the caller did not name.
-fn guest_command(argv: Vec<String>, env: Vec<(String, String)>) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+fn guest_command(argv: Vec<String>, env: Vec<(String, String)>, isolated: bool) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let mut arguments: Vec<Vec<u8>> = Vec::new();
     if !argv.first().is_some_and(|program| program.starts_with('/')) {
         arguments.extend(["/bin/sh", "-c", "exec \"$@\"", "sh"].map(|part| part.as_bytes().to_vec()));
@@ -1551,7 +1692,8 @@ fn guest_command(argv: Vec<String>, env: Vec<(String, String)>) -> (Vec<Vec<u8>>
     if !env.iter().any(|(name, _)| name == "PATH") {
         environment.push(b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_vec());
     }
-    if !env.iter().any(|(name, _)| name == "HOME") {
+    // An isolated session's helper gives its programs their own home.
+    if !isolated && !env.iter().any(|(name, _)| name == "HOME") {
         environment.push(b"HOME=/tmp".to_vec());
     }
     (arguments, environment)

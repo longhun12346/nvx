@@ -23,7 +23,7 @@ default = []
 host = ["nvx/host", "dep:serde_json"]
 # The guest agent: the guest API of `nvx` and the `runtime-adapter-guest` binary, which builds as a
 # static `x86_64-unknown-linux-musl` executable.
-guest = ["nvx/guest", "dep:nix"]
+guest = ["nvx/guest", "dep:nix", "dep:libc"]
 
 [dependencies]
 nvx = { path = "../../nvx-rs", default-features = false }
@@ -38,6 +38,7 @@ serde_json = { version = "1.0.120", optional = true }
 # its executions, which open raw sockets: system calls that `nvx` leaves to the caller. The guest
 # side of `nvx` depends on the same release, with these features among its own.
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
 nix = { version = "0.31.3", default-features = false, features = [
     "fs",
     "mount",
@@ -62,6 +63,7 @@ test = false
 
 [lints.rust]
 missing_docs = "warn"
-# The adapter reaches `nvx` through its public API alone.
-unsafe_code = "forbid"
+# The adapter reaches `nvx` through its public API alone; the session isolation module, which calls
+# system calls that `nvx` does not offer, is the one place that allows `unsafe`.
+unsafe_code = "deny"
 unreachable_pub = "warn"

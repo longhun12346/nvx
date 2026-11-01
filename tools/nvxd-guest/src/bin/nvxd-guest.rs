@@ -53,6 +53,18 @@ fn main() -> ExitCode {
     use std::path::Path;
 
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    // The helpers of the session isolation are this binary started again with a hidden command.
+    if let Some(command) = arguments.first().and_then(|command| command.to_str()) {
+        if command.starts_with("__session-") {
+            let rest = arguments[1..]
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if let Some(status) = runtime_adapter::session::run_helper(command, &rest) {
+                return ExitCode::from(u8::try_from(status).unwrap_or(1));
+            }
+        }
+    }
     match arguments.as_slice() {
         [] => {
             println!("nvxd-guest: {}", runtime_adapter::contract());

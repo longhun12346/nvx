@@ -80,6 +80,8 @@ pub mod initramfs;
 pub mod layered;
 pub mod probe;
 pub mod root;
+#[cfg(all(feature = "guest", target_os = "linux"))]
+pub mod session;
 #[cfg(feature = "host")]
 pub mod runtime;
 #[cfg(feature = "host")]

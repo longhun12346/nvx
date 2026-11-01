@@ -143,6 +143,31 @@ pub enum Message {
     /// the kernel's out-of-memory killer ended, as UTF-8 `id\noom|vmOom`: `oom` when the execution's
     /// own memory limit was reached, `vmOom` when the guest as a whole ran out of memory.
     ExecOom(Vec<u8>),
+    /// Fork extension (session isolation): creates the isolated session `id`, as UTF-8
+    /// `id\nnetwork\nworkspace`, where `network` is `0` for a private network namespace or `1` for
+    /// the VM's own, and `workspace` the absolute path `/sessions/<name>/workspace` of an already
+    /// mounted workspace in the root. Answered with [`Message::SessionOk`] or
+    /// [`Message::SessionFailed`].
+    SessionOpen(Vec<u8>),
+    /// Fork extension: destroys the isolated session whose decimal ID is the body, after its
+    /// executions ended. Answered like [`Message::SessionOpen`].
+    SessionClose(Vec<u8>),
+    /// Fork extension: attaches a mount to a session, as UTF-8 `id\nro|rw\nsource\ntarget`, where
+    /// `source` is the root path `/sessions/<name>/mounts/<child>` of an authorized mount and
+    /// `target` the session path `/workspace/mounts/<leaf>`. Answered like
+    /// [`Message::SessionOpen`].
+    SessionBind(Vec<u8>),
+    /// Fork extension: strictly detaches a session mount, as UTF-8 `id\ntarget`. Answered like
+    /// [`Message::SessionOpen`].
+    SessionUnbind(Vec<u8>),
+    /// Fork extension: the guest's answer to a session request that succeeded.
+    SessionOk,
+    /// Fork extension: the guest's answer to a session request that failed, with the problem as
+    /// UTF-8 text.
+    SessionFailed(Vec<u8>),
+    /// Fork extension: sent before an execution's start, `execution id\nsession id`: the execution
+    /// runs inside that isolated session.
+    ExecSession(Vec<u8>),
 }
 
 impl Message {
@@ -210,6 +235,13 @@ impl Message {
             Self::MountFailed(body) => (Kind::MountFailed, body),
             Self::ExecLimits(body) => (Kind::ExecLimits, body),
             Self::ExecOom(body) => (Kind::ExecOom, body),
+            Self::SessionOpen(body) => (Kind::SessionOpen, body),
+            Self::SessionClose(body) => (Kind::SessionClose, body),
+            Self::SessionBind(body) => (Kind::SessionBind, body),
+            Self::SessionUnbind(body) => (Kind::SessionUnbind, body),
+            Self::SessionOk => (Kind::SessionOk, &[]),
+            Self::SessionFailed(body) => (Kind::SessionFailed, body),
+            Self::ExecSession(body) => (Kind::ExecSession, body),
         }
     }
 }
@@ -281,6 +313,20 @@ const KIND_MOUNT_FAILED: u8 = 103;
 const KIND_EXEC_LIMITS: u8 = 104;
 /// Kind of a [`Message::ExecOom`].
 const KIND_EXEC_OOM: u8 = 105;
+/// Kind of a [`Message::SessionOpen`].
+const KIND_SESSION_OPEN: u8 = 106;
+/// Kind of a [`Message::SessionClose`].
+const KIND_SESSION_CLOSE: u8 = 107;
+/// Kind of a [`Message::SessionBind`].
+const KIND_SESSION_BIND: u8 = 108;
+/// Kind of a [`Message::SessionUnbind`].
+const KIND_SESSION_UNBIND: u8 = 109;
+/// Kind of a [`Message::SessionOk`].
+const KIND_SESSION_OK: u8 = 110;
+/// Kind of a [`Message::SessionFailed`].
+const KIND_SESSION_FAILED: u8 = 111;
+/// Kind of a [`Message::ExecSession`].
+const KIND_EXEC_SESSION: u8 = 112;
 
 /// Kind of a [`Message`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -352,6 +398,20 @@ enum Kind {
     ExecLimits = KIND_EXEC_LIMITS,
     /// [`Message::ExecOom`].
     ExecOom = KIND_EXEC_OOM,
+    /// [`Message::SessionOpen`].
+    SessionOpen = KIND_SESSION_OPEN,
+    /// [`Message::SessionClose`].
+    SessionClose = KIND_SESSION_CLOSE,
+    /// [`Message::SessionBind`].
+    SessionBind = KIND_SESSION_BIND,
+    /// [`Message::SessionUnbind`].
+    SessionUnbind = KIND_SESSION_UNBIND,
+    /// [`Message::SessionOk`].
+    SessionOk = KIND_SESSION_OK,
+    /// [`Message::SessionFailed`].
+    SessionFailed = KIND_SESSION_FAILED,
+    /// [`Message::ExecSession`].
+    ExecSession = KIND_EXEC_SESSION,
 }
 
 impl Kind {
@@ -391,6 +451,13 @@ impl Kind {
             KIND_MOUNT_FAILED => Some(Self::MountFailed),
             KIND_EXEC_LIMITS => Some(Self::ExecLimits),
             KIND_EXEC_OOM => Some(Self::ExecOom),
+            KIND_SESSION_OPEN => Some(Self::SessionOpen),
+            KIND_SESSION_CLOSE => Some(Self::SessionClose),
+            KIND_SESSION_BIND => Some(Self::SessionBind),
+            KIND_SESSION_UNBIND => Some(Self::SessionUnbind),
+            KIND_SESSION_OK => Some(Self::SessionOk),
+            KIND_SESSION_FAILED => Some(Self::SessionFailed),
+            KIND_EXEC_SESSION => Some(Self::ExecSession),
             _ => None,
         }
     }
@@ -419,7 +486,13 @@ impl Kind {
             | Self::MountRemove
             | Self::MountFailed
             | Self::ExecLimits
-            | Self::ExecOom => MAX_TEXT_BODY,
+            | Self::ExecOom
+            | Self::SessionOpen
+            | Self::SessionClose
+            | Self::SessionBind
+            | Self::SessionUnbind
+            | Self::SessionFailed
+            | Self::ExecSession => MAX_TEXT_BODY,
             Self::ExecInputEnd
             | Self::ExecCancel
             | Self::ExecCredit
@@ -434,6 +507,7 @@ impl Kind {
             | Self::Stopped
             | Self::Mapped
             | Self::Mounted
+            | Self::SessionOk
             | Self::Start
             | Self::Started => 0,
         }
@@ -476,6 +550,13 @@ impl Kind {
             Self::MountFailed => Message::MountFailed(body),
             Self::ExecLimits => Message::ExecLimits(body),
             Self::ExecOom => Message::ExecOom(body),
+            Self::SessionOpen => Message::SessionOpen(body),
+            Self::SessionClose => Message::SessionClose(body),
+            Self::SessionBind => Message::SessionBind(body),
+            Self::SessionUnbind => Message::SessionUnbind(body),
+            Self::SessionOk => Message::SessionOk,
+            Self::SessionFailed => Message::SessionFailed(body),
+            Self::ExecSession => Message::ExecSession(body),
         }
     }
 }

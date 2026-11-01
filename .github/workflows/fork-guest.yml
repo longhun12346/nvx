@@ -63,6 +63,14 @@ jobs:
           mkfs.erofs --version || true
           python3 --version
 
+      # build-initramfs compiles the guest programs of nvx-rs for the static musl target.
+      - name: Install the pinned Rust release with the musl target
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\([^"]*\)".*//p' rust-toolchain.toml)
+          test -n "${channel}"
+          rustup toolchain install "${channel}" --profile minimal --target x86_64-unknown-linux-musl
+
       - name: Build the Ubuntu initramfs and distro layer
         run: |
           set -euo pipefail

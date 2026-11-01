@@ -703,13 +703,23 @@ def main():
                 raise RuntimeError(f"diagnostics did not show the expected sessions: {a_idle}")
             if a_idle.get("sessionCount") != 3:
                 raise RuntimeError(f"the session count disagrees with the list: {a_idle}")
-            busy_b = [
-                entry for entry in a_idle["sessions"] if entry.get("session") == "B"
-            ]
-            if not busy_b or not busy_b[0].get("busy"):
-                raise RuntimeError(
-                    f"the session running a command is not visible as busy: {a_idle['sessions']}"
-                )
+            # B2 is accepted as queued and the dispatcher starts it a moment later; it sleeps for
+            # 3 s, so wait up to 2 s for it to show as running instead of sampling once.
+            busy_until = time.monotonic() + 2.0
+            polls = 0
+            while True:
+                busy_b = [
+                    entry for entry in a_idle["sessions"] if entry.get("session") == "B"
+                ]
+                if busy_b and busy_b[0].get("busy"):
+                    break
+                if time.monotonic() > busy_until:
+                    raise RuntimeError(
+                        f"the session running a command is not visible as busy: {a_idle['sessions']}"
+                    )
+                time.sleep(0.05)
+                polls += 1
+                a_idle = sidecar.ok({"id": 1000 + polls, "op": "diagnostics"}, deadline)
             a_busy = sidecar.ok(
                 {
                     "id": 42,

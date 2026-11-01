@@ -29,6 +29,18 @@ and from the P8 suites that prove it. Each guarantee names the test that shows i
   broken and the host retires the VM.
 - Closing a session kills the keeper (PID 1 of its namespace takes every process with it) and waits for
   the kernel teardown. A keeper that does not go away is an isolation fault: the agent is marked broken.
+- The agent polls its keepers while sessions exist (50 ms). A keeper that ended on its own leaves the
+  isolation unproven: the worker ends, the VM goes down, and the host fails every session of that VM.
+- Exports below `/sessions/` are unmounted strictly (EBUSY retried for 1 s), so a handle another process
+  still holds fails the removal instead of being hidden by a lazy unmount. An isolated close whose export
+  cannot be taken back fails with `E_SESSION_CLOSE_FAILED` and retires the VM.
+
+## Diagnostic agent
+
+`cargo build --release --features guest,fault-observer --target x86_64-unknown-linux-musl --bin nvxd-guest`
+builds an agent whose first session starts `__p8-observer`, a root process outside every workload
+namespace and cgroup. It injects a fault when a workspace holds a `p8-fire` file naming it. The cleanup
+suite passes it as `--diagnostic-agent`; the product agent is built without the feature.
 
 ## Guarantees and the tests that prove them
 

@@ -1092,11 +1092,8 @@ fn serve_root<S: Read + Write + AsFd>(
         // Fork extension: isolated sessions, created and changed after the start.
         Message::SessionOpen(body) if order.is_started() => {
             Step::Continue(vec![session_request(&body, |fields| {
-                let [id, network, workspace] = fields else {
-                    return Err("session open needs id, network and workspace".to_owned());
-                };
-                let id = id.parse().map_err(|_| "bad session id".to_owned())?;
-                operations.session_open(id, workspace, *network == "1")
+                let (id, share_network, workspace) = crate::session::decode_open(fields)?;
+                operations.session_open(id, workspace, share_network)
             })])
         }
         Message::SessionClose(body) if order.is_started() => {

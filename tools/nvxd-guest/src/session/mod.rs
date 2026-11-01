@@ -62,6 +62,22 @@ pub struct Session {
     directory: String,
 }
 
+/// The fields of a session open request, `id`, `network` (`0` private, `1` the VM's own) and the
+/// agent-visible `workspace`, as the host sends them. Any other network value is refused: a policy
+/// the agent does not know is never granted as a default.
+pub fn decode_open<'a>(fields: &[&'a str]) -> Result<(u64, bool, &'a str), String> {
+    let [id, network, workspace] = fields else {
+        return Err("session open needs id, network and workspace".to_owned());
+    };
+    let id = id.parse().map_err(|_| "bad session id".to_owned())?;
+    let share_network = match *network {
+        "0" => false,
+        "1" => true,
+        other => return Err(errno_text(libc::EINVAL, &format!("unknown network policy {other:?}"))),
+    };
+    Ok((id, share_network, workspace))
+}
+
 /// The sessions of one VM.
 #[derive(Default)]
 pub struct Sessions {
@@ -91,6 +107,11 @@ impl Sessions {
     /// Whether any session was ever created in this VM.
     pub fn ever_used(&self) -> bool {
         self.highest != 0
+    }
+
+    /// The process ID of session `id`'s keeper in the agent's PID namespace, for diagnostics.
+    pub fn keeper_pid(&self, id: u64) -> Option<i32> {
+        self.table.get(&id).map(|session| session.keeper)
     }
 
     /// Whether any session is resident.

@@ -56,6 +56,9 @@ fn step<T>(name: &str, result: std::io::Result<T>) -> std::io::Result<T> {
 }
 
 fn run(keeper: i32, uid: u32, share_network: bool, directory: &str, program: &[String]) -> std::io::Result<i32> {
+    // Nothing the caller left open reaches the program: the agent's own descriptors stay out of the
+    // session. This is before the chroot, while this process still sees its own /proc.
+    sys::close_other_descriptors(&[0, 1, 2]);
     let joined = step("open session", open_session(keeper, share_network))?;
     for (fd, flag) in &joined.namespaces {
         step(&format!("setns {flag:#x}"), sys::setns(fd, *flag))?;

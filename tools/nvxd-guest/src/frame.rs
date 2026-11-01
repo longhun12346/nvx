@@ -905,7 +905,7 @@ mod tests {
     #[test]
     fn each_kind_decodes_from_its_code_alone() {
         for code in 0..=u8::MAX {
-            let defined = ((1..=27).contains(&code) || (100..=103).contains(&code)).then_some(code);
+            let defined = ((1..=27).contains(&code) || (100..=112).contains(&code)).then_some(code);
             assert_eq!(Kind::from_code(code).map(Kind::code), defined, "{code}");
         }
     }

@@ -11,10 +11,18 @@
 > generation guard, `diagnostics`, `shutdown`. Output the caller is not ready to read is held back
 > (counted as `outbound.deferred`) and delivered later; it is never dropped.
 >
+> Workspace mounts work: the VM boots with an empty anchor directory exported through the aggregate
+> virtio-fs device, so that the export channel exists. Each session's workspace, and the mounts of
+> its `exec` requests (the whole set with every start; no `mounts` key is the empty set), are then
+> exported while the VM runs, through the fork's `--microvm-virtiofs-control` pipe (`live.rs`), and
+> bound at their guest paths by the guest agent, which takes the fork's mount messages (kinds 100 to
+> 103 of the adapter's framing) after the start. Revoking a mount unmounts it in the guest first and
+> then stops the export; an export that cannot be taken back is retried (`cleanupPending`).
+>
 > Still answering `E_NVX_NOT_YET_SUPPORTED` (their previous implementation is in `reference/`):
-> workspace mounts, per-execution limits and OOM attribution, session isolation, the network
-> policy (the arguments are accepted and ignored with a message). The guest agent does not start
-> NVX's time daemon yet, so the guest clock is not synchronized.
+> per-execution limits and OOM attribution, session isolation, the network policy (the arguments are
+> accepted and ignored with a message). The guest agent does not start NVX's time daemon yet, so
+> the guest clock is not synchronized.
 >
 > Build: `cargo build --release` here; the guest agent is built from `tests/runtime-adapter`
 > (`--features guest --target x86_64-unknown-linux-musl --bin runtime-adapter-guest`, linker

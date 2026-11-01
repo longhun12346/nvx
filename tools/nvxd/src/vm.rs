@@ -9,7 +9,8 @@
 //! `HostExecution` keeps the output it forwarded until the execution ends (at most 16 MiB per
 //! execution), so a streaming sink of our own is still to be written.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
@@ -32,7 +33,10 @@ use runtime_adapter::host::{self as adapter_host, Client, ClientError};
 use runtime_adapter::initramfs;
 use runtime_adapter::layered::{LaunchRecord, LayeredLaunch};
 use runtime_adapter::runtime::Runtime;
+use runtime_adapter::sharing::{HostFsSharing, Share};
 use runtime_adapter::staged::Staged;
+
+use crate::live;
 
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -66,6 +70,14 @@ pub struct VmConfig {
     /// Passed to OpenVMM as `--cpu-profile`.
     pub cpu_profile: String,
     pub guest_build: String,
+    /// An empty directory the aggregate virtio-fs device is created with: OpenVMM makes the device,
+    /// and with it the export channel, only for at least one export. Sessions' workspaces and
+    /// mounts are exported through the channel later.
+    pub anchor: PathBuf,
+    /// The VM's generation, which every export request names.
+    pub generation: u64,
+    /// The pipe name `Vm::launch` chooses for the export channel.
+    pub control_pipe: String,
 }
 
 /// A request for the serving thread.
@@ -78,6 +90,10 @@ pub enum Command {
         timeout: Option<Duration>,
         reply: Sender<Result<(), String>>,
     },
+    /// Binds a child of the host export at a target in the guest root.
+    Mount { source: String, target: String, read_only: bool, reply: Sender<Result<(), String>> },
+    /// Unmounts a target that a `Mount` bound.
+    Unmount { target: String, reply: Sender<Result<(), String>> },
     /// Cancels an execution by the name it was started with.
     Cancel { id: String },
     /// Ends the VM.
@@ -115,6 +131,7 @@ pub struct Vm {
     commands: Sender<Command>,
     thread: std::sync::Mutex<Option<JoinHandle<()>>>,
     process: VmProcess,
+    control: Arc<live::Channel>,
 }
 
 impl Vm {
@@ -124,6 +141,16 @@ impl Vm {
         config: VmConfig,
         events: impl Fn(Event) -> bool + Send + 'static,
     ) -> Result<Vm, (String, String)> {
+        let mut config = config;
+        let nonce = {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+            nanos ^ (u64::from(std::process::id()) << 40) ^ config.generation.rotate_left(17)
+        };
+        let pipe = live::pipe_name(nonce);
+        config.control_pipe = pipe.clone();
+        let control = Arc::new(live::Channel::new(pipe, config.generation));
         let (commands, receiver) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<VmProcess, (String, String)>>();
         let thread = std::thread::Builder::new()
@@ -135,6 +162,7 @@ impl Vm {
                 commands,
                 thread: std::sync::Mutex::new(Some(thread)),
                 process,
+                control,
             }),
             Ok(Err(failure)) => {
                 let _ = thread.join();
@@ -170,6 +198,68 @@ impl Vm {
         answer
             .recv_timeout(SESSION_TIMEOUT)
             .map_err(|_| "the VM did not answer".to_owned())?
+    }
+
+    /// Exports the host directory `host` as the aggregate child `child` and binds it at `target` in
+    /// the guest root. On a failure of the guest's bind the export is taken back. The failure is a
+    /// code and a message.
+    pub fn mount_add(
+        &self,
+        session: &str,
+        mount: &str,
+        child: &str,
+        host: &str,
+        target: &str,
+        read_only: bool,
+    ) -> Result<(), (String, String)> {
+        self.control.add(session, mount, child, host, read_only).map_err(|reason| {
+            let limit = reason.contains("mapping-limit") || reason.contains("256 children");
+            let code = if limit { "E_WORKSPACE_MOUNT_LIMIT" } else { "E_WORKSPACE_MOUNT_FAILED" };
+            (code.to_owned(), reason)
+        })?;
+        let (reply, answer) = mpsc::channel();
+        let sent = self.commands.send(Command::Mount {
+            source: child.to_owned(),
+            target: target.to_owned(),
+            read_only,
+            reply,
+        });
+        let bound = match sent {
+            Ok(()) => answer.recv_timeout(SESSION_TIMEOUT).unwrap_or_else(|_| Err("the VM did not answer".to_owned())),
+            Err(_) => Err("the VM is gone".to_owned()),
+        };
+        if let Err(problem) = bound {
+            // The export exists before the guest's bind; a bind that failed must not leave a child.
+            let _ = self.control.remove(session, mount, child);
+            return Err(("E_WORKSPACE_MOUNT_FAILED".to_owned(), problem));
+        }
+        Ok(())
+    }
+
+    /// Unmounts `target` in the guest, then stops exporting `child`. A target the guest has
+    /// unmounted already counts as unmounted, so that a retry after a failed second step succeeds.
+    pub fn mount_remove(
+        &self,
+        session: &str,
+        mount: &str,
+        child: &str,
+        target: &str,
+    ) -> Result<(), (String, String)> {
+        let (reply, answer) = mpsc::channel();
+        let sent = self.commands.send(Command::Unmount { target: target.to_owned(), reply });
+        let unbound = match sent {
+            Ok(()) => answer.recv_timeout(SESSION_TIMEOUT).unwrap_or_else(|_| Err("the VM did not answer".to_owned())),
+            Err(_) => Err("the VM is gone".to_owned()),
+        };
+        if let Err(problem) = unbound {
+            // umount2 reports EINVAL for a path that is no mount point any more.
+            if !problem.contains("Invalid argument") && !problem.contains("EINVAL") {
+                return Err(("E_WORKSPACE_MOUNT_FAILED".to_owned(), problem));
+            }
+        }
+        self.control
+            .remove(session, mount, child)
+            .map_err(|reason| ("E_WORKSPACE_MOUNT_FAILED".to_owned(), reason))
     }
 
     /// The VMM process of this VM.
@@ -236,6 +326,14 @@ fn launch_and_serve(
         .map_err(|e| classify(&e))?;
     // The identity of every execution is the sandbox's: the start names none.
     layered.config.workload_identity = Some(nvx::host::sandbox::DEFAULT_WORKLOAD_IDENTITY);
+    let mut sharing = HostFsSharing::default();
+    std::fs::create_dir_all(&config.anchor)
+        .map_err(|e| failure("E_BACKEND_START", format!("cannot create {}: {e}", config.anchor.display())))?;
+    sharing.add_root(&config.anchor);
+    sharing.add_share(Share::new(&config.anchor, "/mnt/anchor", false));
+    if let Some(export) = sharing.plan().map_err(|e| classify(&e))? {
+        layered.share(export).map_err(|e| classify(&e))?;
+    }
     layered.check_command_line().map_err(|e| classify(&e))?;
     if let Some(parent) = config.store.parent() {
         std::fs::create_dir_all(parent)
@@ -267,6 +365,8 @@ fn launch_and_serve(
         let mut arguments = layered.openvmm_arguments(held, &spec.vmm_launch(endpoint, &outcome))?;
         arguments.push("--cpu-profile".into());
         arguments.push(config.cpu_profile.clone().into());
+        arguments.push("--microvm-virtiofs-control".into());
+        arguments.push(live::spec(&config.control_pipe).into());
         let record = LaunchRecord {
             kernel_command_line: held.kernel_command_line(),
             layered: Some(&layered),
@@ -441,11 +541,31 @@ fn pump(client: &mut Client, commands: &Receiver<Command>, events: &impl Fn(Even
     let base = u64::from_le_bytes(base.try_into().expect("an instance ID has 16 bytes"));
     let mut next = 1u64;
     let mut running: BTreeMap<u64, Running> = BTreeMap::new();
+    let mut mounting: VecDeque<Sender<Result<(), String>>> = VecDeque::new();
     loop {
         // New commands first.
         loop {
             match commands.try_recv() {
                 Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return,
+                Ok(Command::Mount { source, target, read_only, reply }) => {
+                    let nl = char::from(10u8);
+                    let mode = if read_only { "ro" } else { "rw" };
+                    let body = format!("{source}{nl}{target}{nl}{mode}").into_bytes();
+                    match client.send(&Message::MountAdd(body), Some(Instant::now() + SESSION_TIMEOUT)) {
+                        Ok(()) => mounting.push_back(reply),
+                        Err(error) => {
+                            let _ = reply.send(Err(error.to_string()));
+                        }
+                    }
+                }
+                Ok(Command::Unmount { target, reply }) => {
+                    match client.send(&Message::MountRemove(target.into_bytes()), Some(Instant::now() + SESSION_TIMEOUT)) {
+                        Ok(()) => mounting.push_back(reply),
+                        Err(error) => {
+                            let _ = reply.send(Err(error.to_string()));
+                        }
+                    }
+                }
                 Ok(Command::Cancel { id }) => {
                     let now = Instant::now();
                     for entry in running.values_mut().filter(|entry| entry.name == id) {
@@ -498,6 +618,16 @@ fn pump(client: &mut Client, commands: &Receiver<Command>, events: &impl Fn(Even
             .filter_map(|entry| entry.peer.deadline())
             .fold(now + WAKE, Instant::min);
         match client.receive(Some(wake)) {
+            Ok(Message::Mounted) => {
+                if let Some(reply) = mounting.pop_front() {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+            Ok(Message::MountFailed(body)) => {
+                if let Some(reply) = mounting.pop_front() {
+                    let _ = reply.send(Err(String::from_utf8_lossy(&body).into_owned()));
+                }
+            }
             Ok(message) => {
                 if let Some(Ok(decoded)) = GuestMessage::decode(&message) {
                     if let Some(entry) = running.get_mut(&decoded.key().id()) {

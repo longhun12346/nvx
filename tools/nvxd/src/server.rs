@@ -16,7 +16,7 @@
 //! agent. TODO (next steps of the migration): per-execution limits and OOM attribution, workspace
 //! mounts, session isolation, network policy; their code is in `reference/server_old.rs`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 
 use crate::capability::{Capability, Verdict};
 use crate::outbound::Writer;
+use crate::plan;
 use crate::ports;
 use crate::protocol;
 use crate::registry::{Accept, Cancel, Closed, Registry, Terminal};
@@ -106,6 +107,23 @@ impl VmEntry {
 struct SessionInfo {
     workspace: PathBuf,
     last_activity: Instant,
+    /// The session's name reduced to a safe alphabet, for guest paths.
+    prefix: String,
+    /// Where the workspace is mounted in the guest.
+    workspace_guest: String,
+    /// The workspace's live share, exported and mounted when the session opened.
+    workspace_share: Option<plan::Share>,
+    /// The mounts that are live for this session, as of its last applied snapshot.
+    shares: Vec<plan::Share>,
+}
+
+/// An export that could not be taken back yet; retried in the maintenance pass.
+struct Removal {
+    session: String,
+    mount_id: String,
+    child: String,
+    target: String,
+    generation: u64,
 }
 
 /// What the worker needs to run an execution. Kept apart from the registry so the lifecycle state
@@ -116,6 +134,9 @@ struct Spec {
     cwd: Option<String>,
     env: Vec<(String, String)>,
     timeout: Option<Duration>,
+    /// The mounts the request asked for, applied before the execution runs; `None` when the
+    /// request carried none, which leaves the session's mounts as they are.
+    mounts: Option<Vec<plan::Mount>>,
 }
 
 struct Inner {
@@ -126,6 +147,12 @@ struct Inner {
     waiters: HashMap<String, Sender<ExitOutcome>>,
     /// Set while a VM exists; executions are refused rather than queued behind a boot.
     vm_present: bool,
+    /// Guest paths used in this VM's lifetime, including revoked ones: never reused.
+    guest_targets: HashSet<String>,
+    /// Counter for export names, which are never reused within a VM.
+    next_child: u64,
+    /// Exports whose removal failed and is retried.
+    removals: Vec<Removal>,
 }
 
 /// Counters of what this sidecar has done since it started.
@@ -135,6 +162,11 @@ struct Stats {
     failures: u64,
     execs: u64,
     last_failure: Option<(String, String)>,
+    shares_added: u64,
+    shares_removed: u64,
+    shares_remove_failed: u64,
+    mounts_applied: u64,
+    mounts_skipped: u64,
 }
 
 pub struct Context {
@@ -200,6 +232,9 @@ impl Context {
                 specs: HashMap::new(),
                 waiters: HashMap::new(),
                 vm_present: false,
+                guest_targets: HashSet::new(),
+                next_child: 0,
+                removals: Vec::new(),
             }),
             wake: Condvar::new(),
             worker_running: AtomicBool::new(false),
@@ -456,7 +491,7 @@ impl Context {
             "maxRunning": inner.registry.max_running(),
             "maxRunningPerSession": inner.registry.max_running_per_session(),
             "queued": inner.registry.queued_len(),
-            "cleanupPending": 0,
+            "cleanupPending": inner.removals.len(),
             "closingGuestSessions": 0,
             "cleanupOldestMs": 0,
             "outbound": {
@@ -469,6 +504,11 @@ impl Context {
                 "requests": stats.requests,
                 "failures": stats.failures,
                 "execs": stats.execs,
+                "sharesAdded": stats.shares_added,
+                "sharesRemoved": stats.shares_removed,
+                "sharesRemoveFailed": stats.shares_remove_failed,
+                "mountsApplied": stats.mounts_applied,
+                "mountsSkipped": stats.mounts_skipped,
                 "lastFailure": stats.last_failure.as_ref().map(|(code, message)| json!({
                     "reasonCode": code,
                     "message": message,
@@ -504,20 +544,182 @@ impl Context {
             if !inner.registry.open_session(name) {
                 return Err(fail(protocol::REASON_PROTOCOL, "session already open"));
             }
+            let prefix = safe_name(name);
+            let mut workspace_guest = format!("/sessions/{prefix}/workspace");
+            let mut suffix = 1;
+            while inner.guest_targets.contains(&workspace_guest) {
+                suffix += 1;
+                workspace_guest = format!("/sessions/{prefix}-{suffix}/workspace");
+            }
+            inner.guest_targets.insert(workspace_guest.clone());
             inner.sessions.insert(
                 name.to_owned(),
-                SessionInfo { workspace: PathBuf::from(workspace), last_activity: Instant::now() },
+                SessionInfo {
+                    workspace: PathBuf::from(workspace),
+                    last_activity: Instant::now(),
+                    prefix,
+                    workspace_guest,
+                    workspace_share: None,
+                    shares: Vec::new(),
+                },
             );
         }
+        if let Err(failure) = self.ensure_workspace_export(&vm, name) {
+            return Err(failure);
+        }
         self.spawn_worker();
-        // TODO: the session's workspace is not mounted into the guest yet (workspace mounts are a
-        // later step), so the guest path of its files is the root.
+        let workspace_guest = {
+            let inner = self.inner.lock().unwrap();
+            inner.sessions.get(name).map(|info| info.workspace_guest.clone()).unwrap_or_default()
+        };
         Ok(json!({
-            "workspaceGuestPath": "/",
+            "workspaceGuestPath": workspace_guest,
             "runtimeId": vm.runtime_id,
             "vmGeneration": vm.generation,
             "sharedVm": true,
         }))
+    }
+
+    /// Exports the session's workspace and mounts it in the guest. A session that cannot reach its
+    /// workspace is not a session, so a failure takes the registration back.
+    fn ensure_workspace_export(&self, vm: &Arc<VmEntry>, name: &str) -> Result<(), Failure> {
+        let (prefix, workspace, target, child) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.next_child += 1;
+            let n = inner.next_child;
+            let info = inner
+                .sessions
+                .get(name)
+                .ok_or_else(|| fail(protocol::REASON_SESSION_UNKNOWN, format!("unknown session {name}")))?;
+            (info.prefix.clone(), info.workspace.clone(), info.workspace_guest.clone(), format!("{}-ws{n}", info.prefix))
+        };
+        let host = workspace.display().to_string();
+        let outcome = vm.vm.mount_add(name, "workspace", &child, &host, &target, false);
+        match outcome {
+            Ok(()) => {
+                self.stats.lock().unwrap().shares_added += 1;
+                let mut inner = self.inner.lock().unwrap();
+                if let Some(info) = inner.sessions.get_mut(name) {
+                    info.workspace_share = Some(plan::Share {
+                        mount: plan::Mount { id: "workspace".to_owned(), host_path: host, read_only: false, guest_path: None },
+                        child,
+                        source_target: target.clone(),
+                        target,
+                    });
+                }
+                let _ = prefix;
+                Ok(())
+            }
+            Err((code, message)) => {
+                let lost = vm_is_gone(&message);
+                let mut inner = self.inner.lock().unwrap();
+                inner.sessions.remove(name);
+                inner.registry.close_session(name);
+                drop(inner);
+                if lost {
+                    self.mark_vm_lost(vm.generation, message.clone());
+                    return Err(fail(protocol::REASON_BACKEND_UNAVAILABLE, message));
+                }
+                Err(fail(&code, message))
+            }
+        }
+    }
+
+    /// Applies a session's mount snapshot: removes what it no longer lists, adds what is new.
+    fn apply_mounts(&self, vm: &Arc<VmEntry>, name: &str, desired: &[plan::Mount]) -> Result<(), Failure> {
+        let (prefix, mut shares) = {
+            let inner = self.inner.lock().unwrap();
+            let info = inner
+                .sessions
+                .get(name)
+                .ok_or_else(|| fail(protocol::REASON_SESSION_UNKNOWN, format!("unknown session {name}")))?;
+            (info.prefix.clone(), info.shares.clone())
+        };
+        let mut outcome = Ok(());
+        let steps = plan::plan(&shares, desired);
+        {
+            let mut stats = self.stats.lock().unwrap();
+            if steps.is_empty() {
+                stats.mounts_skipped += 1;
+            } else {
+                stats.mounts_applied += 1;
+            }
+        }
+        for step in steps {
+            match step {
+                plan::Step::Remove(share) => {
+                    match vm.vm.mount_remove(name, &share.mount.id, &share.child, &share.target) {
+                        Ok(()) => self.stats.lock().unwrap().shares_removed += 1,
+                        Err((_, message)) => {
+                            self.stats.lock().unwrap().shares_remove_failed += 1;
+                            if vm_is_gone(&message) {
+                                outcome = Err(fail(protocol::REASON_BACKEND_UNAVAILABLE, message));
+                                break;
+                            }
+                            // Revoking a path must not fail the command that triggered it, nor
+                            // destroy a VM other sessions share: keep trying later.
+                            eprintln!("nvxd: cannot remove export {} ({message}); registered for retry", share.child);
+                            self.inner.lock().unwrap().removals.push(Removal {
+                                session: name.to_owned(),
+                                mount_id: share.mount.id.clone(),
+                                child: share.child.clone(),
+                                target: share.target.clone(),
+                                generation: vm.generation,
+                            });
+                        }
+                    }
+                    shares.retain(|other| other.child != share.child);
+                }
+                plan::Step::Add(mount) => {
+                    let (child, target) = {
+                        let mut inner = self.inner.lock().unwrap();
+                        inner.next_child += 1;
+                        let child = format!("{prefix}-m{}", inner.next_child);
+                        let preferred = plan::guest_target_for(&mount);
+                        let target = if inner.guest_targets.contains(&preferred) {
+                            format!("/sessions/{prefix}/mounts/{}", mount.id)
+                        } else {
+                            preferred
+                        };
+                        inner.guest_targets.insert(target.clone());
+                        (child, target)
+                    };
+                    if let Err((code, message)) =
+                        vm.vm.mount_add(name, &mount.id, &child, &mount.host_path, &target, mount.read_only)
+                    {
+                        outcome = Err(if vm_is_gone(&message) {
+                            fail(protocol::REASON_BACKEND_UNAVAILABLE, message)
+                        } else {
+                            fail(&code, message)
+                        });
+                        break;
+                    }
+                    self.stats.lock().unwrap().shares_added += 1;
+                    shares.push(plan::Share { mount, child, source_target: target.clone(), target });
+                }
+            }
+        }
+        if let Some(info) = self.inner.lock().unwrap().sessions.get_mut(name) {
+            info.shares = shares;
+        }
+        outcome
+    }
+
+    /// Retries the exports whose removal failed earlier.
+    fn try_removals(&self) {
+        let Some(vm) = self.vm_now() else { return };
+        let pending: Vec<Removal> = {
+            let mut inner = self.inner.lock().unwrap();
+            let (now, later): (Vec<Removal>, Vec<Removal>) =
+                std::mem::take(&mut inner.removals).into_iter().partition(|r| r.generation == vm.generation);
+            inner.removals = later;
+            now
+        };
+        for removal in pending {
+            if vm.vm.mount_remove(&removal.session, &removal.mount_id, &removal.child, &removal.target).is_err() {
+                self.inner.lock().unwrap().removals.push(removal);
+            }
+        }
     }
 
     /// Boots the VM that every session will share. Called only with `lifecycle` held.
@@ -528,6 +730,7 @@ impl Context {
         config.store = self.config.store.join(format!("vm-{}", self.next_id()));
         let _ = std::fs::remove_dir_all(&config.store);
         let generation = self.inner.lock().unwrap().registry.generation() + 1;
+        config.generation = generation;
         let weak: Weak<Context> = Arc::downgrade(self);
         let vm = Vm::launch(config, move |event| match weak.upgrade() {
             Some(context) => context.on_event(generation, event),
@@ -624,6 +827,9 @@ impl Context {
             inner.sessions.clear();
             inner.specs.clear();
             inner.waiters.clear();
+            inner.guest_targets.clear();
+            inner.removals.clear();
+            inner.next_child = 0;
         }
         eprintln!("nvxd: the VM was lost: {detail}");
         self.retire_if_idle();
@@ -737,11 +943,22 @@ impl Context {
             self.finish_and_emit(id, Terminal::new("cancelled", None, "cancelled before it started"));
             return;
         }
+        let session = self.inner.lock().unwrap().registry.session_of(id).map(str::to_owned).unwrap_or_default();
+        // Mounts change in a gap where this session runs nothing, before the execution starts.
+        if let Some(desired) = &spec.mounts {
+            if let Err(failure) = self.apply_mounts(vm, &session, desired) {
+                if failure.code == protocol::REASON_BACKEND_UNAVAILABLE {
+                    self.mark_vm_lost(vm.generation, failure.message.clone());
+                }
+                self.finish_and_emit(id, Terminal::new("failed", None, failure.message));
+                return;
+            }
+        }
         let (finished_tx, finished) = mpsc::channel::<ExitOutcome>();
         self.inner.lock().unwrap().waiters.insert(id.to_owned(), finished_tx);
         vm.touch();
         let (arguments, environment) = guest_command(spec.argv, spec.env);
-        let cwd = spec.cwd.filter(|cwd| cwd.starts_with('/')).map(String::into_bytes);
+        let cwd = self.guest_cwd(&session, spec.cwd.as_deref()).map(String::into_bytes);
         if let Err(message) = vm.vm.exec(id.to_owned(), arguments, cwd, environment, spec.timeout) {
             self.inner.lock().unwrap().waiters.remove(id);
             self.finish_and_emit(id, Terminal::new("failed", None, message.clone()));
@@ -765,6 +982,25 @@ impl Context {
         self.finish_and_emit(id, terminal);
     }
 
+    /// Where an execution of `session` runs in the guest: a host working directory is placed under
+    /// the live share that holds it (the longest match), an absolute guest path is kept, and
+    /// anything else, or no directory, means the session's workspace.
+    fn guest_cwd(&self, session: &str, cwd: Option<&str>) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        let info = inner.sessions.get(session)?;
+        let mut shares: Vec<plan::Share> = info.shares.clone();
+        shares.extend(info.workspace_share.clone());
+        if let Some(cwd) = cwd {
+            if let Some(translated) = plan::translate_cwd_shares(cwd, &shares) {
+                return Some(translated);
+            }
+            if cwd.starts_with('/') {
+                return Some(cwd.to_owned());
+            }
+        }
+        Some(info.workspace_guest.clone())
+    }
+
     /// Marks an execution terminal and emits exactly one exit event for it.
     fn finish_and_emit(&self, id: &str, terminal: Terminal) {
         let emitted = {
@@ -786,6 +1022,7 @@ impl Context {
     /// long task gets an answer instead of silence. Also run from the maintenance tick.
     pub fn expire_queued_pass(&self) {
         self.expire_queued();
+        self.try_removals();
     }
 
     fn expire_queued(&self) {
@@ -812,8 +1049,42 @@ impl Context {
         if argv.is_empty() {
             return Err(fail(protocol::REASON_PROTOCOL, "argv is required"));
         }
-        if head.get("mounts").and_then(Value::as_array).is_some_and(|mounts| !mounts.is_empty()) {
-            return Err(fail(NOT_YET_SUPPORTED, "workspace mounts are not ported to the new guest agent yet"));
+        let mounts = parse_mounts(head.get("mounts"));
+        if mounts.iter().any(|mount| mount.id.is_empty() || mount.host_path.is_empty()) {
+            return Err(fail(protocol::REASON_PROTOCOL, "a mount needs mountId and hostPath"));
+        }
+        if mounts.iter().any(|mount| {
+            !plan::valid_mount_id(&mount.id)
+                || mount.guest_path.as_deref().is_some_and(|path| !plan::valid_guest_target(path))
+        }) {
+            return Err(fail(
+                "E_WORKSPACE_MOUNT_INVALID",
+                "mountId and guestPath must be one safe /workspace/mounts component",
+            ));
+        }
+        // The engine sends the whole set with every start, and an empty set has no key: a request without
+        // mounts is the empty snapshot, which revokes what the session had.
+        let desired: Option<Vec<plan::Mount>> = Some(mounts.clone());
+        if !mounts.is_empty() || desired.is_some() {
+            // A mount may only export a location inside the session's own tree.
+            let root = {
+                let inner = self.inner.lock().unwrap();
+                let info = inner
+                    .sessions
+                    .get(name)
+                    .ok_or_else(|| fail(protocol::REASON_SESSION_UNKNOWN, format!("unknown session {name}")))?;
+                info.workspace.parent().map(std::path::Path::to_path_buf).unwrap_or_else(|| info.workspace.clone())
+            };
+            let root = std::fs::canonicalize(&root).unwrap_or(root);
+            for mount in &mounts {
+                let candidate = std::fs::canonicalize(&mount.host_path).unwrap_or_else(|_| PathBuf::from(&mount.host_path));
+                if !candidate.starts_with(&root) {
+                    return Err(fail(
+                        "E_WORKSPACE_MOUNT_DENIED",
+                        format!("hostPath {} is outside the allowed root {}", candidate.display(), root.display()),
+                    ));
+                }
+            }
         }
         let timeout = match head.get("timeoutMs") {
             None => None,
@@ -848,7 +1119,20 @@ impl Context {
         {
             return Err(fail(NOT_YET_SUPPORTED, "per-execution limits are not ported to the new guest agent yet"));
         }
-        let digest = digest_of(&argv, cwd.as_deref(), &env, timeout);
+        if let Some(desired) = &desired {
+            let inner = self.inner.lock().unwrap();
+            if let Some(info) = inner.sessions.get(name) {
+                let current: Vec<&plan::Mount> = info.shares.iter().map(|share| &share.mount).collect();
+                let changes = current.len() != desired.len() || current.iter().zip(desired).any(|(a, b)| *a != b);
+                if changes && inner.registry.session_has_unfinished(name) {
+                    return Err(fail(
+                        protocol::REASON_BACKEND_BUSY,
+                        "the session has unfinished work, so its mounts cannot change",
+                    ));
+                }
+            }
+        }
+        let digest = digest_of(&argv, cwd.as_deref(), &env, timeout, &mounts);
         let generation = number(head.get("generation")).unwrap_or(0);
         let accepted = {
             let mut inner = self.inner.lock().unwrap();
@@ -857,7 +1141,7 @@ impl Context {
         match accepted {
             Accept::Queued { position } => {
                 let mut inner = self.inner.lock().unwrap();
-                inner.specs.insert(exec_id.clone(), Spec { argv, cwd, env, timeout });
+                inner.specs.insert(exec_id.clone(), Spec { argv, cwd, env, timeout, mounts: desired });
                 if let Some(info) = inner.sessions.get_mut(name) {
                     info.last_activity = Instant::now();
                 }
@@ -986,7 +1270,7 @@ impl Context {
             return Err(fail(protocol::REASON_PROTOCOL, "session is required"));
         }
         let _lifecycle = self.lifecycle.lock().unwrap();
-        let (closed, running): (Closed, Vec<String>) = {
+        let (closed, running, removed): (Closed, Vec<String>, Option<SessionInfo>) = {
             let mut inner = self.inner.lock().unwrap();
             if !inner.sessions.contains_key(name) {
                 // Closing is idempotent (plan 3.3.2): a caller whose first close reply was lost
@@ -997,11 +1281,11 @@ impl Context {
             }
             let closed = inner.registry.close_session(name);
             let running = closed.running.clone();
-            inner.sessions.remove(name);
+            let removed = inner.sessions.remove(name);
             for id in &closed.cancelled_queued {
                 inner.specs.remove(id);
             }
-            (closed, running)
+            (closed, running, removed)
         };
         // Queued work is already terminal; report it once, here.
         let generation = self.inner.lock().unwrap().registry.generation();
@@ -1032,6 +1316,24 @@ impl Context {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        if let (Some(info), Some(vm)) = (removed, self.vm_now()) {
+            let mut leftovers = info.shares;
+            leftovers.extend(info.workspace_share);
+            for share in leftovers {
+                let gone = !cleanup_pending
+                    && vm.vm.mount_remove(name, &share.mount.id, &share.child, &share.target).is_ok();
+                if !gone {
+                    cleanup_pending = true;
+                    self.inner.lock().unwrap().removals.push(Removal {
+                        session: name.to_owned(),
+                        mount_id: share.mount.id.clone(),
+                        child: share.child.clone(),
+                        target: share.target.clone(),
+                        generation: vm.generation,
+                    });
+                }
             }
         }
         self.retire_if_idle();
@@ -1271,6 +1573,28 @@ fn exit_event(handle: &str, session: &str, generation: u64, terminal: &Terminal)
 }
 
 /// The C++ side builds requests with property trees, which write every scalar as a string.
+/// A caller-chosen name reduced to something safe to use in a guest path or an export name.
+fn safe_name(session: &str) -> String {
+    let safe: String = session
+        .chars()
+        .map(|character| if character.is_ascii_alphanumeric() || character == '-' || character == '_' { character } else { '_' })
+        .collect();
+    if safe.is_empty() { "session".to_owned() } else { safe }
+}
+
+fn parse_mounts(value: Option<&Value>) -> Vec<plan::Mount> {
+    let items = value.and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    items
+        .iter()
+        .map(|item| plan::Mount {
+            id: item["mountId"].as_str().unwrap_or("").to_owned(),
+            host_path: item["hostPath"].as_str().unwrap_or("").to_owned(),
+            read_only: item["mode"].as_str().is_some_and(|mode| mode.eq_ignore_ascii_case("ro")),
+            guest_path: item["guestPath"].as_str().filter(|path| !path.is_empty()).map(str::to_owned),
+        })
+        .collect()
+}
+
 fn number(value: Option<&Value>) -> Option<u64> {
     let value = value?;
     value.as_u64().or_else(|| value.as_str()?.trim().parse().ok())
@@ -1288,8 +1612,23 @@ fn strings(value: Option<&Value>) -> Vec<String> {
 
 /// Digest of everything that makes two requests the same command. Two requests that share an id
 /// but differ here are a contract error, never a silent second run.
-fn digest_of(argv: &[String], cwd: Option<&str>, env: &[(String, String)], timeout: Option<Duration>) -> u64 {
+fn digest_of(
+    argv: &[String],
+    cwd: Option<&str>,
+    env: &[(String, String)],
+    timeout: Option<Duration>,
+    mounts: &[plan::Mount],
+) -> u64 {
     let mut parts: Vec<String> = argv.to_vec();
+    for mount in mounts {
+        parts.push(format!(
+            "mount={}={}={}={}",
+            mount.id,
+            mount.host_path,
+            mount.read_only,
+            mount.guest_path.as_deref().unwrap_or("")
+        ));
+    }
     parts.push(format!("cwd={}", cwd.unwrap_or("")));
     for (key, value) in env {
         parts.push(format!("env={key}={value}"));

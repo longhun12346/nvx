@@ -9,6 +9,8 @@
 mod capability;
 mod control;
 mod frame;
+mod live;
+mod plan;
 mod outbound;
 mod ports;
 mod protocol;
@@ -202,6 +204,9 @@ fn run() -> Result<(), String> {
         memory_mib: u32::try_from(protocol::DEFAULT_MEMORY_MIB).unwrap_or(1024),
         cpu_profile: cpu_profile.clone(),
         guest_build: runtime_adapter::GUEST_BUILD.to_owned(),
+        anchor: args.state_dir.join("export-anchor"),
+        generation: 0,
+        control_pipe: String::new(),
     };
     let provenance = json!({
         "sidecar": env!("CARGO_PKG_VERSION"),

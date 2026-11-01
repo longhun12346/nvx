@@ -1,25 +1,30 @@
 # nvxd
 
-> **Status: scaffold on the `nvx` library.** The sidecar now drives the VM through `nvx` (the
+> **Status: ported to the `nvx` library, partly.** The sidecar drives the VM through `nvx` (the
 > supervisor, sessions and execution engine, as `tests/runtime-adapter` does) with the runtime
-> adapter's guest agent. Working: `ready`, `probe` with the real 128 MiB boot probe and its cache,
-> `session.open`/`session.close` (one shared VM), `exec` with streamed stdout/stderr, backpressure
-> and exit events, `diagnostics`, `shutdown`. Every other operation answers
-> `E_NVX_NOT_YET_SUPPORTED`: request limits, OOM attribution, fair run slots, TTL, port
-> operations, memory trim, session isolation and workspace mounts, whose previous implementation
-> is in `reference/` (`server_old.rs` and the control client). Not wired to the engine yet: the
-> command line takes `--artifacts DIR --guest-agent PATH` instead of the engine's explicit asset
-> paths.
+> adapter's guest agent. Working, with the engine's protocol and launch arguments unchanged:
+> `ready`, `probe` with the real 128 MiB boot probe and its cache, several sessions on one shared
+> VM (session cap, queue, run slots, generation fences), `exec` with streamed stdout/stderr,
+> backpressure and exit events, cancel (`signal`) of queued and running executions, `exec.status`,
+> duplicate and conflicting starts, timeouts, `session.close`, session TTL, `memory.stats`/
+> `memory.trim` and idle trimming, `port.check`/`port.allocate`, VM-lost reporting with the
+> generation guard, `diagnostics`, `shutdown`. Output the caller is not ready to read is held back
+> (counted as `outbound.deferred`) and delivered later; it is never dropped.
+>
+> Still answering `E_NVX_NOT_YET_SUPPORTED` (their previous implementation is in `reference/`):
+> workspace mounts, per-execution limits and OOM attribution, session isolation, the network
+> policy (the arguments are accepted and ignored with a message). The guest agent does not start
+> NVX's time daemon yet, so the guest clock is not synchronized.
 >
 > Build: `cargo build --release` here; the guest agent is built from `tests/runtime-adapter`
 > (`--features guest --target x86_64-unknown-linux-musl --bin runtime-adapter-guest`, linker
 > `rust-lld`, which works from Windows without WSL or Docker; see the `sidecar` job in
-> `.github/workflows/fork-ci.yml`). End-to-end check: `python tests/scaffold_e2e.py` and
-> `tests/scaffold_backpressure.py` (arguments in their headers).
->
-> Known gaps of the scaffold: the adapter's host framing and guest agent are reused (a test
-> crate, not a stable API); programs are resolved as `/usr/bin/<name>` on the host side;
-> the outbound counters mark `broken` on flow-control refusals.
+> `.github/workflows/fork-ci.yml`). Launch: the engine's `--openvmm --kernel --initrd --distro
+> --cpu-profile ...` plus `--guest-agent PATH` (or `nvxd-guest` next to the executable); `--artifacts
+> DIR` derives the first four from a release directory. Tests: `tests/runtime_assets.py` reads
+> `NVX_OPENVMM`, `NVX_KERNEL`, `NVX_INITRD`, `NVX_DISTRO` (a distro with Python and Node for the
+> suites that run them) and `NVX_GUEST_AGENT`; `tests/behaviour_checks.py` exercises the
+> operations above on a live VM.
 
 `nvxd` is the NVX sidecar. It owns the stdio frame protocol,
 session lifecycle, live-share reconciliation, and the OpenVMM-backed execution

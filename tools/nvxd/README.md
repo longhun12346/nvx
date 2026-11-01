@@ -19,10 +19,20 @@
 > 103 of the adapter's framing) after the start. Revoking a mount unmounts it in the guest first and
 > then stops the export; an export that cannot be taken back is retried (`cleanupPending`).
 >
+> Per-execution limits work: the deployment's `--exec-memory-mb`, `--exec-cpu-percent` and
+> `--exec-pids`, overridden field by field by a request's `limits`, reach the guest agent in an
+> `ExecLimits` message (kind 104) before the start and become `memory.max`, `cpu.max` and `pids.max`
+> of the execution's cgroup. The guest refuses a start whose limits it cannot apply: a kernel
+> without `CONFIG_CFS_BANDWIDTH` (upstream's prebuilt one; this fork's config sets it) refuses cpu
+> limits as a launch failure rather than running the program unlimited. A kill by the kernel's
+> OOM killer is reported before the terminal record in an `ExecOom` message (kind 105) and becomes
+> the exit event's `detail`: `oom` when the execution reached its own limit, `vmOom` otherwise. The
+> executions share a workload cgroup sized from the guest's RAM, and the agent exempts itself from
+> the OOM killer. The time daemon NVX's `/init` starts publishes its status at `/run/nvx/time`
+> inside every execution.
+>
 > Still answering `E_NVX_NOT_YET_SUPPORTED` (their previous implementation is in `reference/`):
-> per-execution limits and OOM attribution, session isolation, the network policy (the arguments are
-> accepted and ignored with a message). The guest agent does not start NVX's time daemon yet, so
-> the guest clock is not synchronized.
+> session isolation, and the network policy (the arguments are accepted and ignored with a message).
 >
 > Build: `cargo build --release` here; the guest agent is built from `tools/nvxd-guest` (a fork-owned copy of upstream's runtime adapter)
 > (`--features guest --target x86_64-unknown-linux-musl --bin nvxd-guest`, linker

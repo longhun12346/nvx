@@ -60,7 +60,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             tools/nvxd/target
-          key: nvxd-${{ runner.os }}-${{ steps.rust.outputs.channel }}-${{ hashFiles('tools/nvxd/Cargo.lock', 'tests/runtime-adapter/Cargo.lock', 'nvx-rs/Cargo.lock') }}
+          key: nvxd-${{ runner.os }}-${{ steps.rust.outputs.channel }}-${{ hashFiles('tools/nvxd/Cargo.lock', 'tools/nvxd-guest/Cargo.lock', 'nvx-rs/Cargo.lock') }}
           restore-keys: |
             nvxd-${{ runner.os }}-${{ steps.rust.outputs.channel }}-
 

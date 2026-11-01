@@ -227,6 +227,7 @@ fn run() -> Result<(), String> {
         control_pipe: String::new(),
         network: network::network(args.network_egress, args.ingress_host_loopback, args.private_networks_allow)?,
     };
+    vm::prewarm(&config);
     let provenance = json!({
         "sidecar": env!("CARGO_PKG_VERSION"),
         "openvmm": openvmm.display().to_string(),

@@ -386,15 +386,33 @@ const WORKLOAD_RESERVE_MIB: u64 = 96;
 /// The most processes all executions together may have; the VM's own process limit is the bound.
 const WORKLOAD_PIDS_MAX: u64 = 32768;
 
+/// Prints how long each phase of a launch took when NVXD_TRACE_PHASES is set.
+struct Phases(Option<Instant>);
+
+impl Phases {
+    fn new() -> Self {
+        Phases(std::env::var_os("NVXD_TRACE_PHASES").map(|_| Instant::now()))
+    }
+
+    fn mark(&self, name: &str) {
+        if let Some(start) = self.0 {
+            eprintln!("nvxd: phase {name} at {:.1} ms", start.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}
+
 fn launch_and_serve(
     config: &VmConfig,
     commands: &Receiver<Command>,
     ready: &Sender<Result<VmProcess, (String, String)>>,
     events: &impl Fn(Event) -> bool,
 ) -> Result<(), (String, String)> {
-    let runtime = runtime_of(config)?;
-    let identity = erofs_uuid(&config.distro)?;
-    let staged = Staged::stage(&config.distro, ImageFormat::Erofs, identity, None).map_err(|e| classify(&e))?;
+    let phases = Phases::new();
+    let warm = warm_assets(config)?;
+    let runtime = warm.runtime.clone();
+    let identity = warm.erofs_identity;
+    let staged = warm.staged.clone();
+    phases.mark("warm assets (digests, staged image, composed initramfs)");
     let mut layered = LayeredLaunch::new(&config.distro, ImageFormat::Erofs, identity, None, None)
         .map_err(|e| classify(&e))?;
     // The identity of every execution is the sandbox's: the start names none.
@@ -429,18 +447,28 @@ fn launch_and_serve(
         layered.bindings = staged.bindings(&layered.plan);
     }
     let mut prepared = Some(layered.prepare().map_err(|e| classify(&e))?);
+    phases.mark("layered prepare");
+    phases.mark("store ready, bindings staged");
     let capability = generate_capability().map_err(|e| classify(&e))?;
+    phases.mark("capability generated");
     let initramfs_path = store.dir().join(INITRAMFS_NAME);
     let mut spec = LaunchSpec::new(runtime.artifacts.clone(), config.hypervisor);
     spec.memory_mib = config.memory_mib;
     spec.openvmm = runtime.artifacts.openvmm.clone();
     spec.initrd = initramfs_path.clone();
     let launch_id = LaunchId::generate().map_err(|e| classify(&e))?;
+    phases.mark("launch id");
     let deadline = Instant::now() + START_TIMEOUT;
     let command = |endpoint: &str| -> nvx::Result<VmmCommand<'_>> {
-        initramfs::write(&runtime.artifacts.initrd, &config.guest_agent, None, &initramfs_path).map_err(
-            |error| nvx::Error::io("cannot write the initramfs of the guest agent").with_source(error),
-        )?;
+        // The composed initramfs is read-only for the VM, so a launch links the warm file into its
+        // store instead of writing 8 MB again; a copy is the fallback where linking is refused.
+        let _ = std::fs::remove_file(&initramfs_path);
+        if std::fs::hard_link(&warm.initramfs, &initramfs_path).is_err() {
+            std::fs::copy(&warm.initramfs, &initramfs_path).map_err(|error| {
+                nvx::Error::io("cannot copy the initramfs of the guest agent").with_source(error)
+            })?;
+        }
+        phases.mark("initramfs copied");
         let outcome = store.outcome_path();
         let held = prepared.as_ref().expect("the checked files are held until the root is assembled");
         let mut arguments = layered.openvmm_arguments(held, &spec.vmm_launch(endpoint, &outcome))?;
@@ -457,15 +485,20 @@ fn launch_and_serve(
         command.inherit = held.inherited();
         Ok(command)
     };
+    phases.mark("before supervisor launch");
     let starting = supervisor::launch(&mut locked, &launch_id, &runtime.identity, &capability, command)
         .map_err(|e| classify(&e))?;
+    phases.mark("supervisor launched (openvmm started)");
     let process = starting.process().reference().clone();
     let transport = session::connect(starting.endpoint(), process.pid, process.start_time, deadline)
         .map_err(|e| failure("E_BACKEND_START_CONTROL", format!("cannot connect to the VM: {e}")))?;
+    phases.mark("connected");
     let mut client = Client::attach(transport, &capability, deadline)
         .map_err(|e| failure("E_BACKEND_START_CONTROL", format!("cannot attach to the VM: {e}")))?;
+    phases.mark("attached");
     adapter_host::ready(&mut client, &layered.config, &config.guest_build, deadline)
         .map_err(|e| failure("E_BACKEND_START_CONTROL", format!("the guest did not assemble the root: {e}")))?;
+    phases.mark("guest root assembled");
     if let Some(prepared) = prepared.take() {
         prepared
             .release(starting.process())
@@ -474,6 +507,7 @@ fn launch_and_serve(
     let table = layered.table();
     adapter_host::start_sandbox(&mut client, &table, deadline)
         .map_err(|e| failure("E_BACKEND_START_CONTROL", format!("the guest did not start the sandbox: {e}")))?;
+    phases.mark("sandbox started");
     let _ = ready.send(Ok(VmProcess { pid: process.pid, start_time: process.start_time }));
     pump(&mut client, commands, events);
     // The starting handle drops here, uncommitted, which ends the VM.
@@ -519,20 +553,96 @@ fn artifact_identity(path: &std::path::Path) -> Result<ArtifactIdentity, (String
     ArtifactIdentity::sha256(&digest).map_err(|e| classify(&e))
 }
 
-/// The runtime of the explicitly named artifacts, with the identity the supervisor records. NVX's
-/// own constructor reads a release's checksum list or a checkout's provenance, which a deployment
-/// that names its files one by one does not have; the digests are computed instead.
-fn runtime_of(config: &VmConfig) -> Result<Runtime, (String, String)> {
+/// What a launch needs that depends only on the contents of the artifacts: the runtime identity
+/// (digests of OpenVMM, the kernel and the base initramfs), the EROFS identity and the staged
+/// image (which hashes the image), and the initramfs with the guest agent in it. Nothing here is
+/// per VM, so it is computed once per process, in parallel, and shared by every launch, including
+/// the capability check's.
+pub struct Warm {
+    runtime: Runtime,
+    erofs_identity: nvx::uuid::Uuid,
+    staged: Staged,
+    initramfs: PathBuf,
+}
+
+type WarmKey = Vec<(PathBuf, u64, u64)>;
+type WarmCell = Arc<std::sync::OnceLock<Result<Arc<Warm>, (String, String)>>>;
+
+fn warm_key(config: &VmConfig) -> WarmKey {
+    [&config.openvmm, &config.kernel, &config.initrd, &config.guest_agent, &config.distro]
+        .into_iter()
+        .map(|path| {
+            let metadata = std::fs::metadata(path).ok();
+            let length = metadata.as_ref().map_or(0, |m| m.len());
+            let modified = metadata
+                .and_then(|m| m.modified().ok())
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |age| age.as_nanos() as u64);
+            (path.clone(), length, modified)
+        })
+        .collect()
+}
+
+fn warm_assets(config: &VmConfig) -> Result<Arc<Warm>, (String, String)> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static WARM: OnceLock<Mutex<HashMap<WarmKey, WarmCell>>> = OnceLock::new();
+    let key = warm_key(config);
+    let cell = {
+        let mut cache = WARM.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        cache.entry(key).or_default().clone()
+    };
+    cell.get_or_init(|| compute_warm(config).map(Arc::new)).clone()
+}
+
+/// Starts computing the warm assets in the background, so that the first launch finds them done.
+pub fn prewarm(config: &VmConfig) {
+    let config = config.clone();
+    let _ = std::thread::Builder::new().name("nvxd-prewarm".to_owned()).spawn(move || {
+        let _ = warm_assets(&config);
+    });
+}
+
+fn joined<T>(
+    handle: std::thread::ScopedJoinHandle<'_, Result<T, (String, String)>>,
+) -> Result<T, (String, String)> {
+    handle.join().unwrap_or_else(|_| Err(failure("E_BACKEND_START", "a prewarm thread panicked")))
+}
+
+fn compute_warm(config: &VmConfig) -> Result<Warm, (String, String)> {
+    let dir = config.store.parent().unwrap_or(&config.store).join("warm");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| failure("E_BACKEND_START", format!("cannot create {}: {e}", dir.display())))?;
+    let initramfs_path = dir.join("initramfs.cpio.gz");
     let artifacts = Artifacts::new(&config.openvmm, &config.kernel, &config.initrd);
     artifacts.probe().map_err(|e| classify(&e))?;
-    let initramfs = artifact_identity(&config.initrd)?;
+    let (openvmm, kernel, initrd, image, composed) = std::thread::scope(|scope| {
+        let openvmm = scope.spawn(|| artifact_identity(&config.openvmm));
+        let kernel = scope.spawn(|| artifact_identity(&config.kernel));
+        let initrd = scope.spawn(|| artifact_identity(&config.initrd));
+        let image = scope.spawn(|| -> Result<(nvx::uuid::Uuid, Staged), (String, String)> {
+            let identity = erofs_uuid(&config.distro)?;
+            let staged =
+                Staged::stage(&config.distro, ImageFormat::Erofs, identity, None).map_err(|e| classify(&e))?;
+            Ok((identity, staged))
+        });
+        let composed = scope.spawn(|| {
+            initramfs::write(&config.initrd, &config.guest_agent, None, &initramfs_path).map_err(|error| {
+                classify(&nvx::Error::io("cannot write the initramfs of the guest agent").with_source(error))
+            })
+        });
+        (joined(openvmm), joined(kernel), joined(initrd), joined(image), joined(composed))
+    });
+    let (openvmm, kernel, initrd) = (openvmm?, kernel?, initrd?);
+    let (erofs_identity, staged) = image?;
+    composed?;
     let identity = RuntimeIdentity::new(
-        artifact_identity(&config.openvmm)?,
-        artifact_identity(&config.kernel)?,
-        ArtifactIdentity::new(format!("{initramfs}+runtime-adapter-guest/{}", config.guest_build))
+        openvmm,
+        kernel,
+        ArtifactIdentity::new(format!("{initrd}+runtime-adapter-guest/{}", config.guest_build))
             .map_err(|e| classify(&e))?,
     );
-    Ok(Runtime { artifacts, identity })
+    Ok(Warm { runtime: Runtime { artifacts, identity }, erofs_identity, staged, initramfs: initramfs_path })
 }
 
 /// Reads the filesystem UUID of an EROFS image from its superblock (offset 1024 + 48).

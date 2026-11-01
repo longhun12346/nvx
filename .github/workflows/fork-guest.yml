@@ -16,6 +16,7 @@ on:
   push:
     branches:
       - productization
+      - migration/**
     paths:
       - kernel/**
       - guest/**
@@ -70,6 +71,15 @@ jobs:
           channel=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' rust-toolchain.toml)
           test -n "${channel}"
           rustup toolchain install "${channel}" --profile minimal --target x86_64-unknown-linux-musl
+
+      # The Alpine rootfs of the base initramfs is installed under `unshare`, which Ubuntu 24.04
+      # runners refuse to unprivileged users unless the AppArmor user-namespace restriction is lifted.
+      - name: Allow unprivileged user namespaces for the Alpine rootfs install
+        run: |
+          set -euo pipefail
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          unshare --user --map-root-user true && echo "unshare works"
 
       # nvxd boots NVX's base initramfs with its own guest agent added, and the Ubuntu root as an
       # EROFS layer, so it needs the base initramfs and the layer; the Ubuntu initramfs of

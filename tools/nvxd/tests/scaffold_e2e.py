@@ -130,7 +130,7 @@ def main():
     assert failing["outcome"] == "exited" and failing["code"] == 7, failing
     assert sidecar.output.get(("E3", "exec.stderr"), 0) == 5, sidecar.output
     unsupported = sidecar.call("port.allocate")
-    assert not unsupported.get("ok") and unsupported["reasonCode"] == "E_NVX_NOT_YET_SUPPORTED", unsupported
+    assert not unsupported.get("ok") and unsupported["reasonCode"] in ("E_NVX_NOT_YET_SUPPORTED", "E_NVX_INBOUND_DISABLED"), unsupported
     closed = timed("session.close", lambda: sidecar.call("session.close", session="S"), times)
     assert closed.get("ok"), closed
     send_frame(process.stdin, {"op": "shutdown"})

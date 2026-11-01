@@ -19,10 +19,11 @@ use nvx::Hypervisor;
 use nvx::exec::peer::{Event as PeerEvent, Peer};
 use nvx::exec::{Cause, Key, Limits, Outcome, Status, Stream, Timers, Window};
 use nvx::host::instance::generate_capability;
+use nvx::host::artifacts::Artifacts;
 use nvx::host::launch::LaunchSpec;
 use nvx::host::nvxs::HostConnectionError;
 use nvx::host::session;
-use nvx::host::store::{LaunchId, SandboxStore};
+use nvx::host::store::{ArtifactIdentity, LaunchId, RuntimeIdentity, SandboxStore};
 use nvx::host::supervisor::{self, VmmCommand};
 use nvx::protocol::root::ImageFormat;
 use runtime_adapter::exec::{GuestMessage, HostMessage, Start};
@@ -48,8 +49,12 @@ const WAKE: Duration = Duration::from_millis(20);
 /// Everything a VM is launched with.
 #[derive(Clone, Debug)]
 pub struct VmConfig {
-    /// NVX's artifacts: a release directory or a repository checkout.
-    pub artifacts: PathBuf,
+    /// The OpenVMM executable.
+    pub openvmm: PathBuf,
+    /// The guest kernel (`vmlinux`).
+    pub kernel: PathBuf,
+    /// NVX's base initramfs, which the VM boots a copy of with the guest agent in it.
+    pub initrd: PathBuf,
     /// The guest agent (static musl executable).
     pub guest_agent: PathBuf,
     /// The EROFS image of the root.
@@ -73,6 +78,8 @@ pub enum Command {
         timeout: Option<Duration>,
         reply: Sender<Result<(), String>>,
     },
+    /// Cancels an execution by the name it was started with.
+    Cancel { id: String },
     /// Ends the VM.
     Stop,
 }
@@ -81,6 +88,16 @@ pub enum Command {
 pub enum Event {
     Output { id: String, stderr: bool, bytes: Vec<u8> },
     Exit { id: String, outcome: ExitOutcome },
+    /// The VM is gone (its process ended or the control session broke), not stopped by us. Sent
+    /// once, after the `Exit` events of the executions it took with it.
+    Lost { detail: String },
+}
+
+/// What the launched VM's process is, for memory control and port checks.
+#[derive(Clone, Copy, Debug)]
+pub struct VmProcess {
+    pub pid: u32,
+    pub start_time: u64,
 }
 
 /// How an execution ended, in the vocabulary of the sidecar's `exec.exit` event.
@@ -96,7 +113,8 @@ pub struct ExitOutcome {
 /// A running VM: the channel to its serving thread and the thread.
 pub struct Vm {
     commands: Sender<Command>,
-    thread: Option<JoinHandle<()>>,
+    thread: std::sync::Mutex<Option<JoinHandle<()>>>,
+    process: VmProcess,
 }
 
 impl Vm {
@@ -107,15 +125,16 @@ impl Vm {
         events: impl Fn(Event) -> bool + Send + 'static,
     ) -> Result<Vm, (String, String)> {
         let (commands, receiver) = mpsc::channel();
-        let (ready_tx, ready_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<VmProcess, (String, String)>>();
         let thread = std::thread::Builder::new()
             .name("nvxd-vm".to_owned())
             .spawn(move || serve(config, receiver, ready_tx, events))
             .map_err(|error| ("E_BACKEND_START".to_owned(), error.to_string()))?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Vm {
+            Ok(Ok(process)) => Ok(Vm {
                 commands,
-                thread: Some(thread),
+                thread: std::sync::Mutex::new(Some(thread)),
+                process,
             }),
             Ok(Err(failure)) => {
                 let _ = thread.join();
@@ -153,10 +172,21 @@ impl Vm {
             .map_err(|_| "the VM did not answer".to_owned())?
     }
 
+    /// The VMM process of this VM.
+    pub fn process(&self) -> VmProcess {
+        self.process
+    }
+
+    /// Asks for the cancellation of an execution; its `Exit` event reports how it ended.
+    pub fn cancel(&self, id: &str) {
+        let _ = self.commands.send(Command::Cancel { id: id.to_owned() });
+    }
+
     /// Ends the VM and waits for its thread.
-    pub fn stop(&mut self) {
+    pub fn stop(&self) {
         let _ = self.commands.send(Command::Stop);
-        if let Some(thread) = self.thread.take() {
+        let thread = self.thread.lock().unwrap().take();
+        if let Some(thread) = thread {
             let _ = thread.join();
         }
     }
@@ -182,7 +212,7 @@ fn classify(error: &nvx::Error) -> (String, String) {
 fn serve(
     config: VmConfig,
     commands: Receiver<Command>,
-    ready: Sender<Result<(), (String, String)>>,
+    ready: Sender<Result<VmProcess, (String, String)>>,
     events: impl Fn(Event) -> bool,
 ) {
     // The launch holds the locked store and borrows it for the VM's whole life; dropping the
@@ -196,11 +226,10 @@ fn serve(
 fn launch_and_serve(
     config: &VmConfig,
     commands: &Receiver<Command>,
-    ready: &Sender<Result<(), (String, String)>>,
+    ready: &Sender<Result<VmProcess, (String, String)>>,
     events: &impl Fn(Event) -> bool,
 ) -> Result<(), (String, String)> {
-    let runtime = Runtime::from_dir(&config.artifacts, &config.guest_build).map_err(|e| classify(&e))?;
-    runtime.artifacts.probe().map_err(|e| classify(&e))?;
+    let runtime = runtime_of(config)?;
     let identity = erofs_uuid(&config.distro)?;
     let staged = Staged::stage(&config.distro, ImageFormat::Erofs, identity, None).map_err(|e| classify(&e))?;
     let mut layered = LayeredLaunch::new(&config.distro, ImageFormat::Erofs, identity, None, None)
@@ -264,12 +293,65 @@ fn launch_and_serve(
     let table = layered.table();
     adapter_host::start_sandbox(&mut client, &table, deadline)
         .map_err(|e| failure("E_BACKEND_START_CONTROL", format!("the guest did not start the sandbox: {e}")))?;
-    let _ = ready.send(Ok(()));
+    let _ = ready.send(Ok(VmProcess { pid: process.pid, start_time: process.start_time }));
     pump(&mut client, commands, events);
     // The starting handle drops here, uncommitted, which ends the VM.
     drop(client);
     drop(starting);
     Ok(())
+}
+
+/// SHA-256 identity of an artifact, computed once per file version: the runtime identity names
+/// the artifacts by digest, and hashing the 25 MB OpenVMM on every launch would be wasted work.
+fn artifact_identity(path: &std::path::Path) -> Result<ArtifactIdentity, (String, String)> {
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::io::Read;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, u64, u64), String>>> = OnceLock::new();
+    let asset = |e: &dyn std::fmt::Display| {
+        failure("E_BACKEND_START_ASSET", format!("cannot read {}: {e}", path.display()))
+    };
+    let metadata = std::fs::metadata(path).map_err(|e| asset(&e))?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |age| age.as_secs());
+    let key = (path.to_path_buf(), metadata.len(), modified);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(digest) = cache.lock().unwrap().get(&key) {
+        return ArtifactIdentity::sha256(digest).map_err(|e| classify(&e));
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| asset(&e))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let count = file.read(&mut buffer).map_err(|e| asset(&e))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let digest: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    cache.lock().unwrap().insert(key, digest.clone());
+    ArtifactIdentity::sha256(&digest).map_err(|e| classify(&e))
+}
+
+/// The runtime of the explicitly named artifacts, with the identity the supervisor records. NVX's
+/// own constructor reads a release's checksum list or a checkout's provenance, which a deployment
+/// that names its files one by one does not have; the digests are computed instead.
+fn runtime_of(config: &VmConfig) -> Result<Runtime, (String, String)> {
+    let artifacts = Artifacts::new(&config.openvmm, &config.kernel, &config.initrd);
+    artifacts.probe().map_err(|e| classify(&e))?;
+    let initramfs = artifact_identity(&config.initrd)?;
+    let identity = RuntimeIdentity::new(
+        artifact_identity(&config.openvmm)?,
+        artifact_identity(&config.kernel)?,
+        ArtifactIdentity::new(format!("{initramfs}+runtime-adapter-guest/{}", config.guest_build))
+            .map_err(|e| classify(&e))?,
+    );
+    Ok(Runtime { artifacts, identity })
 }
 
 /// Reads the filesystem UUID of an EROFS image from its superblock (offset 1024 + 48).
@@ -364,6 +446,12 @@ fn pump(client: &mut Client, commands: &Receiver<Command>, events: &impl Fn(Even
         loop {
             match commands.try_recv() {
                 Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return,
+                Ok(Command::Cancel { id }) => {
+                    let now = Instant::now();
+                    for entry in running.values_mut().filter(|entry| entry.name == id) {
+                        entry.peer.cancel(now);
+                    }
+                }
                 Ok(Command::Exec { id, arguments, working_directory, environment, timeout, reply }) => {
                     let key = Key::new(base.wrapping_add(next), identity.epoch);
                     next += 1;
@@ -399,7 +487,7 @@ fn pump(client: &mut Client, commands: &Receiver<Command>, events: &impl Fn(Even
         for entry in running.values_mut() {
             for message in entry.serve(now, events) {
                 if client.send(&message, Some(send_deadline)).is_err() {
-                    lose_all(&mut running, events);
+                    lose_all(&mut running, events, "the control session ended while sending");
                     return;
                 }
             }
@@ -418,8 +506,8 @@ fn pump(client: &mut Client, commands: &Receiver<Command>, events: &impl Fn(Even
                 }
             }
             Err(ClientError::Session(HostConnectionError::TimedOut)) => {}
-            Err(_) => {
-                lose_all(&mut running, events);
+            Err(error) => {
+                lose_all(&mut running, events, &format!("the control session ended: {error}"));
                 return;
             }
         }
@@ -457,13 +545,14 @@ fn describe(outcome: &Outcome) -> ExitOutcome {
     ExitOutcome { kind, code, truncated, launch_failure }
 }
 
-fn lose_all(running: &mut BTreeMap<u64, Running>, events: &impl Fn(Event) -> bool) {
+fn lose_all(running: &mut BTreeMap<u64, Running>, events: &impl Fn(Event) -> bool, detail: &str) {
     for (_, entry) in std::mem::take(running) {
         let _ = events(Event::Exit {
             id: entry.name,
             outcome: ExitOutcome { kind: "lost", code: None, truncated: false, launch_failure: None },
         });
     }
+    let _ = events(Event::Lost { detail: detail.to_owned() });
 }
 
 #[allow(dead_code)]

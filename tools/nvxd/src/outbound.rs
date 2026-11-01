@@ -47,6 +47,10 @@ struct Frame {
 pub struct Stats {
     frames: AtomicU64,
     refused: AtomicU64,
+    /// Output chunks that were held back because the caller was not reading. The execution
+    /// engine keeps those bytes and grants the guest no more credit for them, so nothing is lost:
+    /// this counts flow control, not failure.
+    deferred: AtomicU64,
     /// Set once a send was refused or the output thread failed: the connection is no longer
     /// able to carry everything that was produced.
     broken: AtomicBool,
@@ -59,6 +63,10 @@ impl Stats {
 
     pub fn refused(&self) -> u64 {
         self.refused.load(Ordering::Relaxed)
+    }
+
+    pub fn deferred(&self) -> u64 {
+        self.deferred.load(Ordering::Relaxed)
     }
 
     pub fn broken(&self) -> bool {
@@ -84,7 +92,9 @@ impl Writer {
     }
 
     /// Queues a chunk of command output. Limited to the output capacity, so a caller that stops
-    /// reading loses output, never replies.
+    /// reading never costs replies. A refusal at that limit is flow control: the caller of this
+    /// function keeps the bytes and offers them again, so it is counted as `deferred` and does not
+    /// mark the connection broken.
     pub fn send_output(&self, head: &Value, payload: &[u8]) -> io::Result<()> {
         self.enqueue(head, payload, true)
     }
@@ -99,7 +109,11 @@ impl Writer {
         };
         if output && self.queued_output.fetch_add(1, Ordering::AcqRel) >= self.output_limit {
             self.queued_output.fetch_sub(1, Ordering::AcqRel);
-            return Err(self.refuse_full());
+            self.stats.deferred.fetch_add(1, Ordering::Relaxed);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the caller is not reading; the output is held back",
+            ));
         }
         match self.sender.try_send(frame) {
             Ok(()) => Ok(()),
@@ -250,8 +264,9 @@ mod tests {
             }
         }
         assert!(refused, "a full queue must be reported");
-        assert!(writer.broken(), "a refused send marks the connection broken");
-        assert!(writer.stats().refused() >= 1);
+        assert!(!writer.broken(), "holding output back is flow control, not a failure");
+        assert!(writer.stats().deferred() >= 1);
+        assert_eq!(writer.stats().refused(), 0);
         gate.open();
         drop(writer);
         let _ = thread.join();

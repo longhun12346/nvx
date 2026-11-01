@@ -31,6 +31,6 @@ while exit_event is None:
     if h.get("event") == "exec.stdout": total += len(payload)
     elif h.get("event") == "exec.exit": exit_event = h
     elif h.get("id") == 4: diag = h
-print("after the stall: received", total, "of 67108864 bytes in %.2f s;" % (time.monotonic() - t), "exit", exit_event["outcome"], exit_event["code"], "truncated", exit_event["truncated"])
+print("after the stall: received", total, "of 67108864 bytes in %.2f s;" % (time.monotonic() - t), "exit", exit_event["outcome"], exit_event["code"], "truncated", exit_event.get("truncated", False))
 print("diagnostics answered while stalled:", diag is not None, (diag or {}).get("outbound"))
 e.send_frame(p.stdin, {"op": "shutdown"}); p.stdin.close(); p.wait(60)

@@ -398,12 +398,15 @@ def case_stalled_reader(nvxd, repo, initrd, root):
         watchdog = threading.Timer(120, lambda: (timed_out.append(True), process.kill()))
         watchdog.start()
         diagnostics = None
+        received = 0
         try:
             while True:
                 frame = read_frame(process.stdout)
                 if frame is None:
                     break
-                head, _ = frame
+                head, payload = frame
+                if head.get("event") == "exec.stdout":
+                    received += len(payload)
                 if head.get("id") == 3:
                     diagnostics = head
                     break
@@ -417,13 +420,37 @@ def case_stalled_reader(nvxd, repo, initrd, root):
             raise RuntimeError(f"diagnostics was refused: {diagnostics}")
         outbound = diagnostics.get("outbound") or {}
         print(
-            f"stalled reader: frames={outbound.get('frames')} "
-            f"refused={outbound.get('refused')} broken={outbound.get('broken')}"
+            f"stalled reader: frames={outbound.get('frames')} refused={outbound.get('refused')} "
+            f"deferred={outbound.get('deferred')} broken={outbound.get('broken')}"
         )
-        if not outbound.get("refused"):
+        # Output is held back, not dropped: the writer defers what the caller cannot take and the
+        # execution engine withholds credit from the guest, so the stall costs flow control only.
+        if not outbound.get("deferred"):
+            raise RuntimeError("a stalled reader cost nothing: no output was ever held back")
+        if outbound.get("broken"):
+            raise RuntimeError("holding output back for a stalled reader marked the connection broken")
+        # Reading again delivers all of it.
+        expected = 256 * 32768
+        exit_seen = False
+        watchdog = threading.Timer(120, lambda: (timed_out.append(True), process.kill()))
+        watchdog.start()
+        try:
+            while not exit_seen:
+                frame = read_frame(process.stdout)
+                if frame is None:
+                    break
+                head, payload = frame
+                if head.get("event") == "exec.stdout":
+                    received += len(payload)
+                elif head.get("event") == "exec.exit" and head.get("execId") == "CHATTY":
+                    exit_seen = True
+        finally:
+            watchdog.cancel()
+        if not exit_seen or received != expected:
             raise RuntimeError(
-                "a stalled reader cost nothing: the queue was never refused"
+                f"the held-back output did not arrive whole: {received} of {expected} bytes, exit seen {exit_seen}"
             )
+        print(f"stalled reader: all {received} bytes arrived once reading resumed")
     finally:
         try:
             send_frame(process.stdin, {"op": "shutdown"})

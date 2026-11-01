@@ -144,6 +144,7 @@ dependencies = [
  "nvx",
  "runtime-adapter",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

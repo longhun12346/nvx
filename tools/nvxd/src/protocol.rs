@@ -120,9 +120,23 @@ pub fn classify_start_failure(kind: Option<ErrorKind>, message: &str) -> &'stati
     }
 }
 
-use aci_edge_sandboxes::nvx::ErrorKind;
+use nvx::ErrorKind;
 
-use aci_edge_sandboxes::nvx::protocol::{ExecLimits, MAX_EXEC_CPU_PERCENT, MAX_EXEC_MEMORY_MIB};
+/// Largest per-execution memory limit, in MiB.
+pub const MAX_EXEC_MEMORY_MIB: u32 = 4096;
+/// Largest per-execution CPU limit, in hundredths of one core.
+pub const MAX_EXEC_CPU_PERCENT: u32 = 6400;
+/// Largest per-execution task limit.
+#[allow(dead_code)]
+pub const MAX_EXEC_PIDS: u32 = 4096;
+
+/// Resource limits of one execution alone. Zero in a field means "no limit" there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecLimits {
+    pub mem_mb: u32,
+    pub cpu_percent: u32,
+    pub pids_max: u32,
+}
 use serde_json::Value;
 
 /// Validates a request-level `limits` object.

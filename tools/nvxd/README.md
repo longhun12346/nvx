@@ -1,10 +1,25 @@
 # nvxd
 
-> **Status: not buildable at the moment.** The `aci_edge_sandboxes` crate this sidecar was built
-> on was removed upstream; the sidecar is being ported onto the `nvx` library in `nvx-rs`
-> (`tools/nvxd/reference/` keeps the removed control-client sources for that port). The text
-> below describes the sidecar as it was before the port.
-
+> **Status: scaffold on the `nvx` library.** The sidecar now drives the VM through `nvx` (the
+> supervisor, sessions and execution engine, as `tests/runtime-adapter` does) with the runtime
+> adapter's guest agent. Working: `ready`, `probe` with the real 128 MiB boot probe and its cache,
+> `session.open`/`session.close` (one shared VM), `exec` with streamed stdout/stderr, backpressure
+> and exit events, `diagnostics`, `shutdown`. Every other operation answers
+> `E_NVX_NOT_YET_SUPPORTED`: request limits, OOM attribution, fair run slots, TTL, port
+> operations, memory trim, session isolation and workspace mounts, whose previous implementation
+> is in `reference/` (`server_old.rs` and the control client). Not wired to the engine yet: the
+> command line takes `--artifacts DIR --guest-agent PATH` instead of the engine's explicit asset
+> paths.
+>
+> Build: `cargo build --release` here; the guest agent is built from `tests/runtime-adapter`
+> (`--features guest --target x86_64-unknown-linux-musl --bin runtime-adapter-guest`, linker
+> `rust-lld`, which works from Windows without WSL or Docker; see the `sidecar` job in
+> `.github/workflows/fork-ci.yml`). End-to-end check: `python tests/scaffold_e2e.py` and
+> `tests/scaffold_backpressure.py` (arguments in their headers).
+>
+> Known gaps of the scaffold: the adapter's host framing and guest agent are reused (a test
+> crate, not a stable API); programs are resolved as `/usr/bin/<name>` on the host side;
+> the outbound counters mark `broken` on flow-control refusals.
 
 `nvxd` is the NVX sidecar. It owns the stdio frame protocol,
 session lifecycle, live-share reconciliation, and the OpenVMM-backed execution

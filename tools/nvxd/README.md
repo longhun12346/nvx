@@ -1,6 +1,6 @@
 # nvxd
 
-> **Status: ported to the `nvx` library, partly.** The sidecar drives the VM through `nvx` (the
+> **Status: ported to the `nvx` library.** The sidecar drives the VM through `nvx` (the
 > supervisor, sessions and execution engine, as `tests/runtime-adapter` does) with the runtime
 > adapter's guest agent. Working, with the engine's protocol and launch arguments unchanged:
 > `ready`, `probe` with the real 128 MiB boot probe and its cache, several sessions on one shared
@@ -31,8 +31,23 @@
 > the OOM killer. The time daemon NVX's `/init` starts publishes its status at `/run/nvx/time`
 > inside every execution.
 >
-> Still answering `E_NVX_NOT_YET_SUPPORTED` (their previous implementation is in `reference/`):
-> session isolation, and the network policy (the arguments are accepted and ignored with a message).
+> Session isolation works (`--session-isolation`): a keeper process per session with its own mount, PID, IPC, UTS
+> and network namespaces, scoped mounts and strict revocation, implemented in the guest agent (kinds 106 to 112 of
+> its framing; the contract and the tests that prove it are in `../nvxd-guest/ISOLATION.md`).
+>
+> The network policy works: `--network allow|deny`, `--private-networks allow|deny` and `--ingress
+> host-loopback|none` become a `SandboxNetwork` on the guest address `10.0.0.2/24` (`src/network.rs`). Egress is
+> open except the private and link-local ranges unless `--private-networks allow` (the guest's gateway is the one
+> exception, for DNS); the host's own loopback is closed unless ingress publishes the guest's listeners. The guest
+> agent writes the DNS servers of the kernel command line into the assembled root.
+>
+> Cold start: the first `session.open` of a fresh sidecar, which boots the VM and mounts the workspace, takes about
+> 0.24 s on the Win11 development host (the previous stack took 0.19 s; before the prewarm it was 0.69 s) and about
+> 0.8 s on the nested Windows 10 VM (nested, not physical; the previous stack 0.59 s). The digests of the files a
+> launch uses, the staged EROFS image and the composed initramfs are computed once per process, on parallel threads,
+> and prewarming starts with the process; nothing is cached across processes, so every launch re-verifies the
+> files it uses (about 85 ms of the remaining cost, deliberately kept). `NVXD_TRACE_PHASES=1` prints the phase
+> timings and `tests/cold_start.py` measures 12 fresh starts.
 >
 > Build: `cargo build --release` here; the guest agent is built from `tools/nvxd-guest` (a fork-owned copy of upstream's runtime adapter)
 > (`--features guest --target x86_64-unknown-linux-musl --bin nvxd-guest`, linker
@@ -48,14 +63,15 @@
 session lifecycle, live-share reconciliation, and the OpenVMM-backed execution
 adapter used by the Windows sandbox host.
 
-The crate is intentionally maintained in the NVX fork because it is coupled to
-the `aci_edge_sandboxes` and OpenVMM APIs. It is a standalone Cargo package and
-must build from a clean NVX checkout with `cargo build --locked`.
+The crate is maintained in the NVX fork because it is coupled to the fork's OpenVMM
+(live virtio-fs share control, the Windows 10 path) and to the fork's guest agent. It is a standalone
+Cargo package that depends on the `nvx` crate by path and must build from a clean NVX checkout
+with `cargo build --locked`.
 
 The sidecar keeps the v1 product contract explicit:
 
 - one VM per sidecar, shared by its logical sessions; guest size is fixed at boot,
-  accepts 1024–4096 MiB, and the engine chooses a tier before creating the VM;
+  accepts 512–4096 MiB (1024 by default), and the engine chooses a tier before creating the VM;
 - `hardTimeoutSec` maps to guest execution timeout;
 - up to eight concurrent executions by default, with per-execution memory, CPU,
   and process limits when the guest advertises the required features;
@@ -80,17 +96,20 @@ content, while private HOME/tmp and mount permissions remain per session.
 This requires the matching OpenVMM revision from the dependency lock.
 
 The engine's `verify-nvx-vm.ps1 -Stage P8` runs the required integration matrix,
-including fresh diagnostic guest probes, external cleanup fault injection,
-and the four-tier capacity matrix. For EROFS, pass the stage initramfs as
-`-Initrd` and the locked read-only layer as `-Distro`. The gate passes
-`NVX_DISTRO` to every test; tests pass explicit artifact paths to the sidecar
+including the guest probe, external cleanup fault injection, and the four-tier
+capacity matrix. The inputs are NVX's base initramfs (`-Initrd`), the guest agent
+(`-GuestAgent`), the locked read-only layer (`-Distro`), the kernel and OpenVMM. The
+gate passes `NVX_OPENVMM`, `NVX_KERNEL`, `NVX_INITRD`, `NVX_GUEST_AGENT` and
+`NVX_DISTRO` to every suite; tests pass explicit artifact paths to the sidecar
 instead of discovering other files from the checkout. Standalone Python suites
-use the same environment variable. Leave it unset for full-initramfs tests.
+read the same variables.
 
-Diagnostic fault observers live in disposable copies of the runtime: appended
-archives for full initramfs, or rebuilt EROFS layers paired with an unchanged
-stage image. The cleanup observer preserves the production agent's bytes.
-Diagnostic helpers are not part of the production runtime.
+The guest probe (`tests/guest_probe_report.py`) builds `nvxd-guest-probe` from the
+`session-probe` feature as a static musl binary and boots it from a disposable copy
+of the initramfs. The cleanup fault injection (`tests/isolated_cleanup_faults.py`,
+`--diagnostic-agent`) uses a second agent built with the `fault-observer` feature;
+the production agent is built without it. Diagnostic helpers are not part of the
+production runtime.
 
 ## Diagnostics
 

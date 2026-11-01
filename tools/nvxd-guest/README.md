@@ -12,6 +12,14 @@ Differences from upstream's copy (carry these over by diff when the adapter chan
 - `src/frame.rs`, `src/worker.rs`: the messages `MountAdd`, `MountRemove`, `Mounted` and
   `MountFailed` (kinds 100 to 103, clear of the codes upstream assigns next) and their handling after
   the start, so the sidecar can bind and unbind children of the live host export.
+- `ExecLimits` (104) and `ExecOom` (105): per-execution `memory.max`, `memory.swap.max`, `cpu.max` and
+  `pids.max` in the execution's cgroup, and the `oom` / `vmOom` attribution; the agent exempts itself from
+  the OOM killer and the workload cgroup is sized from the guest's RAM.
+- `src/session/` and kinds 106 to 112: session isolation (keeper, namespaces, scoped mounts, strict
+  revocation); the contract is `ISOLATION.md`.
+- `src/resolver.rs`: writes the DNS servers of the kernel command line into the assembled root.
+- `src/bin/nvxd-guest-probe.rs` (feature `session-probe`): the guest probe of the P8 gate; the feature
+  `fault-observer` builds the diagnostic agent of the cleanup fault injection.
 - `src/bin/nvxd-guest.rs`: the binary name in the usage text.
 
 Build (static `x86_64-unknown-linux-musl`, from Windows with `rust-lld`, no WSL or Docker, about ten

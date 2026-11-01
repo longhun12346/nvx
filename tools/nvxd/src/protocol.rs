@@ -218,7 +218,7 @@ pub fn request_exec_limits(
 
 /// Guest RAM accepted per session.
 ///
-/// The floor is measured on the EROFS runtime (thin stage initramfs + read-only EROFS distro,
+/// The floor is measured on the EROFS runtime (base initramfs with the guest agent + read-only EROFS distro,
 /// so the root filesystem is not held in RAM). Python and Node boot and run from 256 MiB; a
 /// 192 MiB Node allocation needs 320 MiB; the eight-session workload (eight resident 32 MiB
 /// tasks, plus 8 MiB private tmpfs each in isolated mode) fails at 320 MiB shared and 384 MiB

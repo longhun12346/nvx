@@ -2,7 +2,7 @@
 
 The sidecar can run the shared VM in isolated mode (`--session-isolation`, `sessionIsolation` at
 `session.open`). This file is the contract the guest side implements, taken from the previous C
-implementation (`reference/nvx-guest-session.h.txt` and `git show 4f19a650:guest/common/nvx-managed-agent.c`)
+implementation (`git show 4f19a650:guest/common/nvx-guest-session.h` and `git show 4f19a650:guest/common/nvx-managed-agent.c`)
 and from the P8 suites that prove it. Each guarantee names the test that shows it.
 
 ## Mechanism

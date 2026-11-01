@@ -13,8 +13,8 @@
 //!   to it any more.
 //!
 //! The VM itself is [`crate::vm`]: NVX's supervisor and execution engine with the sidecar's guest
-//! agent. TODO (next steps of the migration): per-execution limits and OOM attribution, workspace
-//! mounts, session isolation, network policy; their code is in `reference/server_old.rs`.
+//! agent; mounts, limits, OOM attribution, session isolation and the network policy are in the modules
+//! next to it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -34,7 +34,6 @@ use crate::registry::{Accept, Cancel, Closed, Registry, Terminal};
 use crate::vm::{Event, ExitOutcome, Resources, Vm, VmConfig};
 use crate::winmem::VmmMemory;
 
-pub const NOT_YET_SUPPORTED: &str = "E_NVX_NOT_YET_SUPPORTED";
 /// How long `probe` waits for the capability check unless the caller names a bound.
 const PROBE_WAIT: Duration = Duration::from_secs(30);
 /// How long a close waits for the session's running executions before it reports `closing`.

@@ -35,4 +35,4 @@ The sidecar (`tools/nvxd`) uses the same crate with the `host` feature for its c
 configuration and execution messages, writes a copy of NVX's initramfs that holds the agent,
 stages the EROFS image as the root and boots it with a RAM upper.
 
-The sources of the previous C implementation of the session isolation are in `reference/`.
+The previous C implementation of the session isolation is in git history (`git show 4f19a650:guest/common/nvx-managed-agent.c`).

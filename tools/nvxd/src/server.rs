@@ -181,6 +181,7 @@ pub struct Context {
     max_sessions: usize,
     max_running: usize,
     ingress_host_loopback: bool,
+    network_egress: bool,
     /// Whether sessions are isolated from each other inside the VM; fixed for the sidecar's life.
     session_isolation: bool,
     /// Identities of guest sessions, never reused within a sidecar.
@@ -216,6 +217,7 @@ pub struct Settings {
     pub max_sessions: usize,
     pub max_running: usize,
     pub ingress_host_loopback: bool,
+    pub network_egress: bool,
     /// Deployment-wide limits of each execution, 0 for none: memory in MiB, CPU in percent of one
     /// core, and processes.
     pub exec_memory_mb: u64,
@@ -241,6 +243,7 @@ impl Context {
             max_sessions: settings.max_sessions,
             max_running,
             ingress_host_loopback: settings.ingress_host_loopback,
+            network_egress: settings.network_egress,
             session_isolation: settings.session_isolation,
             guest_session_counter: Mutex::new(0),
             closing_guest_sessions: AtomicUsize::new(0),
@@ -380,7 +383,7 @@ impl Context {
         match text("op") {
             protocol::OP_PROBE => self.probe(head),
             protocol::OP_SESSION_OPEN => {
-                validate_session_policy(head, self.session_isolation)?;
+                validate_session_policy(head, self.session_isolation, self.network_egress)?;
                 let memory = match head.get("memoryMiB") {
                     None => protocol::DEFAULT_MEMORY_MIB,
                     Some(value) => number(Some(value)).ok_or_else(|| {
@@ -612,7 +615,7 @@ impl Context {
                 *counter += 1;
                 *counter
             };
-            if let Err(problem) = vm.vm.session_open(id, &workspace_guest, false) {
+            if let Err(problem) = vm.vm.session_open(id, &workspace_guest, self.network_egress) {
                 let lost = vm_is_gone(&problem);
                 self.rollback_open_session(&vm, name);
                 if lost {
@@ -1644,7 +1647,7 @@ impl Context {
 /// Refuses, before any VM boot, a session policy that does not match how this sidecar was started:
 /// the isolation mode is a startup property, the network is the VM's (none, here), and the kernel is
 /// shared.
-fn validate_session_policy(head: &Value, isolated: bool) -> Result<(), Failure> {
+fn validate_session_policy(head: &Value, isolated: bool, network_allowed: bool) -> Result<(), Failure> {
     // The C++ side writes scalar JSON values as strings.
     let boolean = |value: &Value| match value {
         Value::Bool(value) => Some(*value),
@@ -1661,12 +1664,14 @@ fn validate_session_policy(head: &Value, isolated: bool) -> Result<(), Failure> 
         }
     }
     if let Some(network) = head.get("networkPolicy") {
-        // The network is a property of the VM, not of one session, and this VM has none: an isolated
-        // session has its own empty namespace. Asking for another policy is refused, not granted.
-        if !isolated || network.as_str() != Some("deny") {
+        // The network is a property of the VM, not of one session: an isolated session either has
+        // its own empty namespace (the VM has no network) or shares the VM's (it has one). Asking
+        // for the other is refused instead of being silently granted.
+        let supported = if network_allowed { "allow" } else { "deny" };
+        if !isolated || network.as_str() != Some(supported) {
             return Err(fail(
                 "E_SESSION_NETWORK_UNSUPPORTED",
-                "isolated sessions here support only networkPolicy=deny",
+                format!("isolated sessions here support only networkPolicy={supported}"),
             ));
         }
     }

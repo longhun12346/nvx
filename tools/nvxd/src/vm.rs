@@ -78,6 +78,8 @@ pub struct VmConfig {
     pub generation: u64,
     /// The pipe name `Vm::launch` chooses for the export channel.
     pub control_pipe: String,
+    /// The VM's network device and policy, or `None` for a guest with loopback only.
+    pub network: Option<nvx::host::sandbox::SandboxNetwork>,
 }
 
 /// A request for the serving thread.
@@ -412,6 +414,7 @@ fn launch_and_serve(
     if let Some(export) = sharing.plan().map_err(|e| classify(&e))? {
         layered.share(export).map_err(|e| classify(&e))?;
     }
+    let mut layered = layered.with_network(config.network.clone());
     layered.check_command_line().map_err(|e| classify(&e))?;
     if let Some(parent) = config.store.parent() {
         std::fs::create_dir_all(parent)

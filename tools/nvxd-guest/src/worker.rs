@@ -1491,6 +1491,12 @@ impl RootOperations for LibraryRoot {
             timeout: config.device_timeout,
         };
         let root = root::assemble(&assembly).map_err(|error| error.to_string())?;
+        if let Ok(line) = fs::read_to_string(COMMAND_LINE) {
+            // A guest that cannot write its resolver still runs; names just do not resolve.
+            if let Err(error) = crate::resolver::write(root.path(), &line) {
+                eprintln!("nvxd-guest: cannot write the guest's resolver file: {error}");
+            }
+        }
         self.root = Some(Assembled::Cold(root));
         Ok(())
     }

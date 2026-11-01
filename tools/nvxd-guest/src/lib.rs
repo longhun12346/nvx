@@ -79,6 +79,7 @@ pub mod initramfs;
 #[cfg(feature = "host")]
 pub mod layered;
 pub mod probe;
+pub mod resolver;
 pub mod root;
 #[cfg(all(feature = "guest", target_os = "linux"))]
 pub mod session;

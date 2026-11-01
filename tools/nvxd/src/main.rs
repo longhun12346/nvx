@@ -10,6 +10,7 @@ mod capability;
 mod control;
 mod frame;
 mod live;
+mod network;
 mod plan;
 mod outbound;
 mod ports;
@@ -57,6 +58,8 @@ struct Args {
     max_queue: usize,
     max_running: usize,
     ingress_host_loopback: bool,
+    network_egress: bool,
+    private_networks_allow: bool,
     exec_memory_mb: u64,
     exec_cpu_percent: u64,
     exec_pids: u64,
@@ -82,8 +85,10 @@ fn parse_args() -> Result<Args, String> {
         capability_cache: default_cache(),
         max_sessions: 0,
         max_queue: registry::DEFAULT_QUEUE_DEPTH,
-        max_running: 1,
+        max_running: MAX_RUNNING,
         ingress_host_loopback: false,
+        network_egress: false,
+        private_networks_allow: false,
         exec_memory_mb: 0,
         exec_cpu_percent: 0,
         exec_pids: 0,
@@ -91,7 +96,7 @@ fn parse_args() -> Result<Args, String> {
         max_pending: DEFAULT_MAX_PENDING,
         work_workers: DEFAULT_WORK_WORKERS,
         session_ttl_secs: 0,
-        idle_trim_secs: 0,
+        idle_trim_secs: 30,
         session_isolation: false,
     };
     let mut iter = std::env::args().skip(1);
@@ -125,11 +130,18 @@ fn parse_args() -> Result<Args, String> {
                 "none" => args.ingress_host_loopback = false,
                 other => return Err(format!("--ingress takes host-loopback or none, not {other:?}")),
             },
-            // Accepted so the engine's argument list works unchanged; not served by this build yet.
-            "--network" | "--private-networks" => {
-                let v = value()?;
-                if v != "deny" {
-                    eprintln!("nvxd: {flag} {v} is not served by this build yet (no guest network)");
+            "--network" => {
+                args.network_egress = match value()?.as_str() {
+                    "allow" => true,
+                    "deny" => false,
+                    other => return Err(format!("--network takes allow or deny, not {other:?}")),
+                }
+            }
+            "--private-networks" => {
+                args.private_networks_allow = match value()?.as_str() {
+                    "allow" => true,
+                    "deny" => false,
+                    other => return Err(format!("--private-networks takes allow or deny, not {other:?}")),
                 }
             }
             "--exec-memory-mb" => args.exec_memory_mb = number(value()?)?,
@@ -138,6 +150,9 @@ fn parse_args() -> Result<Args, String> {
             "--session-isolation" => args.session_isolation = true,
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if args.ingress_host_loopback && !args.network_egress {
+        return Err("--ingress host-loopback needs --network allow".to_string());
     }
     if args.max_running == 0 || args.max_running > MAX_RUNNING {
         return Err(format!("--max-running must be within 1..={MAX_RUNNING}"));
@@ -210,6 +225,7 @@ fn run() -> Result<(), String> {
         anchor: args.state_dir.join("export-anchor"),
         generation: 0,
         control_pipe: String::new(),
+        network: network::network(args.network_egress, args.ingress_host_loopback, args.private_networks_allow)?,
     };
     let provenance = json!({
         "sidecar": env!("CARGO_PKG_VERSION"),
@@ -235,6 +251,7 @@ fn run() -> Result<(), String> {
         max_sessions: args.max_sessions,
         max_running: args.max_running,
         ingress_host_loopback: args.ingress_host_loopback,
+        network_egress: args.network_egress,
         exec_memory_mb: args.exec_memory_mb,
         exec_cpu_percent: args.exec_cpu_percent,
         exec_pids: args.exec_pids,

@@ -24,8 +24,8 @@
 > accepted and ignored with a message). The guest agent does not start NVX's time daemon yet, so
 > the guest clock is not synchronized.
 >
-> Build: `cargo build --release` here; the guest agent is built from `tests/runtime-adapter`
-> (`--features guest --target x86_64-unknown-linux-musl --bin runtime-adapter-guest`, linker
+> Build: `cargo build --release` here; the guest agent is built from `tools/nvxd-guest` (a fork-owned copy of upstream's runtime adapter)
+> (`--features guest --target x86_64-unknown-linux-musl --bin nvxd-guest`, linker
 > `rust-lld`, which works from Windows without WSL or Docker; see the `sidecar` job in
 > `.github/workflows/fork-ci.yml`). Launch: the engine's `--openvmm --kernel --initrd --distro
 > --cpu-profile ...` plus `--guest-agent PATH` (or `nvxd-guest` next to the executable); `--artifacts

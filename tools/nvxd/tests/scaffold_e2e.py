@@ -1,7 +1,7 @@
 """End-to-end check of the scaffold sidecar: probe, session.open, large output, a failing command,
 session.close, shutdown. Prints the timings next to the old baselines.
 
-    python scaffold_e2e.py --nvxd nvxd.exe --artifacts DIR --guest-agent runtime-adapter-guest
+    python scaffold_e2e.py --nvxd nvxd.exe --artifacts DIR --guest-agent nvxd-guest
 """
 
 import argparse

@@ -10,9 +10,9 @@ publish = false
 # The sidecar is an adapter of the NVX runtime, built on the `nvx` crate like
 # tests/runtime-adapter: path dependencies, default features off.
 nvx = { path = "../../nvx-rs", default-features = false, features = ["host"] }
-# Until the sidecar has a guest agent and host framing of its own, it reuses the runtime
-# adapter's: the control framing, the root configuration, and the execution messages.
-runtime-adapter = { path = "../../tests/runtime-adapter", default-features = false, features = ["host"] }
+# The control framing, the root configuration and the execution messages come from the sidecar's own
+# copy of upstream's runtime adapter (tools/nvxd-guest, library name runtime_adapter).
+runtime-adapter = { package = "nvxd-guest", path = "../nvxd-guest", default-features = false, features = ["host"] }
 serde_json = "1.0.120"
 sha2 = "0.10"
 

@@ -73,14 +73,14 @@ jobs:
       # The guest agent the sidecar boots is a static musl executable; building it from Windows
       # needs only rust-lld, no Linux tools.
       - name: Build the guest agent (static musl)
-        working-directory: tests/runtime-adapter
+        working-directory: tools/nvxd-guest
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -Clinker-flavor=ld.lld -Clink-self-contained=yes
         run: |
           set -euo pipefail
           rustup target add --toolchain "${{ steps.rust.outputs.channel }}" x86_64-unknown-linux-musl
-          cargo "+${{ steps.rust.outputs.channel }}" build --locked --release --features guest             --target x86_64-unknown-linux-musl --bin runtime-adapter-guest
+          cargo "+${{ steps.rust.outputs.channel }}" build --locked --release --features guest             --target x86_64-unknown-linux-musl --bin nvxd-guest
 
       # The crate was not formatted or linted before this workflow existed, so these two report
       # without failing the run until the existing findings are cleaned up in a commit of their own.

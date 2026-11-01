@@ -31,7 +31,7 @@ use crate::plan;
 use crate::ports;
 use crate::protocol;
 use crate::registry::{Accept, Cancel, Closed, Registry, Terminal};
-use crate::vm::{Event, ExitOutcome, Vm, VmConfig};
+use crate::vm::{Event, ExitOutcome, Resources, Vm, VmConfig};
 use crate::winmem::VmmMemory;
 
 pub const NOT_YET_SUPPORTED: &str = "E_NVX_NOT_YET_SUPPORTED";
@@ -134,6 +134,8 @@ struct Spec {
     cwd: Option<String>,
     env: Vec<(String, String)>,
     timeout: Option<Duration>,
+    /// The limits of the execution: the deployment's, overridden field by field by the request's.
+    resources: Resources,
     /// The mounts the request asked for, applied before the execution runs; `None` when the
     /// request carried none, which leaves the session's mounts as they are.
     mounts: Option<Vec<plan::Mount>>,
@@ -177,6 +179,8 @@ pub struct Context {
     max_sessions: usize,
     max_running: usize,
     ingress_host_loopback: bool,
+    /// Deployment limits of each execution (memory MiB, CPU percent, pids), 0 for none.
+    exec_defaults: (u64, u64, u64),
     /// Ports `port.allocate` handed out lately, so concurrent callers do not get the same one.
     allocated_ports: Mutex<std::collections::VecDeque<u16>>,
     /// Whether this machine can boot the VM at all, learned by booting a small one once.
@@ -202,6 +206,11 @@ pub struct Settings {
     pub max_sessions: usize,
     pub max_running: usize,
     pub ingress_host_loopback: bool,
+    /// Deployment-wide limits of each execution, 0 for none: memory in MiB, CPU in percent of one
+    /// core, and processes.
+    pub exec_memory_mb: u64,
+    pub exec_cpu_percent: u64,
+    pub exec_pids: u64,
 }
 
 impl Context {
@@ -222,6 +231,7 @@ impl Context {
             max_sessions: settings.max_sessions,
             max_running,
             ingress_host_loopback: settings.ingress_host_loopback,
+            exec_defaults: (settings.exec_memory_mb, settings.exec_cpu_percent, settings.exec_pids),
             allocated_ports: Mutex::new(std::collections::VecDeque::new()),
             capability,
             lifecycle: Mutex::new(()),
@@ -434,7 +444,7 @@ impl Context {
                 "parallelExec": self.max_running > 1,
                 "maxRunningPerVm": self.max_running,
                 "maxRunningPerSession": self.max_running,
-                "guestFeatures": 0,
+                "guestFeatures": 953,
                 "sessionIsolation": false,
             },
         }))
@@ -959,7 +969,7 @@ impl Context {
         vm.touch();
         let (arguments, environment) = guest_command(spec.argv, spec.env);
         let cwd = self.guest_cwd(&session, spec.cwd.as_deref()).map(String::into_bytes);
-        if let Err(message) = vm.vm.exec(id.to_owned(), arguments, cwd, environment, spec.timeout) {
+        if let Err(message) = vm.vm.exec(id.to_owned(), arguments, cwd, environment, spec.timeout, spec.resources) {
             self.inner.lock().unwrap().waiters.remove(id);
             self.finish_and_emit(id, Terminal::new("failed", None, message.clone()));
             if vm_is_gone(&message) {
@@ -1110,15 +1120,20 @@ impl Context {
             Some(id) if !id.is_empty() => id.to_owned(),
             _ => format!("ex-{}-{:08x}", self.runtime_prefix, self.next_id()),
         };
-        // TODO(4b): per-execution limits and their enforcement in the guest agent.
-        if head
+        // The deployment's limits apply to every execution; a nonzero field of the request's own
+        // `limits` replaces the deployment's value for that field.
+        let requested = head
             .get("limits")
             .and_then(Value::as_object)
             .and_then(protocol::request_exec_limits)
-            .is_some()
-        {
-            return Err(fail(NOT_YET_SUPPORTED, "per-execution limits are not ported to the new guest agent yet"));
-        }
+            .unwrap_or_default();
+        let (default_memory_mb, default_cpu, default_pids) = self.exec_defaults;
+        let memory_mb = if requested.mem_mb > 0 { u64::from(requested.mem_mb) } else { default_memory_mb };
+        let resources = Resources {
+            memory_bytes: memory_mb * 1024 * 1024,
+            cpu_percent: if requested.cpu_percent > 0 { u64::from(requested.cpu_percent) } else { default_cpu },
+            pids: if requested.pids_max > 0 { u64::from(requested.pids_max) } else { default_pids },
+        };
         if let Some(desired) = &desired {
             let inner = self.inner.lock().unwrap();
             if let Some(info) = inner.sessions.get(name) {
@@ -1141,7 +1156,7 @@ impl Context {
         match accepted {
             Accept::Queued { position } => {
                 let mut inner = self.inner.lock().unwrap();
-                inner.specs.insert(exec_id.clone(), Spec { argv, cwd, env, timeout, mounts: desired });
+                inner.specs.insert(exec_id.clone(), Spec { argv, cwd, env, timeout, resources, mounts: desired });
                 if let Some(info) = inner.sessions.get_mut(name) {
                     info.last_activity = Instant::now();
                 }
@@ -1552,7 +1567,7 @@ fn terminal_of(outcome: ExitOutcome, cancelled: bool) -> Terminal {
     }
     match outcome.kind {
         "exited" => Terminal::new("exited", outcome.code.map(|code| code as i32), ""),
-        "signaled" => Terminal::new("signaled", outcome.code.map(|code| code as i32), ""),
+        "signaled" => Terminal::new("signaled", outcome.code.map(|code| code as i32), outcome.detail),
         "timeout" => Terminal::new("timedOut", None, ""),
         "cancelled" => Terminal::new("cancelled", None, ""),
         _ => Terminal::new("failed", None, "the execution was lost with its VM"),

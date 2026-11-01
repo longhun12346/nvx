@@ -57,6 +57,9 @@ struct Args {
     max_queue: usize,
     max_running: usize,
     ingress_host_loopback: bool,
+    exec_memory_mb: u64,
+    exec_cpu_percent: u64,
+    exec_pids: u64,
     outbound_capacity: usize,
     max_pending: usize,
     work_workers: usize,
@@ -80,6 +83,9 @@ fn parse_args() -> Result<Args, String> {
         max_queue: registry::DEFAULT_QUEUE_DEPTH,
         max_running: 1,
         ingress_host_loopback: false,
+        exec_memory_mb: 0,
+        exec_cpu_percent: 0,
+        exec_pids: 0,
         outbound_capacity: outbound::DEFAULT_CAPACITY,
         max_pending: DEFAULT_MAX_PENDING,
         work_workers: DEFAULT_WORK_WORKERS,
@@ -124,12 +130,9 @@ fn parse_args() -> Result<Args, String> {
                     eprintln!("nvxd: {flag} {v} is not served by this build yet (no guest network)");
                 }
             }
-            "--exec-memory-mb" | "--exec-cpu-percent" | "--exec-pids" => {
-                let v = number(value()?)?;
-                if v > 0 {
-                    eprintln!("nvxd: {flag} {v} is not enforced by this build yet");
-                }
-            }
+            "--exec-memory-mb" => args.exec_memory_mb = number(value()?)?,
+            "--exec-cpu-percent" => args.exec_cpu_percent = number(value()?)?,
+            "--exec-pids" => args.exec_pids = number(value()?)?,
             "--session-isolation" => {
                 return Err("--session-isolation is not served by this build yet".to_owned());
             }
@@ -231,6 +234,9 @@ fn run() -> Result<(), String> {
         max_sessions: args.max_sessions,
         max_running: args.max_running,
         ingress_host_loopback: args.ingress_host_loopback,
+        exec_memory_mb: args.exec_memory_mb,
+        exec_cpu_percent: args.exec_cpu_percent,
+        exec_pids: args.exec_pids,
     };
     let context = Arc::new(Context::new(config, provenance, Arc::clone(&writer), settings, capability));
     // Find out whether this machine can boot the VM while the caller is still starting up, so its

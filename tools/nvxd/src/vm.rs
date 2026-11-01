@@ -88,6 +88,7 @@ pub enum Command {
         working_directory: Option<Vec<u8>>,
         environment: Vec<Vec<u8>>,
         timeout: Option<Duration>,
+        resources: Resources,
         reply: Sender<Result<(), String>>,
     },
     /// Binds a child of the host export at a target in the guest root.
@@ -98,6 +99,23 @@ pub enum Command {
     Cancel { id: String },
     /// Ends the VM.
     Stop,
+}
+
+/// The resource limits of one execution as the guest applies them; 0 in a field means none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Resources {
+    /// The most memory the execution's processes use together, in bytes.
+    pub memory_bytes: u64,
+    /// The share of one processor, in percent (it may exceed 100).
+    pub cpu_percent: u64,
+    /// The most processes and threads.
+    pub pids: u64,
+}
+
+impl Resources {
+    fn any(&self) -> bool {
+        self.memory_bytes > 0 || self.cpu_percent > 0 || self.pids > 0
+    }
 }
 
 /// What the serving thread reports about an execution.
@@ -124,6 +142,9 @@ pub struct ExitOutcome {
     pub truncated: bool,
     /// Why the program did not start, if it did not.
     pub launch_failure: Option<String>,
+    /// `oom` when the kernel killed the execution because it reached its own memory limit, `vmOom`
+    /// when it did because the guest ran out of memory, empty otherwise.
+    pub detail: &'static str,
 }
 
 /// A running VM: the channel to its serving thread and the thread.
@@ -183,6 +204,7 @@ impl Vm {
         working_directory: Option<Vec<u8>>,
         environment: Vec<Vec<u8>>,
         timeout: Option<Duration>,
+        resources: Resources,
     ) -> Result<(), String> {
         let (reply, answer) = mpsc::channel();
         self.commands
@@ -192,6 +214,7 @@ impl Vm {
                 working_directory,
                 environment,
                 timeout,
+                resources,
                 reply,
             })
             .map_err(|_| "the VM is gone".to_owned())?;
@@ -313,6 +336,13 @@ fn serve(
     }
 }
 
+/// Guest RAM kept out of the executions' shared cgroup: the kernel, the agent, the page tables and
+/// the runtime files.
+const WORKLOAD_RESERVE_MIB: u64 = 96;
+
+/// The most processes all executions together may have; the VM's own process limit is the bound.
+const WORKLOAD_PIDS_MAX: u64 = 32768;
+
 fn launch_and_serve(
     config: &VmConfig,
     commands: &Receiver<Command>,
@@ -326,6 +356,13 @@ fn launch_and_serve(
         .map_err(|e| classify(&e))?;
     // The identity of every execution is the sandbox's: the start names none.
     layered.config.workload_identity = Some(nvx::host::sandbox::DEFAULT_WORKLOAD_IDENTITY);
+    // The guest's defaults cap all executions together at 128 MiB and 128 processes. The engine's
+    // contract is that the VM's memory is the only shared bound, so the workload cgroup gets the
+    // guest's RAM less a reserve for the kernel, the agent and the runtime files; an execution
+    // that needs less asks for its own limit.
+    layered.config.workload_memory_max =
+        Some((u64::from(config.memory_mib).saturating_sub(WORKLOAD_RESERVE_MIB)).max(64) << 20);
+    layered.config.workload_pids_max = Some(WORKLOAD_PIDS_MAX);
     let mut sharing = HostFsSharing::default();
     std::fs::create_dir_all(&config.anchor)
         .map_err(|e| failure("E_BACKEND_START", format!("cannot create {}: {e}", config.anchor.display())))?;
@@ -476,6 +513,8 @@ struct Running {
     peer: Peer,
     finished: Option<Outcome>,
     chunk: usize,
+    /// What the guest said killed the execution, before its terminal record.
+    oom: &'static str,
 }
 
 impl Running {
@@ -486,6 +525,7 @@ impl Running {
             peer: Peer::new(start.key, start.limits, timers, now),
             finished: None,
             chunk: start.limits.chunk(),
+            oom: "",
         }
     }
 
@@ -572,7 +612,7 @@ fn pump(client: &mut Client, commands: &Receiver<Command>, events: &impl Fn(Even
                         entry.peer.cancel(now);
                     }
                 }
-                Ok(Command::Exec { id, arguments, working_directory, environment, timeout, reply }) => {
+                Ok(Command::Exec { id, arguments, working_directory, environment, timeout, resources, reply }) => {
                     let key = Key::new(base.wrapping_add(next), identity.epoch);
                     next += 1;
                     let mut timers = Timers::new(EXEC_GRACE, EXEC_SETTLEMENT);
@@ -589,6 +629,20 @@ fn pump(client: &mut Client, commands: &Receiver<Command>, events: &impl Fn(Even
                     let answer = Start::decode(&start.encode())
                         .map_err(|e| e.problem().to_owned())
                         .and_then(|_| {
+                            // The limits go first: the guest keeps them for the start that follows.
+                            if resources.any() {
+                                let nl = char::from(10u8);
+                                let body = format!(
+                                    "{}{nl}{}{nl}{}{nl}{}",
+                                    key.id(),
+                                    resources.memory_bytes,
+                                    resources.cpu_percent,
+                                    resources.pids
+                                );
+                                client
+                                    .send(&Message::ExecLimits(body.into_bytes()), Some(Instant::now() + SESSION_TIMEOUT))
+                                    .map_err(|e| e.to_string())?;
+                            }
                             client
                                 .send(&Message::ExecStart(start.encode()), Some(Instant::now() + SESSION_TIMEOUT))
                                 .map_err(|e| e.to_string())
@@ -628,6 +682,19 @@ fn pump(client: &mut Client, commands: &Receiver<Command>, events: &impl Fn(Even
                     let _ = reply.send(Err(String::from_utf8_lossy(&body).into_owned()));
                 }
             }
+            Ok(Message::ExecOom(body)) => {
+                // The execution's id, a newline, then `oom` or `vmOom`, ahead of its terminal record.
+                let text = String::from_utf8_lossy(&body).into_owned();
+                if let Some((id, class)) = text.split_once(char::from(10u8)) {
+                    if let Some(entry) = id.parse::<u64>().ok().and_then(|id| running.get_mut(&id)) {
+                        entry.oom = match class {
+                            "oom" => "oom",
+                            "vmOom" => "vmOom",
+                            _ => "",
+                        };
+                    }
+                }
+            }
             Ok(message) => {
                 if let Some(Ok(decoded)) = GuestMessage::decode(&message) {
                     if let Some(entry) = running.get_mut(&decoded.key().id()) {
@@ -654,13 +721,13 @@ fn report(running: &mut BTreeMap<u64, Running>, events: &impl Fn(Event) -> bool)
     for id in done {
         if let Some(entry) = running.remove(&id) {
             if let Some(outcome) = entry.finished {
-                events(Event::Exit { id: entry.name, outcome: describe(&outcome) });
+                events(Event::Exit { id: entry.name, outcome: describe(&outcome, entry.oom) });
             }
         }
     }
 }
 
-fn describe(outcome: &Outcome) -> ExitOutcome {
+fn describe(outcome: &Outcome, oom: &'static str) -> ExitOutcome {
     let truncated = Stream::ALL.into_iter().any(|stream| outcome.is_truncated(stream));
     let launch_failure = outcome
         .launch_failure()
@@ -672,14 +739,15 @@ fn describe(outcome: &Outcome) -> ExitOutcome {
         (Some(Status::Signaled(signal)), _) => ("signaled", Some(i64::from(signal))),
         _ => ("lost", None),
     };
-    ExitOutcome { kind, code, truncated, launch_failure }
+    let detail = if kind == "signaled" { oom } else { "" };
+    ExitOutcome { kind, code, truncated, launch_failure, detail }
 }
 
 fn lose_all(running: &mut BTreeMap<u64, Running>, events: &impl Fn(Event) -> bool, detail: &str) {
     for (_, entry) in std::mem::take(running) {
         let _ = events(Event::Exit {
             id: entry.name,
-            outcome: ExitOutcome { kind: "lost", code: None, truncated: false, launch_failure: None },
+            outcome: ExitOutcome { kind: "lost", code: None, truncated: false, launch_failure: None, detail: "" },
         });
     }
     let _ = events(Event::Lost { detail: detail.to_owned() });

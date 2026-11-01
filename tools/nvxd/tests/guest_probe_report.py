@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
+import os
 import pathlib
 import hashlib
 import subprocess
 import time
-from runtime_assets import distro_path
 
 
 REQUIRED_CHECKS = {
@@ -69,25 +70,54 @@ def sha256(path):
     return hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
 
 
-def linux_path(path):
-    return subprocess.check_output(
-        ["wsl", "--exec", "wslpath", "-a", str(path.resolve())],
-        text=True, timeout=15).strip()
+GUEST_DIRECTORY = pathlib.Path(__file__).resolve().parents[2] / "nvxd-guest"
+TARGET = "x86_64-unknown-linux-musl"
+NUL = bytes(1)
+BOOT_SCRIPT = (
+    "#!/bin/sh\n"
+    "status=0\n"
+    "/p8-session-probe || status=$?\n"
+    'exec /sbin/nvx-exit "$status"\n'
+).encode()
 
 
-def probe_command(openvmm, kernel, diagnostic, diagnostic_distro=None):
-    cmdline = "nvx_exec=/p8-probe-boot"
-    if diagnostic_distro is not None:
-        cmdline += " nvx_overlay_upper=ramfs"
-    command = [
+def cpio_entry(name, data, mode):
+    encoded = name.encode() + NUL
+    fields = (0, mode, 0, 0, 1, 0, len(data), 0, 0, 0, 0, len(encoded), 0)
+    header = b"070701" + b"".join(b"%08X" % value for value in fields)
+    return (header + encoded + NUL * (-(110 + len(encoded)) % 4)
+            + data + NUL * (-len(data) % 4))
+
+
+def append_probe(base, probe, output):
+    entries = [("p8-session-probe", probe.read_bytes(), 0o100755),
+               ("p8-probe-boot", BOOT_SCRIPT, 0o100755)]
+    archive = b"".join(cpio_entry(*entry) for entry in entries)
+    archive += cpio_entry("TRAILER!!!", b"", 0)
+    archive += NUL * (-len(archive) % 512)
+    output.write_bytes(base.read_bytes() + gzip.compress(archive, mtime=0))
+
+
+def build_probe(log):
+    environment = dict(os.environ)
+    environment["CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"] = "rust-lld"
+    environment["CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS"] = (
+        "-Clinker-flavor=ld.lld -Clink-self-contained=yes")
+    subprocess.run(
+        ["cargo", "build", "--release", "--locked", "--features", "session-probe",
+         "--target", TARGET, "--bin", "nvxd-guest-probe"],
+        cwd=GUEST_DIRECTORY, env=environment, stdout=log, stderr=subprocess.STDOUT,
+        check=True, timeout=900)
+    return GUEST_DIRECTORY / "target" / TARGET / "release" / "nvxd-guest-probe"
+
+
+def probe_command(openvmm, kernel, diagnostic):
+    return [
         str(openvmm), "--single-process", "--machine", "microvm",
         "--processors", "2", "--hypervisor", "whp", "--cpu-profile", "host",
         "--memory", "1024M", "--kernel", str(kernel),
-        "--initrd", str(diagnostic), "--cmdline", cmdline,
+        "--initrd", str(diagnostic), "--cmdline", "nvx_exec=/p8-probe-boot",
     ]
-    if diagnostic_distro is not None:
-        command += ["--microvm-sandbox-block", f"distro:file:{diagnostic_distro},ro"]
-    return command
 
 
 def main() -> int:
@@ -103,26 +133,22 @@ def main() -> int:
         "runtime": args.initrd.resolve(),
         "kernel": args.repo / "build/vmlinux",
         "openvmm": args.repo / "openvmm/target/release/openvmm.exe",
-        "agent": args.repo / "guest/common/nvx-managed-agent.c",
-        "session": args.repo / "guest/common/nvx-guest-session.h",
-        "probe": args.repo / "scripts/guest_session_probe.c",
-        "builder": args.repo / "scripts/build_guest_session_probe.sh",
+        "agent": GUEST_DIRECTORY / "src/session/mod.rs",
+        "session": GUEST_DIRECTORY / "ISOLATION.md",
+        "probe": GUEST_DIRECTORY / "src/bin/nvxd-guest-probe.rs",
+        "builder": pathlib.Path(__file__).resolve(),
     }
-    distro = distro_path()
-    if distro:
-        inputs["distro"] = distro
-        inputs["erofsBuilder"] = args.repo / "scripts/diagnostic_erofs.sh"
+    for key, variable in (("kernel", "NVX_KERNEL"), ("openvmm", "NVX_OPENVMM"),
+                          ("runtime", "NVX_INITRD")):
+        if os.environ.get(variable):
+            inputs[key] = pathlib.Path(os.environ[variable]).resolve()
     hashes = {key: sha256(path) for key, path in inputs.items()}
     diagnostic = out / "probe.cpio.gz"
     with (out / "build.log").open("wb") as log:
-        subprocess.run(["wsl", "--exec", "sh", linux_path(inputs["builder"]),
-                        linux_path(args.initrd), linux_path(diagnostic),
-                        *([linux_path(distro)] if distro else [])],
-                       stdout=log, stderr=subprocess.STDOUT, check=True, timeout=120)
+        probe = build_probe(log)
+    append_probe(inputs["runtime"], probe, diagnostic)
     started = time.monotonic()
-    diagnostic_distro = pathlib.Path(str(diagnostic) + ".erofs") if distro else None
-    command = probe_command(
-        inputs["openvmm"], inputs["kernel"], diagnostic, diagnostic_distro)
+    command = probe_command(inputs["openvmm"], inputs["kernel"], diagnostic)
     with (out / "boot.log").open("wb") as log:
         # subprocess.run kills and waits for this specific process on timeout.
         result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=60)
@@ -139,7 +165,7 @@ def main() -> int:
         "passed": passed, "exitCode": result.returncode, "args": command,
         "elapsedSeconds": time.monotonic() - started, "sha256": hashes,
         "diagnosticSha256": sha256(diagnostic), "inputsUnchanged": stable,
-        "diagnosticDistroSha256": sha256(diagnostic_distro) if diagnostic_distro else None,
+        "probeBinarySha256": sha256(probe),
         "checks": found, "missing": missing,
     }
     (out / "result.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

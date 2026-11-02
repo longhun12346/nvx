@@ -16014,6 +16014,117 @@ class BuildTests(unittest.TestCase):
                 ubuntu.erofs_uuid(second_digest),
             )
 
+    @staticmethod
+    def _python_tree(root: Path, library_name: str) -> Path:
+        library = root / "usr" / "lib" / library_name
+        (library / "package").mkdir(parents=True)
+        (library / "os.py").write_text("PATH = 'os'\n", encoding="utf-8")
+        (library / "package" / "__init__.py").write_text(
+            "def value():\n    return 1\n", encoding="utf-8"
+        )
+        return library
+
+    def test_python_precompile_is_deterministic_unchecked_hash_bytecode(self):
+        if sys.version_info.releaselevel != "final":
+            self.skipTest("byte-compiling needs a final-release interpreter")
+        name = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        runs: list[dict[str, bytes]] = []
+        roots: list[str] = []
+        for _ in range(2):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                roots.append(str(root))
+                library = self._python_tree(root, name)
+                ubuntu.precompile_python(root)
+                runs.append(
+                    {
+                        path.relative_to(library).as_posix(): path.read_bytes()
+                        for path in sorted(library.rglob("*.pyc"))
+                    }
+                )
+        self.assertEqual(len(runs[0]), 2)
+        self.assertEqual(runs[0], runs[1])
+        for relative, data in runs[0].items():
+            with self.subTest(relative=relative):
+                # Bytes 4..8 are the flags: 0b01 is a hash-based file that is
+                # not checked against its source.
+                self.assertEqual(int.from_bytes(data[4:8], "little"), 0b01)
+        # The recorded source path is the one inside the guest, never the
+        # build directory.
+        os_module = runs[0][f"__pycache__/os.{sys.implementation.cache_tag}.pyc"]
+        guest_path = os.path.join(f"/usr/lib/{name}", "os.py")
+        self.assertIn(guest_path.encode(), os_module)
+        for run, root in zip(runs, roots, strict=True):
+            for data in run.values():
+                self.assertNotIn(root.encode(), data)
+
+    def _precompile_in_subprocess(
+        self, root: Path, *interpreter_flags: str, env: Mapping[str, str] | None = None
+    ) -> None:
+        code = (
+            "import sys; from pathlib import Path; "
+            "from nvx_tools import ubuntu; "
+            "ubuntu.precompile_python(Path(sys.argv[1]))"
+        )
+        scripts = Path(__file__).resolve().parent
+        environment = {**os.environ, "PYTHONPATH": str(scripts), **(env or {})}
+        subprocess.run(
+            [sys.executable, *interpreter_flags, "-c", code, str(root)],
+            check=True,
+            env=environment,
+        )
+
+    def test_python_precompile_ignores_the_build_optimization_level(self):
+        if sys.version_info.releaselevel != "final":
+            self.skipTest("byte-compiling needs a final-release interpreter")
+        name = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            library = self._python_tree(root, name)
+            self._precompile_in_subprocess(root, "-O")
+            names = sorted(path.name for path in library.rglob("*.pyc"))
+        tag = sys.implementation.cache_tag
+        self.assertEqual(names, [f"__init__.{tag}.pyc", f"os.{tag}.pyc"])
+
+    def test_python_precompile_ignores_the_build_cache_prefix(self):
+        if sys.version_info.releaselevel != "final":
+            self.skipTest("byte-compiling needs a final-release interpreter")
+        name = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            prefix = Path(temporary) / "host-cache"
+            library = self._python_tree(root, name)
+            self._precompile_in_subprocess(
+                root, env={"PYTHONPYCACHEPREFIX": str(prefix)}
+            )
+            self.assertEqual(len(list(library.rglob("*.pyc"))), 2)
+            # The interpreter that runs this build imports its own modules
+            # under the prefix; only the root's modules, which the prefix
+            # mirrors under the root's own path, must stay out of it.
+            leaked = [
+                p
+                for p in prefix.rglob("*.pyc")
+                if Path(temporary).name in p.relative_to(prefix).parts
+            ]
+            self.assertEqual(leaked, [])
+
+    def test_python_precompile_needs_the_matching_interpreter(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._python_tree(root, f"python3.{sys.version_info.minor + 1}")
+            with self.assertRaisesRegex(
+                common.ScriptError, "needs a final-release Python"
+            ):
+                ubuntu.precompile_python(root)
+
+    def test_python_precompile_ignores_a_root_without_python(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ubuntu.precompile_python(root)
+            (root / "usr" / "lib").mkdir(parents=True)
+            ubuntu.precompile_python(root)
+            self.assertEqual(sorted(root.rglob("*.pyc")), [])
+
     def test_ubuntu_prepare_root_normalizes_root_directory_mode(self):
         with tempfile.TemporaryDirectory() as temporary:
             temporary_root = Path(temporary)

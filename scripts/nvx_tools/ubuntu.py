@@ -776,14 +776,15 @@ def _validate_ubuntu_identity(root: Path) -> None:
 
 
 def precompile_python(root: Path) -> None:
-    """Byte-compiles the guest's Python standard library.
+    """Byte-compiles the Python standard library of the root, if it has one.
 
-    Maintainer scripts do not run, so the packages' own byte-compilation never
-    happens. Sandboxed workloads run unprivileged on a root they cannot write
-    to, so without these files every interpreter start recompiles the modules it
-    imports. Unchecked-hash files carry no timestamp, so the output is
-    deterministic. Bytecode is only valid for the interpreter's exact minor
-    version, so this runs only on a matching build interpreter.
+    The build never runs maintainer scripts, so the packages' own byte-compilation
+    does not happen. Workloads run unprivileged on a root they cannot write to,
+    so without these files every interpreter start recompiles the modules it
+    imports. Unchecked-hash files carry no timestamp and the recorded source
+    path is the path inside the guest rather than the build directory, which
+    keeps the output deterministic. Bytecode only fits the exact minor version
+    of the interpreter that wrote it, so the build interpreter must match.
     """
     libraries = sorted(
         path
@@ -791,19 +792,34 @@ def precompile_python(root: Path) -> None:
         if path.is_dir() and not path.is_symlink()
     )
     for library in libraries:
-        minor = tuple(int(part) for part in library.name.removeprefix("python").split("."))
-        if sys.version_info[:2] != minor or sys.version_info.releaselevel != "final":
+        major, minor = (int(part) for part in library.name[len("python") :].split("."))
+        if (
+            sys.version_info[:2] != (major, minor)
+            or sys.version_info.releaselevel != "final"
+        ):
             raise ScriptError(
                 f"byte-compiling {library.name} needs a final-release Python "
-                f"{minor[0]}.{minor[1]} build interpreter; this is {sys.version.split()[0]}"
+                f"{major}.{minor} build interpreter; this is {sys.version.split()[0]}"
             )
-        if not compileall.compile_dir(
-            str(library),
-            quiet=1,
-            force=True,
-            workers=1,
-            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
-        ):
+        # compileall follows the build interpreter's settings unless told
+        # otherwise: -O would write only *.opt-1.pyc files, which the guest's
+        # interpreter does not read, and a cache prefix would send the bytecode
+        # to a host directory instead of the root.
+        cache_prefix = sys.pycache_prefix
+        sys.pycache_prefix = None
+        try:
+            compiled = compileall.compile_dir(
+                str(library),
+                ddir=f"/usr/lib/{library.name}",
+                quiet=1,
+                force=True,
+                workers=1,
+                optimize=0,
+                invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+            )
+        finally:
+            sys.pycache_prefix = cache_prefix
+        if not compiled:
             raise ScriptError(f"failed to byte-compile {library.name}")
         for path in (*library.rglob("__pycache__"), *library.rglob("*.pyc")):
             path.chmod(0o755 if path.is_dir() else 0o644)

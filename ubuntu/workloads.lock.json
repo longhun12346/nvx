@@ -245,9 +245,17 @@
     },
     {
       "name": "plotille",
-      "version": "6.0.5",
-      "url": "https://files.pythonhosted.org/packages/08/b7/a098cacb7f81f617157cb9c9c7c5ac66b6ac886075722d443e8e25b5a4b8/plotille-6.0.5-py3-none-any.whl",
-      "sha256": "c35be42f8aa080853904d123894194a5ea7e095bdeb76d7b61fd41c89cdeaeee"
+      "version": "5.0.0",
+      "url": "https://files.pythonhosted.org/packages/8a/73/3f342572f7f916e387e546cc502d6cad35e7162ba0bcde203669e15aa3af/plotille-5.0.0.tar.gz",
+      "sha256": "99e5ca51a2e4c922ead3a3b0863cc2c6a9a4b3f701944589df10f42ce02ab3dc",
+      "wheel": {
+        "filename": "plotille-5.0.0-py3-none-any.whl",
+        "sha256": "12e24ca3edbaaf89ebac897f90878838a350dbcebc96e93863f98a067499bb68"
+      },
+      "buildWheel": {
+        "filename": "setuptools-78.1.1-py3-none-any.whl",
+        "sha256": "ad8a84f2a45275d5a399764185c8fcc07956905fb285b10776e7cd5114ce945d"
+      }
     },
     {
       "name": "prettytable",
@@ -440,5 +448,46 @@
     "version": "11.6.2",
     "url": "https://registry.npmjs.org/npm/-/npm-11.6.2.tgz",
     "sha256": "585f95094ee5cb2788ee11d90f2a518a7c9ef6e083fa141d0b63ca3383675a20"
+  },
+  "requirements": [
+    "pandas>=2.2,<3",
+    "numpy>=1.23,<3",
+    "scipy>=1.12,<2",
+    "scikit-learn>=1.4,<2",
+    "matplotlib>=3.10,<4",
+    "mplfinance==0.12.10b0",
+    "pyecharts>=2.0,<3",
+    "networkx>=3,<4",
+    "openpyxl>=3.1,<4",
+    "python-docx>=1.1,<2",
+    "python-pptx>=0.6,<2",
+    "pypdf>=4.0,<6",
+    "pdfplumber>=0.11,<1",
+    "pdf2image>=1.17,<2",
+    "pypdfium2>=4.30,<5",
+    "reportlab>=4.0,<5",
+    "pytesseract>=0.3,<1",
+    "Pillow>=10,<12",
+    "markitdown>=0.1,<1",
+    "rdkit>=2024.3",
+    "PyYAML>=6,<7",
+    "python-frontmatter>=1.3,<2",
+    "rich>=13,<15",
+    "plotille>=5,<6",
+    "requests",
+    "playwright>=1.40,<2"
+  ],
+  "node": {
+    "dependencies": {
+      "echarts": "^5",
+      "@antv/g2": "^5",
+      "pptxgenjs": "^3",
+      "react": "^18",
+      "react-dom": "^18",
+      "react-icons": "^5",
+      "sharp": "^0.33",
+      "oh-my-mermaid": "*"
+    },
+    "lockSha256": "ea83c128ff378533eac55f7fd21dfdb227c936f2185681cbaa14b93bf593e719"
   }
 }

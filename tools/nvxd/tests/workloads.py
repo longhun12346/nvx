@@ -17,6 +17,15 @@ import importlib, json, os, ssl, subprocess, urllib.request, warnings
 from pathlib import Path
 names = "pandas numpy scipy sklearn matplotlib mplfinance pyecharts networkx openpyxl docx pptx pypdf pdfplumber pdf2image pypdfium2 reportlab pytesseract PIL markitdown rdkit yaml frontmatter rich plotille requests playwright pip".split()
 for name in names: importlib.import_module(name)
+from importlib.metadata import version
+from pip._vendor.packaging.requirements import Requirement
+profile = json.loads(Path("/usr/share/nvx/workloads.json").read_text())
+for text in profile["requirements"]:
+    requirement = Requirement(text)
+    assert requirement.specifier.contains(version(requirement.name)), text
+import plotille
+assert version("plotille") == "5.0.0"
+assert plotille.plot([0,1,2],[0,1,4])
 assert ssl.create_default_context().cert_store_stats()["x509_ca"] > 50
 for url in ("https://example.com", "https://pypi.org/simple/", "https://github.com"):
     with urllib.request.urlopen(url, timeout=30) as r: assert r.status == 200
@@ -63,6 +72,49 @@ pdf[0].render(scale=1).to_pil().save("/workspace/pdf-preview.png")
 Path("/home/session/private-marker").write_text("private")
 print(json.dumps({"imports":names,"caCount":ssl.create_default_context().cert_store_stats()["x509_ca"],
                   "cpus":os.cpu_count(),"documents":True,"https":True,"venv":True}))
+'''
+
+NODE_WORKLOAD = r'''
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const { execFileSync } = require('node:child_process');
+(async () => {
+  const profile = JSON.parse(fs.readFileSync('/usr/share/nvx/workloads.json', 'utf8'));
+  const names = Object.keys(profile.node.dependencies);
+  for (const name of names) {
+    assert(name === 'oh-my-mermaid' ? await import(name) : require(name));
+  }
+  const echarts = require('echarts');
+  const chart = echarts.init(null, null, {renderer:'svg', ssr:true, width:480, height:320});
+  chart.setOption({xAxis:{type:'category',data:['A','B']}, yAxis:{}, series:[{type:'bar',data:[2,4]}]});
+  const svg = chart.renderToSVGString();
+  chart.dispose();
+  assert(svg.includes('<svg'));
+  fs.writeFileSync('/workspace/node-chart.svg', svg);
+  const sharp = require('sharp');
+  await sharp(Buffer.from(svg)).png().toFile('/workspace/node-chart.png');
+  assert.equal((await sharp('/workspace/node-chart.png').metadata()).width, 480);
+  assert.equal(typeof require('@antv/g2').Chart, 'function');
+  const React = require('react');
+  const {renderToStaticMarkup} = require('react-dom/server');
+  const {FaCheck} = require('react-icons/fa');
+  assert(renderToStaticMarkup(React.createElement(FaCheck)).includes('<svg'));
+  const PptxGenJS = require('pptxgenjs');
+  const pptx = new PptxGenJS();
+  pptx.addSlide().addText('NVX workload', {x:1,y:1,w:5,h:1});
+  await pptx.writeFile({fileName:'/workspace/node-test.pptx'});
+  assert(fs.statSync('/workspace/node-test.pptx').size > 1000);
+  assert(execFileSync('omm', ['--help'], {encoding:'utf8'}).includes('omm'));
+  fs.writeFileSync('/workspace/esm-check.mjs',
+    names.filter(name => name !== '@antv/g2')
+      .map(name => `import * as m${names.indexOf(name)} from ${JSON.stringify(name)};`).join('\n') +
+    '\nimport {createRequire} from "node:module";createRequire(import.meta.url)("@antv/g2");' +
+    '\nconsole.log("esm-ok");\n');
+  assert(execFileSync('node', ['/workspace/esm-check.mjs'], {encoding:'utf8'}).includes('esm-ok'));
+  fs.writeFileSync('/tmp/nvx-resolve.cjs', 'require("sharp");console.log("tmp-ok")');
+  assert(execFileSync('node', ['/tmp/nvx-resolve.cjs'], {encoding:'utf8'}).includes('tmp-ok'));
+  console.log(JSON.stringify({packages:names, sharp:true, echarts:true, pptx:true, react:true, esm:true}));
+})().catch(error => {console.error(error); process.exitCode=1;});
 '''
 
 STORAGE = r'''
@@ -119,6 +171,12 @@ def run(args, memory, output):
                             "argv":["python3","-c",script]},deadline)
                 sidecar.succeeded([name],deadline)
                 report[name] = json.loads(sidecar.stdout_of(name))
+            if memory >= 4096:
+                (root/"a"/"node-check.cjs").write_text(NODE_WORKLOAD, encoding="utf-8")
+                sidecar.ok({"id":20,"op":"exec","session":"a","execId":"node",
+                            "argv":["node","/workspace/node-check.cjs"]},deadline)
+                sidecar.succeeded(["node"],deadline)
+                report["node"] = json.loads(sidecar.stdout_of("node"))
             sidecar.ok({"id":30,"op":"exec","session":"b","execId":"isolation",
                         "argv":["python3","-c",
                                 "import os;assert not os.path.exists('/home/session/private-marker');"

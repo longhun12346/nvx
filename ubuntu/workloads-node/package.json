@@ -1,0 +1,15 @@
+{
+  "name": "nvx-guest-workloads",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "echarts": "^5",
+    "@antv/g2": "^5",
+    "pptxgenjs": "^3",
+    "react": "^18",
+    "react-dom": "^18",
+    "react-icons": "^5",
+    "sharp": "^0.33",
+    "oh-my-mermaid": "*"
+  }
+}

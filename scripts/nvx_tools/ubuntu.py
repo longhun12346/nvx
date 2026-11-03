@@ -1095,6 +1095,9 @@ def customization_files() -> tuple[Path, ...]:
         UbuntuBuildConstants.PACKAGE_LOCK,
         workloads.LOCK,
         workloads.REQUIREMENTS,
+        workloads.NODE_MANIFEST,
+        workloads.NODE_LOCK,
+        workloads.CHECK,
         Path(workloads.__file__),
         *guest_binary_source_files(),
     )

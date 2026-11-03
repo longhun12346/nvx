@@ -14,19 +14,38 @@ OpenSSL hash links are generated explicitly from the locked CA package. Fontconf
 can build its user cache on first use.
 
 `workloads.requirements.txt` describes the workload capability baseline.
-`workloads.lock.json` is the resolved Python 3.14 / Linux x86_64 wheel set and the
-bundled npm distribution. Every download is verified, and pip installs offline
-with `--require-hashes --no-deps --no-index`. Release builds do not resolve version
-ranges or build source distributions. Plotille uses the 6.x wheel distribution;
-its older 5.x releases have no wheel. Updating the lock requires reviewing the
-new versions and rerunning `tools/nvxd/tests/workloads.py` on a real VM.
+`workloads.lock.json` records the exact Python 3.14 / Linux x86_64 artifacts and
+the bundled npm distribution. Every download is verified, and pip installs offline
+with `--require-hashes --no-deps --no-index`. Plotille remains within the declared
+`>=5,<6` range: its pinned 5.0.0 source archive is built offline using the pinned
+setuptools wheel already supplied by the distro, and the resulting wheel must
+match its locked hash. Build tooling is not added to the runtime package set.
+The build checks every declared version range, the complete dependency closure
+and the absence of unrelated Python packages (pip is runtime infrastructure).
+
+`workloads-node/package.json` defines the eight direct Node workloads; its
+`package-lock.json` pins their transitive dependencies with registry URLs and
+SHA-512 integrity. A Node.js 22 build host downloads only Linux x64/glibc-compatible
+tarballs, then runs `npm ci --offline --ignore-scripts`. No lifecycle hooks, source
+compilation, browser downloads or additional top-level packages run or appear
+during installation. Sharp uses its locked Linux x64 native packages.
+Release builds never resolve floating ranges. Updating either profile requires
+reviewing the lock and rerunning `tools/nvxd/tests/workloads.py` on a real VM.
 
 Installed wheel metadata and licenses remain in
 `/usr/local/lib/python3.14/dist-packages`; npm and its bundled dependencies remain
-in `/usr/local/lib/node_modules/npm`. `/usr/share/nvx/workloads.json` and the EROFS
-manifest record the workload lock. Build-cache paths are removed from installed
+in `/usr/local/lib/node_modules/npm`. Node workloads live in
+`/usr/local/lib/nvx-workloads/node_modules`; `/node_modules` points to that directory,
+so CommonJS and ESM scripts in `/workspace` and `/tmp` find the supplied packages.
+Task-local packages take precedence. Workload CLI links, including `omm`, are in
+`/usr/local/bin`. `/usr/share/nvx/workloads.json` and the EROFS manifest record the
+workload lock. Build-cache paths are removed from installed
 metadata and script shebangs. Standard library and workload bytecode use guest
 paths and hash invalidation.
+
+Package-specific loading rules still apply. In particular, the locked G2 package's
+ESM entry targets bundlers; native Node scripts use its CommonJS entry, or
+`createRequire(import.meta.url)` from ESM. The profile does not add a bundler.
 
 The system Python remains externally managed. For additional dependencies, create
 a session-local environment, for example:

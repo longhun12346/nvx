@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 from urllib.parse import unquote, urlparse
 
 from .build_constants import BuildConstants
@@ -23,12 +24,23 @@ from .common import ScriptError, cache_root, download_verified
 
 LOCK = BuildConstants.REPO_ROOT / "ubuntu" / "workloads.lock.json"
 REQUIREMENTS = BuildConstants.REPO_ROOT / "ubuntu" / "workloads.requirements.txt"
+NODE_PROJECT = BuildConstants.REPO_ROOT / "ubuntu" / "workloads-node"
+NODE_MANIFEST = NODE_PROJECT / "package.json"
+NODE_LOCK = NODE_PROJECT / "package-lock.json"
+CHECK = Path(__file__).with_name("workload_check.py")
+
+
+def requirements() -> list[str]:
+    return [line.strip() for line in REQUIREMENTS.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]
 
 
 def load_lock() -> dict:
     document = json.loads(LOCK.read_text(encoding="utf-8"))
     if (document.get("format"), document.get("python"), document.get("architecture")) != (1, "3.14", "x86_64"):
         raise ScriptError("unsupported Ubuntu workload lock")
+    if document.get("requirements") != requirements():
+        raise ScriptError("Python workload requirements differ from the resolved lock")
     names = set()
     for package in document["packages"]:
         name = re.sub(r"[-_.]+", "-", package["name"]).lower()
@@ -36,20 +48,108 @@ def load_lock() -> dict:
             raise ScriptError("duplicate or invalid Python workload name")
         names.add(name)
         url = urlparse(package["url"])
-        if url.scheme != "https" or url.netloc != "files.pythonhosted.org" or not url.path.endswith(".whl"):
-            raise ScriptError("Python workloads must be locked PyPI wheels")
+        suffix = ".tar.gz" if "wheel" in package else ".whl"
+        if url.scheme != "https" or url.netloc != "files.pythonhosted.org" or not url.path.endswith(suffix):
+            raise ScriptError("Python workloads must be locked PyPI artifacts")
         if not re.fullmatch(r"[0-9a-f]{64}", package["sha256"]):
             raise ScriptError("invalid workload SHA-256")
+        if "wheel" in package:
+            for item in (package["wheel"], package["buildWheel"]):
+                if (Path(item["filename"]).name != item["filename"]
+                        or not item["filename"].endswith(".whl")
+                        or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])):
+                    raise ScriptError("invalid source-build wheel lock")
     npm = document["npm"]
     if npm["url"] != f"https://registry.npmjs.org/npm/-/npm-{npm['version']}.tgz":
         raise ScriptError("npm must come from the official registry")
     if not re.fullmatch(r"[0-9a-f]{64}", npm["sha256"]):
         raise ScriptError("invalid npm SHA-256")
+    node = json.loads(NODE_MANIFEST.read_text(encoding="utf-8"))
+    node_lock = json.loads(NODE_LOCK.read_text(encoding="utf-8"))
+    if (document.get("node", {}).get("dependencies") != node["dependencies"]
+            or node_lock.get("lockfileVersion") != 3
+            or node_lock["packages"][""]["dependencies"] != node["dependencies"]
+            or document["node"].get("lockSha256") != hashlib.sha256(NODE_LOCK.read_bytes()).hexdigest()):
+        raise ScriptError("Node workload manifest differs from the resolved lock")
+    for name, package in node_lock["packages"].items():
+        if not name:
+            continue
+        url = urlparse(package.get("resolved", ""))
+        if (url.scheme != "https" or url.netloc != "registry.npmjs.org"
+                or not re.fullmatch(r"sha512-[A-Za-z0-9+/]+={0,2}", package.get("integrity", ""))):
+            raise ScriptError(f"Node workload lacks a registry URL or SHA-512 integrity: {name}")
     return document
 
 
+def build_source_wheel(root: Path, package: dict, source: Path, pip_wheel: Path) -> Path:
+    """Build the explicitly pinned pure-Python sdist using the locked distro build wheel."""
+    backend = root / "usr/share/python-wheels" / package["buildWheel"]["filename"]
+    if hashlib.sha256(backend.read_bytes()).hexdigest() != package["buildWheel"]["sha256"]:
+        raise ScriptError("source-build backend differs from its lock")
+    output = source.parent / package["wheel"]["filename"]
+    with tempfile.TemporaryDirectory(prefix="nvx-wheel-") as temporary:
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(map(str, (pip_wheel, backend))),
+                   PIP_CONFIG_FILE=os.devnull, PIP_DISABLE_PIP_VERSION_CHECK="1",
+                   PYTHONNOUSERSITE="1", SOURCE_DATE_EPOCH="0", PYTHONHASHSEED="0")
+        subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps",
+                        "--no-build-isolation", "--no-index", "--no-cache-dir",
+                        "--wheel-dir", temporary, str(source)], env=env, check=True)
+        wheel = Path(temporary) / package["wheel"]["filename"]
+        if hashlib.sha256(wheel.read_bytes()).hexdigest() != package["wheel"]["sha256"]:
+            raise ScriptError("source-built workload wheel differs from its lock")
+        shutil.copyfile(wheel, output)
+    return output
+
+
+def install_node(root: Path, npm_root: Path, binaries: Path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        raise ScriptError("Node.js 22 is required to build the Ubuntu Node workloads")
+    version = subprocess.check_output([node, "--version"], text=True).strip()
+    if not version.startswith("v22."):
+        raise ScriptError("Node workload installation requires Node.js 22")
+    project = root / "usr/local/lib/nvx-workloads"
+    project.mkdir(parents=True, exist_ok=True)
+    for source in (NODE_MANIFEST, NODE_LOCK):
+        shutil.copyfile(source, project / source.name)
+    lock = json.loads(NODE_LOCK.read_text(encoding="utf-8"))
+    urls = []
+    for name, package in lock["packages"].items():
+        if not name:
+            continue
+        if any(key in package and expected not in package[key]
+               for key, expected in (("os", "linux"), ("cpu", "x64"), ("libc", "glibc"))):
+            continue
+        urls.append(package["resolved"])
+    with tempfile.TemporaryDirectory(prefix="nvx-npm-") as temporary:
+        # Do not inherit host npm configuration, caches or lifecycle hooks.
+        env = {key: value for key, value in os.environ.items()
+               if not key.lower().startswith("npm_config_")}
+        for name in ("user.npmrc", "global.npmrc"):
+            (Path(temporary) / name).touch()
+        env.update(HOME=temporary, npm_config_userconfig=str(Path(temporary) / "user.npmrc"),
+                   npm_config_globalconfig=str(Path(temporary) / "global.npmrc"), npm_config_cache=temporary,
+                   npm_config_ignore_scripts="true")
+        command = [node, str(npm_root / "bin/npm-cli.js"),
+                   "--ignore-scripts", "--no-audit", "--fund=false",
+                   "--os=linux", "--cpu=x64", "--libc=glibc"]
+        # Fetch only the locked target-platform tarballs. ci validates their SRI before
+        # extraction; no dependency resolution or network access occurs during installation.
+        subprocess.run([*command, "cache", "add", *sorted(set(urls))], env=env, check=True)
+        subprocess.run([*command, "ci", "--offline", "--omit=dev", "--include=optional"],
+                       cwd=project, env=env, check=True)
+    # Ancestor lookup supports both require() and ESM import from /workspace and /tmp.
+    # A task's own node_modules still takes precedence.
+    (root / "node_modules").symlink_to("usr/local/lib/nvx-workloads/node_modules")
+    for entry in (project / "node_modules/.bin").iterdir():
+        destination = binaries / entry.name
+        if destination.exists() or destination.is_symlink():
+            raise ScriptError(f"Node workload command conflicts with a runtime command: {entry.name}")
+        destination.symlink_to(os.path.relpath(entry, binaries))
+
+
 def install(root: Path) -> None:
-    """Install verified wheels without network resolution, scripts or source builds."""
+    """Install locked workloads without floating resolution or npm lifecycle hooks."""
     if sys.version_info[:2] != (3, 14):
         raise ScriptError("Ubuntu workloads require a Python 3.14 build interpreter")
     lock = load_lock()
@@ -67,9 +167,12 @@ def install(root: Path) -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         wheels = list(pool.map(fetch, lock["packages"]))
     pip_wheel = wheels[next(i for i, p in enumerate(lock["packages"]) if p["name"].lower() == "pip")]
+    for i, package in enumerate(lock["packages"]):
+        if "wheel" in package:
+            wheels[i] = build_source_wheel(root, package, wheels[i], pip_wheel)
     requirements = downloads / "requirements.lock.txt"
     requirements.write_text("".join(
-        f"{wheel.as_uri()} --hash=sha256:{package['sha256']}\n"
+        f"{wheel.as_uri()} --hash=sha256:{package.get('wheel', package)['sha256']}\n"
         for package, wheel in zip(lock["packages"], wheels, strict=True)
     ), encoding="utf-8")
     target = root / "usr/local/lib/python3.14/dist-packages"
@@ -81,6 +184,8 @@ def install(root: Path) -> None:
         "--require-hashes", "--no-compile", "--no-cache-dir",
         "--target", str(target), "-r", str(requirements),
     ], env=env, check=True)
+    subprocess.run([sys.executable, str(CHECK), str(target), str(LOCK)],
+                   env=env, check=True)
     binaries = root / "usr/local/bin"
     binaries.mkdir(parents=True, exist_ok=True)
     for script in (target / "bin").iterdir():
@@ -114,6 +219,7 @@ def install(root: Path) -> None:
         source.extractall(npm_root, members=members, filter="data")
     for name in ("npm", "npx"):
         (binaries / name).symlink_to(f"../lib/node_modules/npm/bin/{name}-cli.js")
+    install_node(root, npm_root, binaries)
     # Font selection is explicit so charts with Chinese labels work without task-specific setup.
     mpl = target / "matplotlib/mpl-data/matplotlibrc"
     settings = {"backend": "Agg", "font.family": "sans-serif",

@@ -56,6 +56,14 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Install Node.js for the locked guest workloads
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check workload profiles and dependency closure
+        run: python3 scripts/test_workloads.py
+
       - name: Install the EROFS, zstd and musl tools
         run: |
           set -euo pipefail

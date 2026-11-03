@@ -142,9 +142,11 @@ def measure(args, isolated, memory_mib, repetition):
         after = call("memory.stats")
         private_storage = []
         if isolated:
-            # A saturates each private tmpfs separately while B remains alive.
-            # This tests ENOSPC boundaries, persistence and recovery without
-            # claiming resistance to group-wide resource exhaustion.
+            # A saturates the shared private quota through each writable directory
+            # while B remains alive. The eight resident /tmp files stay in place.
+            quota = (memory_mib - 96) // 2 // 8
+            if active["vm"]["sessionCapacity"] != 8 or active["vm"]["sessionStorageMiB"] != quota:
+                raise RuntimeError(f"unexpected private storage budget: {active['vm']}")
             guest_b = opened["b"]["workspaceGuestPath"]
             call("exec", session="b", execId="storage-peer",
                  argv=["sh", "-ec", f"echo ready >{guest_b}/storage.ready; "
@@ -154,25 +156,32 @@ def measure(args, isolated, memory_mib, repetition):
                 if time.monotonic() >= deadline:
                     raise RuntimeError("storage peer did not become ready")
                 call("diagnostics")
-            for directory, maximum in (("/tmp", 32), ("/home/sandbox", 32), ("/dev/shm", 16)):
+            for directory in ("/tmp", "/home/session", "/dev/shm"):
                 key = "fill-" + directory.replace("/", "-")
                 script = (
                     "import errno,json,os,pathlib\n"
                     f"root=pathlib.Path({directory!r})\n"
-                    "root = pathlib.Path(os.environ['HOME']) if str(root)=='/home/sandbox' else root\n"
+                    "before=os.statvfs(root)\n"
+                    f"assert before.f_blocks*before.f_frsize == {quota}*1024*1024\n"
+                    "available=before.f_bavail*before.f_frsize\n"
+                    f"assert available >= ({quota}-10)*1024*1024, available\n"
                     "block=b'x'*(1024*1024)\n"
                     "count=0\n"
                     "try:\n"
                     " with (root/'capacity-fill').open('wb',buffering=0) as f:\n"
-                    "  while count<128: count+=f.write(block)//len(block)\n"
+                    f"  while count<{quota}+1: count+=f.write(block)//len(block)\n"
                     "except OSError as error:\n"
                     " assert error.errno==errno.ENOSPC, error\n"
                     "else: raise AssertionError('private tmpfs has no enforced bound')\n"
-                    f"assert {maximum - 10}<=count<={maximum}, count\n"
-                    "print(json.dumps({'path':str(root),'writtenMiB':count}))\n"
+                    "assert max(0,available//len(block)-2)<=count<=available//len(block), (count,available)\n"
+                    "for path in ('/tmp',os.environ['HOME'],'/dev/shm'):\n"
+                    " stat=os.statvfs(path)\n"
+                    " assert stat.f_bavail*stat.f_frsize < len(block), (path,stat)\n"
+                    "print(json.dumps({'path':str(root),'writtenMiB':count,"
+                    "'availableBeforeBytes':available,'sharedQuotaMiB':before.f_blocks*before.f_frsize//len(block)}))\n"
                 )
                 call("exec", session="a", execId=key, argv=["python3", "-c", script],
-                     limits={"memMb": 96}, timeoutMs=30000)
+                     limits={"memMb": quota + 64}, timeoutMs=30000)
                 sidecar.succeeded([key], deadline)
                 sample = json.loads(sidecar.stdout_of(key))
                 sample["workingSetMiB"] = call("memory.stats")["workingSetMiB"]
@@ -263,7 +272,7 @@ def main():
         ], text=True, timeout=20)),
         "tokenMode": "ordinary development runner; no restricted-token claim",
         "scope": "eight sessions, eight Python tasks holding 32 MiB each; isolated /tmp 8 MiB each; "
-                 "individual private tmpfs saturation with a live peer; memory trim disabled",
+                 "shared per-session storage quota saturation through tmp/home/shm with a live peer; memory trim disabled",
         "sha256": hashes, "results": [], "passed": False,
     }
     try:

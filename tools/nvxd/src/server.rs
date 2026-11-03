@@ -81,6 +81,7 @@ struct VmEntry {
     generation: u64,
     runtime_id: String,
     memory: VmmMemory,
+    memory_mib: u32,
     state: Mutex<VmState>,
 }
 
@@ -459,6 +460,7 @@ impl Context {
             "backend": "nvx-whp",
             "provenance": self.provenance,
             "vmGeneration": generation,
+            "processors": self.config.processors,
             "capabilities": {
                 "sharedVm": true,
                 "parallelExec": self.max_running > 1,
@@ -508,11 +510,15 @@ impl Context {
         json!({
             "runtimePrefix": self.runtime_prefix,
             "maxSessions": self.max_sessions,
+            "processors": self.config.processors,
+            "execCpuPercent": self.exec_defaults.1,
             "sessionCount": inner.registry.session_count(),
             "maxQueue": self.max_queue,
             "vm": vm.as_ref().map(|vm| json!({
                 "runtimeId": vm.runtime_id,
                 "generation": vm.generation,
+                "processors": self.config.processors,
+                "memoryMiB": vm.memory_mib,
                 "idleMs": vm.idle().as_millis() as u64,
             })),
             "sessions": sessions,
@@ -865,6 +871,7 @@ impl Context {
             generation,
             runtime_id,
             memory: VmmMemory::new(process.pid, process.start_time),
+            memory_mib,
             state: Mutex::new(VmState { last_activity: Instant::now(), trimmed: false, trims: 0 }),
         });
         {
@@ -875,7 +882,10 @@ impl Context {
         }
         self.retiring.store(false, Ordering::SeqCst);
         *self.vm.lock().unwrap() = Some(Arc::clone(&entry));
-        eprintln!("nvxd: booted shared VM generation={} runtimeId={}", entry.generation, entry.runtime_id);
+        eprintln!(
+            "nvxd: booted shared VM generation={} runtimeId={} processors={} memoryMiB={}",
+            entry.generation, entry.runtime_id, self.config.processors, memory_mib
+        );
         Ok(entry)
     }
 

@@ -67,6 +67,8 @@ pub struct VmConfig {
     /// The directory of the sandbox's store; created if needed.
     pub store: PathBuf,
     pub memory_mib: u32,
+    /// Fixed for this VM's lifetime; one of 1, 2, 4 or 8.
+    pub processors: u32,
     /// Passed to OpenVMM as `--cpu-profile`.
     pub cpu_profile: String,
     pub guest_build: String,
@@ -474,6 +476,8 @@ fn launch_and_serve(
         let mut arguments = layered.openvmm_arguments(held, &spec.vmm_launch(endpoint, &outcome))?;
         arguments.push("--cpu-profile".into());
         arguments.push(config.cpu_profile.clone().into());
+        arguments.push("--processors".into());
+        arguments.push(config.processors.to_string().into());
         arguments.push("--microvm-virtiofs-control".into());
         arguments.push(live::spec(&config.control_pipe).into());
         let record = LaunchRecord {

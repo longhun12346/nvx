@@ -113,6 +113,21 @@ production runtime.
 
 ## Diagnostics
 
+`--processors 1|2|4|8` selects the VM's vCPU count (default `1` for existing
+callers). The count is fixed for the lifetime of the sidecar and is passed explicitly
+to OpenVMM, including the capability probe. The capability cache key includes it:
+a successful single-processor probe does not prove a larger topology works.
+Startup provenance, `probe.processors`, and `diagnostics.processors` report the
+configured count; a running `diagnostics.vm` also reports `processors` and
+`memoryMiB`. Per-execution `cpuPercent` remains hundredths of one logical CPU,
+independent of topology; zero inherits the deployment default.
+
+Run `tests/processors.py --nvxd PATH --repo PATH --initrd PATH` on a WHP host
+with explicit `NVX_*` artifacts to verify all four counts in shared and isolated
+modes. It checks guest CPU count and affinity, pins a worker to every CPU, records
+CPU time and elapsed time, cancels a process tree, verifies the VM survives, and
+checks that its VMM exits at shutdown. It never terminates unrelated VMM processes.
+
 Two things exist so a failure can be explained without a debugger or a test harness.
 
 `{"op":"diagnostics"}` (read-only) answers with this sidecar's own counters and the state

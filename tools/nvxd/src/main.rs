@@ -51,6 +51,7 @@ struct Args {
     guest_agent: Option<PathBuf>,
     /// Required: the guest CPU profile is a deployment decision, never inferred.
     cpu_profile: Option<String>,
+    processors: u32,
     hypervisor: String,
     state_dir: PathBuf,
     capability_cache: Option<PathBuf>,
@@ -72,6 +73,10 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_arguments(std::env::args().skip(1))
+}
+
+fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut args = Args {
         artifacts: None,
         openvmm: None,
@@ -80,6 +85,7 @@ fn parse_args() -> Result<Args, String> {
         distro: None,
         guest_agent: None,
         cpu_profile: None,
+        processors: 1,
         hypervisor: "whp".to_owned(),
         state_dir: std::env::temp_dir().join(format!("nvxd-{}", std::process::id())),
         capability_cache: default_cache(),
@@ -99,7 +105,7 @@ fn parse_args() -> Result<Args, String> {
         idle_trim_secs: 30,
         session_isolation: false,
     };
-    let mut iter = std::env::args().skip(1);
+    let mut iter = arguments.into_iter();
     while let Some(flag) = iter.next() {
         let mut value = || iter.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |text: String| text.parse::<u64>().map_err(|e| format!("{flag}: {e}"));
@@ -111,6 +117,13 @@ fn parse_args() -> Result<Args, String> {
             "--distro" => args.distro = Some(PathBuf::from(value()?)),
             "--guest-agent" => args.guest_agent = Some(PathBuf::from(value()?)),
             "--cpu-profile" => args.cpu_profile = Some(value()?),
+            "--processors" => {
+                let count = number(value()?)?;
+                if ![1, 2, 4, 8].contains(&count) {
+                    return Err("--processors must be 1, 2, 4 or 8".to_owned());
+                }
+                args.processors = count as u32;
+            }
             "--hypervisor" => args.hypervisor = value()?,
             "--state-dir" => args.state_dir = PathBuf::from(value()?),
             "--capability-cache" => {
@@ -221,6 +234,7 @@ fn run() -> Result<(), String> {
         store: args.state_dir.join("store"),
         memory_mib: u32::try_from(protocol::DEFAULT_MEMORY_MIB).unwrap_or(1024),
         cpu_profile: cpu_profile.clone(),
+        processors: args.processors,
         guest_build: runtime_adapter::GUEST_BUILD.to_owned(),
         anchor: args.state_dir.join("export-anchor"),
         generation: 0,
@@ -236,13 +250,16 @@ fn run() -> Result<(), String> {
         "guestAgent": guest_agent.display().to_string(),
         "distro": distro.display().to_string(),
         "cpuProfile": cpu_profile,
+        "processors": args.processors,
     });
     let _ = writeln!(std::io::stderr(), "nvxd: {provenance}");
     let paths = [openvmm.clone(), kernel.clone(), initrd.clone(), guest_agent.clone(), distro.clone()];
     let path_refs: Vec<&std::path::Path> = paths.iter().map(PathBuf::as_path).collect();
     let capability = capability::Capability::new(
         args.capability_cache.clone(),
-        capability::fingerprint(&path_refs, &format!("{}|{}", cpu_profile, protocol::VERSION)),
+        capability::fingerprint(
+            &path_refs, &format!("{}|{}|{}", cpu_profile, args.processors, protocol::VERSION),
+        ),
     );
     let (writer, writer_thread) = outbound::spawn(Box::new(std::io::stdout()), args.outbound_capacity);
     let writer = Arc::new(writer);
@@ -400,5 +417,23 @@ fn main() {
     if let Err(message) = run() {
         let _ = writeln!(std::io::stderr(), "nvxd: {message}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::parse_arguments;
+
+    #[test]
+    fn processor_counts_are_validated_before_startup() {
+        assert_eq!(parse_arguments(Vec::new()).unwrap().processors, 1);
+        for count in ["1", "2", "4", "8"] {
+            let args = parse_arguments(["--processors".to_owned(), count.to_owned()]).unwrap();
+            assert_eq!(args.processors.to_string(), count);
+        }
+        for count in ["0", "3", "16", "-1", "4294967297", "four"] {
+            assert!(parse_arguments(["--processors".to_owned(), count.to_owned()]).is_err());
+        }
+        assert!(parse_arguments(["--processors".to_owned()]).is_err());
     }
 }

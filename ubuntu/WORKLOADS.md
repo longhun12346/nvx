@@ -17,8 +17,8 @@ can build its user cache on first use.
 `workloads.lock.json` records the exact Python 3.14 / Linux x86_64 artifacts and
 the bundled npm distribution. Every download is verified, and pip installs offline
 with `--require-hashes --no-deps --no-index`. Plotille remains within the declared
-`>=5,<6` range: its pinned 5.0.0 source archive is built offline using the pinned
-setuptools wheel already supplied by the distro, and the resulting wheel must
+`>=5,<6` range: its pinned 5.0.0 source archive is built offline using a pinned
+upstream setuptools wheel, and the resulting wheel must
 match its locked hash. Build tooling is not added to the runtime package set.
 The build checks every declared version range, the complete dependency closure
 and the absence of unrelated Python packages (pip is runtime infrastructure).

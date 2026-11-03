@@ -59,6 +59,10 @@ def load_lock() -> dict:
                         or not item["filename"].endswith(".whl")
                         or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])):
                     raise ScriptError("invalid source-build wheel lock")
+            backend_url = urlparse(package["buildWheel"].get("url", ""))
+            if (backend_url.scheme != "https" or backend_url.netloc != "files.pythonhosted.org"
+                    or unquote(backend_url.path.rsplit("/", 1)[-1]) != package["buildWheel"]["filename"]):
+                raise ScriptError("source-build backend must be a locked PyPI wheel")
     npm = document["npm"]
     if npm["url"] != f"https://registry.npmjs.org/npm/-/npm-{npm['version']}.tgz":
         raise ScriptError("npm must come from the official registry")
@@ -81,11 +85,10 @@ def load_lock() -> dict:
     return document
 
 
-def build_source_wheel(root: Path, package: dict, source: Path, pip_wheel: Path) -> Path:
-    """Build the explicitly pinned pure-Python sdist using the locked distro build wheel."""
-    backend = root / "usr/share/python-wheels" / package["buildWheel"]["filename"]
-    if hashlib.sha256(backend.read_bytes()).hexdigest() != package["buildWheel"]["sha256"]:
-        raise ScriptError("source-build backend differs from its lock")
+def build_source_wheel(package: dict, source: Path, pip_wheel: Path) -> Path:
+    """Build a pinned pure-Python sdist with a host-independent, build-only backend."""
+    backend = source.parent / package["buildWheel"]["filename"]
+    download_verified(package["buildWheel"]["url"], backend, package["buildWheel"]["sha256"])
     output = source.parent / package["wheel"]["filename"]
     with tempfile.TemporaryDirectory(prefix="nvx-wheel-") as temporary:
         env = dict(os.environ, PYTHONPATH=os.pathsep.join(map(str, (pip_wheel, backend))),
@@ -169,7 +172,7 @@ def install(root: Path) -> None:
     pip_wheel = wheels[next(i for i, p in enumerate(lock["packages"]) if p["name"].lower() == "pip")]
     for i, package in enumerate(lock["packages"]):
         if "wheel" in package:
-            wheels[i] = build_source_wheel(root, package, wheels[i], pip_wheel)
+            wheels[i] = build_source_wheel(package, wheels[i], pip_wheel)
     requirements = downloads / "requirements.lock.txt"
     requirements.write_text("".join(
         f"{wheel.as_uri()} --hash=sha256:{package.get('wheel', package)['sha256']}\n"

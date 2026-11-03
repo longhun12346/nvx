@@ -88,6 +88,8 @@ pub struct Sessions {
     broken: bool,
     /// Set once a program ran outside a session; private sessions then need a new VM.
     legacy_used: bool,
+    capacity: usize,
+    storage_mib: u64,
     /// The fault observer of a diagnostic agent, started with the first session.
     #[cfg(feature = "fault-observer")]
     observer: Option<Child>,
@@ -96,7 +98,21 @@ pub struct Sessions {
 impl Sessions {
     /// Returns no sessions.
     pub fn new() -> Self {
-        Self { next_uid: FIRST_UID, ..Self::default() }
+        Self { next_uid: FIRST_UID, capacity: MAX_SESSIONS, storage_mib: 64, ..Self::default() }
+    }
+
+    /// Configures the shared per-session filesystem quota before the first session.
+    pub fn configure_storage(&mut self, capacity: u64, memory_bytes: u64) -> Result<(), String> {
+        if self.ever_used() || !(1..=MAX_SESSIONS as u64).contains(&capacity) {
+            return Err("invalid session storage configuration".to_owned());
+        }
+        let storage_mib = memory_bytes / (2 * 1024 * 1024) / capacity;
+        if storage_mib == 0 {
+            return Err("session storage budget is below 1 MiB".to_owned());
+        }
+        self.capacity = capacity as usize;
+        self.storage_mib = storage_mib;
+        Ok(())
     }
 
     /// Whether an isolation fault was seen.
@@ -165,7 +181,7 @@ impl Sessions {
         if id == 0 || id <= self.highest {
             return Err(errno_text(libc::ESTALE, "session identity not newer than the last"));
         }
-        if self.table.len() >= MAX_SESSIONS || self.next_uid == u32::MAX {
+        if self.table.len() >= self.capacity || self.next_uid == u32::MAX {
             return Err(errno_text(libc::ENOSPC, "no free session slot"));
         }
         let source_parent = workspace
@@ -194,6 +210,7 @@ impl Sessions {
             .arg(root)
             .arg(workspace)
             .arg(&directory)
+            .arg(self.storage_mib.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()

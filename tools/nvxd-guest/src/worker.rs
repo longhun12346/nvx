@@ -1415,6 +1415,12 @@ impl RootOperations for LibraryRoot {
 
     /// Runs `nvx::guest::root::bootstrap` with the configuration's cgroups and resource values.
     fn bootstrap(&mut self, config: &RootConfig) -> Result<(), String> {
+        if let Some(capacity) = config.session_capacity {
+            self.sessions.configure_storage(
+                capacity,
+                config.workload_memory_max.ok_or("session storage needs a workload memory budget")?,
+            )?;
+        }
         let layout = Layout::new(&config.agent_cgroup, &config.workload_cgroup)
             .map_err(|error| error.to_string())?;
         let resources = Resources {

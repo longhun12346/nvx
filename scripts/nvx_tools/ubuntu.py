@@ -38,6 +38,7 @@ from .common import (
     sha256_file,
 )
 from .guest_binaries import guest_binary_source_files
+from . import workloads
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _PACKAGE_NAME = re.compile(r"[a-z0-9][a-z0-9+.-]*")
@@ -746,7 +747,8 @@ def _customize_root(root: Path) -> None:
             host_key.unlink()
     _ensure_symlink(root, "usr/bin/nc", "nc.openbsd")
     _ensure_symlink(root, "usr/bin/netcat", "nc.openbsd")
-    _ensure_symlink(root, "usr/bin/wget", "busybox")
+    if not path_exists(root / "usr/bin/wget"):
+        _ensure_symlink(root, "usr/bin/wget", "busybox")
     _ensure_symlink(root, "usr/sbin/mdev", "../bin/busybox")
     if path_exists(root / "usr" / "bin" / "python3"):
         _ensure_symlink(root, "usr/bin/python", "python3")
@@ -889,6 +891,8 @@ def prepare_root(work: Path) -> Path:
         download_verified(package["url"], package_path, package["sha256"])
         _install_deb(root, package, package_path)
     precompile_python(root)
+    workloads.configure_trust(root)
+    workloads.install(root)
     _customize_root(root)
     return root
 
@@ -1064,6 +1068,7 @@ def package_manifest(
         "rootfs_sha256": rootfs_sha256(root),
         "packages": package_records(root),
         "helpers": helpers,
+        "workloads": workloads.load_lock(),
     }
 
 
@@ -1088,6 +1093,9 @@ def customization_files() -> tuple[Path, ...]:
             if path.is_file()
         ),
         UbuntuBuildConstants.PACKAGE_LOCK,
+        workloads.LOCK,
+        workloads.REQUIREMENTS,
+        Path(workloads.__file__),
         *guest_binary_source_files(),
     )
 

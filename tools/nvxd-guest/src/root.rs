@@ -142,8 +142,10 @@ const WORKLOAD_UID: &str = "workload-uid";
 const WORKLOAD_GID: &str = "workload-gid";
 /// See [`VERSION`].
 const LISTENERS: &str = "listeners";
+/// Maximum simultaneous isolated sessions, used to divide the memory-backed storage budget.
+const SESSION_CAPACITY: &str = "session-capacity";
 /// Every field, in the order in which [`RootConfig::encode`] writes them.
-const FIELDS: [&str; 17] = [
+const FIELDS: [&str; 18] = [
     VERSION,
     RUNTIME,
     AGENT_CGROUP,
@@ -155,6 +157,7 @@ const FIELDS: [&str; 17] = [
     DISTRO_SECTORS,
     SCRATCH_SECTORS,
     FIRST_PARTITION_BOUND,
+    SESSION_CAPACITY,
     OVERLAY_MODE,
     SCRATCH_JOURNAL,
     MAPPING_COUNT,
@@ -280,6 +283,9 @@ pub struct RootConfig {
     pub workload_memory_max: Option<u64>,
     /// The workload cgroup's `pids.max`, if any.
     pub workload_pids_max: Option<u64>,
+    /// Optional isolated-session limit (1..=64). Half the workload memory budget is divided
+    /// among these sessions for their private writable filesystems.
+    pub session_capacity: Option<u64>,
     /// The size that the image's block device must have, in 512-byte sectors, if any.
     pub distro_sectors: Option<u64>,
     /// The size that the scratch block device must have, in 512-byte sectors, if any.
@@ -317,6 +323,7 @@ impl Default for RootConfig {
             agent_memory_low: Some(DEFAULT_AGENT_MEMORY_LOW),
             workload_memory_max: Some(DEFAULT_WORKLOAD_MEMORY_MAX),
             workload_pids_max: Some(DEFAULT_WORKLOAD_PIDS_MAX),
+            session_capacity: None,
             distro_sectors: None,
             scratch_sectors: None,
             first_partition_bound: None,
@@ -348,6 +355,7 @@ impl RootConfig {
             (DISTRO_SECTORS, self.distro_sectors),
             (SCRATCH_SECTORS, self.scratch_sectors),
             (FIRST_PARTITION_BOUND, self.first_partition_bound),
+            (SESSION_CAPACITY, self.session_capacity),
         ];
         fields.extend(
             optional
@@ -517,14 +525,27 @@ impl RootConfig {
             .get(LISTENERS)
             .map(|text| Listeners::from_name(text).ok_or_else(|| unknown(LISTENERS, text)))
             .transpose()?;
+        let session_capacity = number(SESSION_CAPACITY)?;
+        let workload_memory_max = number(WORKLOAD_MEMORY_MAX)?;
+        if let Some(capacity) = session_capacity {
+            if capacity > 64
+                || workload_memory_max.is_none_or(|memory| memory / (2 * 1024 * 1024) < capacity)
+            {
+                return Err(refused(
+                    "session-capacity needs 1..=64 sessions and at least 2 MiB of workload memory per session"
+                        .to_owned(),
+                ));
+            }
+        }
         Ok(Self {
             runtime,
             agent_cgroup,
             workload_cgroup,
             device_timeout,
             agent_memory_low: number(AGENT_MEMORY_LOW)?,
-            workload_memory_max: number(WORKLOAD_MEMORY_MAX)?,
+            workload_memory_max,
             workload_pids_max: number(WORKLOAD_PIDS_MAX)?,
+            session_capacity,
             distro_sectors: number(DISTRO_SECTORS)?,
             scratch_sectors: number(SCRATCH_SECTORS)?,
             first_partition_bound: number(FIRST_PARTITION_BOUND)?,
@@ -1044,7 +1065,12 @@ mod tests {
             listeners: Some(Listeners::Published),
             ..RootConfig::default()
         };
-        for config in [full(), minimal, largest, published, RootConfig::default()] {
+        let isolated = RootConfig {
+            session_capacity: Some(8),
+            workload_memory_max: Some(4000 << 20),
+            ..RootConfig::default()
+        };
+        for config in [full(), minimal, largest, published, isolated, RootConfig::default()] {
             assert_eq!(RootConfig::decode(&config.encode()), Ok(config));
         }
         // The fields may come in any order.
@@ -1059,6 +1085,20 @@ mod tests {
             .map(|line| format!("{line}\n"))
             .collect::<String>();
         assert_eq!(RootConfig::decode(reversed.as_bytes()), Ok(full()));
+    }
+
+    #[test]
+    fn isolated_storage_needs_a_bounded_capacity_and_memory() {
+        for (capacity, memory) in [
+            (0, Some(1024 << 20)), (65, Some(1024 << 20)), (8, None), (8, Some(15 << 20)),
+        ] {
+            let config = RootConfig {
+                session_capacity: Some(capacity),
+                workload_memory_max: memory,
+                ..RootConfig::default()
+            };
+            assert!(RootConfig::decode(&config.encode()).is_err(), "{config:?}");
+        }
     }
 
     #[test]

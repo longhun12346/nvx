@@ -69,6 +69,8 @@ pub struct VmConfig {
     pub memory_mib: u32,
     /// Fixed for this VM's lifetime; one of 1, 2, 4 or 8.
     pub processors: u32,
+    /// Maximum simultaneous isolated sessions. The guest also enforces this storage-budget divisor.
+    pub session_capacity: u64,
     /// Passed to OpenVMM as `--cpu-profile`.
     pub cpu_profile: String,
     pub guest_build: String,
@@ -385,6 +387,11 @@ fn serve(
 /// the runtime files.
 const WORKLOAD_RESERVE_MIB: u64 = 96;
 
+/// Private filesystem quota, shared by all writable directories of one isolated session.
+pub fn session_storage_mib(memory_mib: u32, capacity: u64) -> u64 {
+    u64::from(memory_mib).saturating_sub(WORKLOAD_RESERVE_MIB).max(64) / 2 / capacity
+}
+
 /// The most processes all executions together may have; the VM's own process limit is the bound.
 const WORKLOAD_PIDS_MAX: u64 = 32768;
 
@@ -426,6 +433,7 @@ fn launch_and_serve(
     layered.config.workload_memory_max =
         Some((u64::from(config.memory_mib).saturating_sub(WORKLOAD_RESERVE_MIB)).max(64) << 20);
     layered.config.workload_pids_max = Some(WORKLOAD_PIDS_MAX);
+    layered.config.session_capacity = Some(config.session_capacity);
     let mut sharing = HostFsSharing::default();
     std::fs::create_dir_all(&config.anchor)
         .map_err(|e| failure("E_BACKEND_START", format!("cannot create {}: {e}", config.anchor.display())))?;

@@ -60,7 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends zstd erofs-utils musl-tools
+          sudo apt-get install --yes --no-install-recommends zstd erofs-utils musl-tools openssl
           mkfs.erofs --version || true
           python3 --version
 

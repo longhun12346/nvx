@@ -235,6 +235,7 @@ fn run() -> Result<(), String> {
         memory_mib: u32::try_from(protocol::DEFAULT_MEMORY_MIB).unwrap_or(1024),
         cpu_profile: cpu_profile.clone(),
         processors: args.processors,
+        session_capacity: if args.max_sessions == 0 { 64 } else { args.max_sessions.min(64) as u64 },
         guest_build: runtime_adapter::GUEST_BUILD.to_owned(),
         anchor: args.state_dir.join("export-anchor"),
         generation: 0,

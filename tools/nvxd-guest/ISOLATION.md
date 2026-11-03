@@ -13,9 +13,15 @@ and from the P8 suites that prove it. Each guarantee names the test that shows i
   fork-and-setup safely: it is multithreaded). Namespaces are owned by root, because the guest kernel has
   no `USER_NS`.
 - The keeper builds the session's root before it reports ready: a read-only bind of the sandbox root as
-  lower layer, a 64 MiB tmpfs for the overlay upper, empty tmpfs mounts hiding `run`, `root`, `sessions`,
-  `mnt` and `sys`, private `/tmp` (32 MiB), `/home` (32 MiB, account `session`), `/dev` (a few nodes,
-  `/dev/shm` 16 MiB), the session's workspace as `/workspace`, a procfs of the session's PID namespace,
+  lower layer and a private tmpfs shared by the overlay upper, the directories hiding `run`, `root`,
+  `sessions`, `mnt` and `sys`, `/tmp`, `/home` (account `session`), and `/dev` (a few nodes and `/dev/shm`).
+  The sidecar divides half the workload memory budget (VM RAM less 96 MiB) by `--max-sessions`,
+  rounded down to whole MiB. A zero/unlimited limit uses the guest's maximum 64 slots; larger limits
+  are capped at 64. The guest enforces this same session capacity. For 4096 MiB and eight sessions,
+  each session gets 250 MiB, with 32768 inodes; all writable directories share that quota.
+  This is an allocation ceiling, not reserved RAM; process memory and files still compete for VM RAM.
+  Direct adapter clients omitting `session-capacity` retain a fixed 64 MiB shared quota.
+  The root also has the session's workspace as `/workspace`, a procfs of the session's PID namespace,
   hostname `nvx-session-<id>`, fresh `passwd` and `group` files, a `chroot`, and `lo` up in a private
   network namespace. It then drops every capability, sets no-new-privs and only reaps children.
 - An **execution** of an isolated session runs through the helper `nvxd-guest __session-enter`, spawned by

@@ -22,6 +22,142 @@
       "suite": "resolute"
     },
     {
+      "name": "ca-certificates",
+      "source_name": "ca-certificates",
+      "source_version": "20260816ubuntu0.26.04.1",
+      "version": "20260816ubuntu0.26.04.1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/c/ca-certificates/ca-certificates_20260816ubuntu0.26.04.1_all.deb",
+      "sha256": "5b6326f1932cfd7be57130561dc78192f09ed9f58bfbe6606ed0c50510c3b6cd",
+      "license_path": "/usr/share/doc/ca-certificates/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "openssl (>= 1.1.1), debconf (>= 0.5) | debconf-2.0",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "curl",
+      "source_name": "curl",
+      "source_version": "8.18.0-1ubuntu2.8",
+      "version": "8.18.0-1ubuntu2.8",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/c/curl/curl_8.18.0-1ubuntu2.8_amd64.deb",
+      "sha256": "2c418a61d7165d0cde01d9cb05ae025cc41fc75ef6d3f095996bd045ba0945dc",
+      "license_path": "/usr/share/doc/curl/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libcurl4t64 (= 8.18.0-1ubuntu2.8), libc6 (>= 2.34), zlib1g (>= 1:1.1.4)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "fontconfig",
+      "source_name": "fontconfig",
+      "source_version": "2.17.1-3ubuntu1",
+      "version": "2.17.1-3ubuntu1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/f/fontconfig/fontconfig_2.17.1-3ubuntu1_amd64.deb",
+      "sha256": "5f87d9f0ff7189e5dbf7bedd1ef6c09ea81747bc68dd5263ea811b471f23ee65",
+      "license_path": "/usr/share/doc/fontconfig/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.38), libfontconfig1 (>= 2.17.1), libfreetype6 (>= 2.2.1), fontconfig-config",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "fontconfig-config",
+      "source_name": "fontconfig",
+      "source_version": "2.17.1-3ubuntu1",
+      "version": "2.17.1-3ubuntu1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/f/fontconfig/fontconfig-config_2.17.1-3ubuntu1_amd64.deb",
+      "sha256": "304cc61f61b94399453db02e1032d9f74a0bd737307acb4ed847f8da9406b8c1",
+      "license_path": "/usr/share/doc/fontconfig-config/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "fonts-dejavu-core | fonts-liberation | fonts-croscore | fonts-freefont-otf | fonts-freefont-ttf | fonts-urw-base35 | fonts-texgyre | fonts-noto-core",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "fonts-dejavu-core",
+      "source_name": "fonts-dejavu",
+      "source_version": "2.37-8build1",
+      "version": "2.37-8build1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/f/fonts-dejavu/fonts-dejavu-core_2.37-8build1_all.deb",
+      "sha256": "f4606b12eb41ddf7932d3a1ebc2019f9bbf90d0824943a2dc0c77a00f43019f2",
+      "license_path": "/usr/share/doc/fonts-dejavu-core/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "fonts-dejavu-mono",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "fonts-dejavu-mono",
+      "source_name": "fonts-dejavu",
+      "source_version": "2.37-8build1",
+      "version": "2.37-8build1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/f/fonts-dejavu/fonts-dejavu-mono_2.37-8build1_all.deb",
+      "sha256": "bf5ad873961972ea8f1299ef99c1854715e68d9aa798830fb78c5b222ddeb4b9",
+      "license_path": "/usr/share/doc/fonts-dejavu-mono/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "fonts-noto-cjk",
+      "source_name": "fonts-noto-cjk",
+      "source_version": "1:20240730+repack1-1build1",
+      "version": "1:20240730+repack1-1build1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/f/fonts-noto-cjk/fonts-noto-cjk_20240730+repack1-1build1_all.deb",
+      "sha256": "be378a571b8f49b4b9146f7d13b31990950d35ee3e0bf1999f554c3ed5670dc0",
+      "license_path": "/usr/share/doc/fonts-noto-cjk/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "fonts-wqy-microhei",
+      "source_name": "fonts-wqy-microhei",
+      "source_version": "0.2.0-beta-4",
+      "version": "0.2.0-beta-4",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/f/fonts-wqy-microhei/fonts-wqy-microhei_0.2.0-beta-4_all.deb",
+      "sha256": "608b93d1acca135f422dca8efed4960a381de0142fd6b81f8a33aa37180e59f1",
+      "license_path": "/usr/share/doc/fonts-wqy-microhei/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
       "name": "iputils-ping",
       "source_name": "iputils",
       "source_version": "3:20250605-1ubuntu1",
@@ -107,6 +243,23 @@
       "suite": "resolute-updates"
     },
     {
+      "name": "libcurl4t64",
+      "source_name": "curl",
+      "source_version": "8.18.0-1ubuntu2.8",
+      "version": "8.18.0-1ubuntu2.8",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/c/curl/libcurl4t64_8.18.0-1ubuntu2.8_amd64.deb",
+      "sha256": "7c0b37592f83a629cc22f0c98effa176da9edbd6d77b3f38184a9d0ddc5e0266",
+      "license_path": "/usr/share/doc/libcurl4t64/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libbrotli1 (>= 0.6.0), libc6 (>= 2.34), libgssapi-krb5-2 (>= 1.17), libidn2-0 (>= 2.0.0), libldap2 (>= 2.6.2), libnghttp2-14 (>= 1.50.0), libpsl5t64 (>= 0.16.0), librtmp1 (>= 2.3), libssh2-1t64 (>= 1.11.1), libssl3t64 (>= 3.2.0), libzstd1 (>= 1.5.5), zlib1g (>= 1:1.2.3.4)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
       "name": "libexpat1",
       "source_name": "expat",
       "source_version": "2.7.4-1ubuntu0.2",
@@ -136,6 +289,91 @@
         "libpython3.14-stdlib"
       ],
       "depends": "libc6 (>= 2.38)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "libfontconfig1",
+      "source_name": "fontconfig",
+      "source_version": "2.17.1-3ubuntu1",
+      "version": "2.17.1-3ubuntu1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/f/fontconfig/libfontconfig1_2.17.1-3ubuntu1_amd64.deb",
+      "sha256": "72ba4fc43155566b46442b741a6892d5d1f1581ba58cdfd037aabf47ad9080f7",
+      "license_path": "/usr/share/doc/libfontconfig1/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.38), libexpat1 (>= 2.0.1), libfreetype6 (>= 2.9.1), fontconfig-config (>= 2.17.1-3ubuntu1)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "libfreetype6",
+      "source_name": "freetype",
+      "source_version": "2.14.2+dfsg-1ubuntu0.2",
+      "version": "2.14.2+dfsg-1ubuntu0.2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/f/freetype/libfreetype6_2.14.2+dfsg-1ubuntu0.2_amd64.deb",
+      "sha256": "6d7d532b7d0c57639deb3b228f1f0d786cf5305d613ef7df9ba76c776a0f8373",
+      "license_path": "/usr/share/doc/libfreetype6/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libbrotli1 (>= 0.6.0), libbz2-1.0, libc6 (>= 2.38), libpng16-16t64 (>= 1.6.46), zlib1g (>= 1:1.1.4)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "libgnutls30t64",
+      "source_name": "gnutls28",
+      "source_version": "3.8.12-2ubuntu1.1",
+      "version": "3.8.12-2ubuntu1.1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/g/gnutls28/libgnutls30t64_3.8.12-2ubuntu1.1_amd64.deb",
+      "sha256": "b08d4e2842cd53dbe1565a46bd11d6f7ecb36bc08b236802ae4da744cae9f691",
+      "license_path": "/usr/share/doc/libgnutls30t64/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.43), libgmp10 (>= 2:6.3.0+dfsg), libhogweed6t64 (>= 3.10), libidn2-0 (>= 2.0.0), libnettle8t64 (>= 3.10), libp11-kit0 (>= 0.25.1), libtasn1-6 (>= 4.14), libunistring5 (>= 1.1)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "libgssapi-krb5-2",
+      "source_name": "krb5",
+      "source_version": "1.22.1-2ubuntu4.1",
+      "version": "1.22.1-2ubuntu4.1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/k/krb5/libgssapi-krb5-2_1.22.1-2ubuntu4.1_amd64.deb",
+      "sha256": "d156dd940bff6dec8b6880cd0da4d515398d03d7b2e8b3163a935e701f80aa27",
+      "license_path": "/usr/share/doc/libgssapi-krb5-2/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libkrb5-3 (= 1.22.1-2ubuntu4.1), libc6 (>= 2.38), libcom-err2 (>= 1.43.9), libk5crypto3 (>= 1.20), libkrb5support0 (= 1.22.1-2ubuntu4.1)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "libhogweed6t64",
+      "source_name": "nettle",
+      "source_version": "3.10.2-1",
+      "version": "3.10.2-1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/n/nettle/libhogweed6t64_3.10.2-1_amd64.deb",
+      "sha256": "1c8c808ab24ff3018ac886e3f311edee0f2d4d97d12d3908be52343e89807046",
+      "license_path": "/usr/share/doc/libhogweed6t64/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.14), libgmp10 (>= 2:6.3.0+dfsg), libnettle8t64",
       "pre_depends": "",
       "component": "main",
       "suite": "resolute"
@@ -175,6 +413,108 @@
       "suite": "resolute"
     },
     {
+      "name": "libk5crypto3",
+      "source_name": "krb5",
+      "source_version": "1.22.1-2ubuntu4.1",
+      "version": "1.22.1-2ubuntu4.1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/k/krb5/libk5crypto3_1.22.1-2ubuntu4.1_amd64.deb",
+      "sha256": "8e99ef104a6bf49bea708747fdf4c28eb4fcebd6dba9e55ecfa919211eb5ab75",
+      "license_path": "/usr/share/doc/libk5crypto3/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.38), libkrb5support0 (= 1.22.1-2ubuntu4.1)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "libkeyutils1",
+      "source_name": "keyutils",
+      "source_version": "1.6.3-6ubuntu3",
+      "version": "1.6.3-6ubuntu3",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/k/keyutils/libkeyutils1_1.6.3-6ubuntu3_amd64.deb",
+      "sha256": "ea7d3cc642ffe2459c35a85c894f80e92499b9eba13bdcb225e0aa751c0970be",
+      "license_path": "/usr/share/doc/libkeyutils1/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.38)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "libkrb5-3",
+      "source_name": "krb5",
+      "source_version": "1.22.1-2ubuntu4.1",
+      "version": "1.22.1-2ubuntu4.1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/k/krb5/libkrb5-3_1.22.1-2ubuntu4.1_amd64.deb",
+      "sha256": "54612a2019863c44d80218f40d40670c3684108f4b2a760aae644ab68457e239",
+      "license_path": "/usr/share/doc/libkrb5-3/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libkrb5support0 (= 1.22.1-2ubuntu4.1), libc6 (>= 2.38), libcom-err2 (>= 1.43.9), libk5crypto3 (>= 1.20), libkeyutils1 (>= 1.5.9), libssl3t64 (>= 3.0.0)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "libkrb5support0",
+      "source_name": "krb5",
+      "source_version": "1.22.1-2ubuntu4.1",
+      "version": "1.22.1-2ubuntu4.1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/k/krb5/libkrb5support0_1.22.1-2ubuntu4.1_amd64.deb",
+      "sha256": "127d735efece139dfb7109ac3709da7eb8923bef090c20a10dbaf4c4fa45001d",
+      "license_path": "/usr/share/doc/libkrb5support0/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.38)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "libldap-common",
+      "source_name": "openldap",
+      "source_version": "2.6.10+dfsg-1ubuntu5",
+      "version": "2.6.10+dfsg-1ubuntu5",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/o/openldap/libldap-common_2.6.10+dfsg-1ubuntu5_all.deb",
+      "sha256": "919b209f5040c1dca1d9c3912521e4bc476028c2e16905ab09347004a599a722",
+      "license_path": "/usr/share/doc/libldap-common/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "libldap2",
+      "source_name": "openldap",
+      "source_version": "2.6.10+dfsg-1ubuntu5",
+      "version": "2.6.10+dfsg-1ubuntu5",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/o/openldap/libldap2_2.6.10+dfsg-1ubuntu5_amd64.deb",
+      "sha256": "8d3a361e8655a0ff4a390243059949fa6f22d42d0e266f58b57c124eb21d2993",
+      "license_path": "/usr/share/doc/libldap2/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.38), libsasl2-2 (>= 2.1.28+dfsg1), libssl3t64 (>= 3.0.0), libldap-common",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
       "name": "libllhttp9.3",
       "source_name": "llhttp",
       "source_version": "9.3.3~really9.3.0+~cs12.11.8-3build1",
@@ -189,6 +529,23 @@
       "depends": "libc6 (>= 2.3.4)",
       "pre_depends": "",
       "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "libnettle8t64",
+      "source_name": "nettle",
+      "source_version": "3.10.2-1",
+      "version": "3.10.2-1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/n/nettle/libnettle8t64_3.10.2-1_amd64.deb",
+      "sha256": "83a2a924c11759a2ed6e6f98f456d28e1b026974ce9e6e7ef12c9ac43b2d543e",
+      "license_path": "/usr/share/doc/libnettle8t64/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.17)",
+      "pre_depends": "",
+      "component": "main",
       "suite": "resolute"
     },
     {
@@ -223,6 +580,57 @@
       "depends": "libada-url0-3 (>= 3.3.0), libbrotli1 (>= 1.0.0), libc6 (>= 2.43), libcares2 (>= 1.28.0), libgcc-s1 (>= 3.4), libicu78 (>= 78.1-1~), libllhttp9.3 (>= 9.3.0), libnghttp2-14 (>= 1.57.0), libsimdjson29 (>= 4.2.4), libsimdutf31 (>= 8.0.0), libsqlite3-0 (>= 3.37.0), libssl3t64 (>= 3.4.0), libstdc++6 (>= 13.1), libuv1t64 (>= 1.51.0~), libzstd1 (>= 1.5.5), zlib1g (>= 1:1.1.4), node-acorn (>= 8.16.0~), node-cjs-module-lexer (>= 1.2.2~), node-minimatch (>= 9.0.3-5), node-undici (>= 5.0.0~)",
       "pre_depends": "",
       "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "libp11-kit0",
+      "source_name": "p11-kit",
+      "source_version": "0.26.2-2",
+      "version": "0.26.2-2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/p/p11-kit/libp11-kit0_0.26.2-2_amd64.deb",
+      "sha256": "e70d3422e24b267293215134458f340944bf10e92b27147594c69a7dd2823089",
+      "license_path": "/usr/share/doc/libp11-kit0/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.38), libffi8 (>= 3.4)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "libpng16-16t64",
+      "source_name": "libpng1.6",
+      "source_version": "1.6.57-1ubuntu0.1",
+      "version": "1.6.57-1ubuntu0.1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/libp/libpng1.6/libpng16-16t64_1.6.57-1ubuntu0.1_amd64.deb",
+      "sha256": "f24a7f7c0428d74e33ea934696987b7336ec0962f212535185f0493792e7536e",
+      "license_path": "/usr/share/doc/libpng16-16t64/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.29), zlib1g (>= 1:1.2.3.4)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "libpsl5t64",
+      "source_name": "libpsl",
+      "source_version": "0.21.2-1.1build2",
+      "version": "0.21.2-1.1build2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/libp/libpsl/libpsl5t64_0.21.2-1.1build2_amd64.deb",
+      "sha256": "1ae62705714f660ecdfd70273fce5b226b6cb7b9fe53776531799093edc99774",
+      "license_path": "/usr/share/doc/libpsl5t64/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libidn2-0 (>= 0.16), libc6 (>= 2.38), libunistring5 (>= 1.1)",
+      "pre_depends": "",
+      "component": "main",
       "suite": "resolute"
     },
     {
@@ -294,6 +702,57 @@
       "suite": "resolute"
     },
     {
+      "name": "librtmp1",
+      "source_name": "rtmpdump",
+      "source_version": "2.4+20151223.gitfa8646d.1-3",
+      "version": "2.4+20151223.gitfa8646d.1-3",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/r/rtmpdump/librtmp1_2.4+20151223.gitfa8646d.1-3_amd64.deb",
+      "sha256": "77cbd0ddf7e7487079ec300ff7751322de5e7d67f0f46749591b78ff1442cbe8",
+      "license_path": "/usr/share/doc/librtmp1/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.38), libgmp10 (>= 2:6.3.0+dfsg), libgnutls30t64 (>= 3.8.1), libhogweed6t64, libnettle8t64, zlib1g (>= 1:1.1.4)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "libsasl2-2",
+      "source_name": "cyrus-sasl2",
+      "source_version": "2.1.28+dfsg1-9ubuntu3",
+      "version": "2.1.28+dfsg1-9ubuntu3",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/c/cyrus-sasl2/libsasl2-2_2.1.28+dfsg1-9ubuntu3_amd64.deb",
+      "sha256": "11b9b2ce6702d86dd3dea60e08bd15255d7fd9545431a9e555eec47770404de0",
+      "license_path": "/usr/share/doc/libsasl2-2/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libsasl2-modules-db (>= 2.1.28+dfsg1-9ubuntu3), libc6 (>= 2.38), libssl3t64 (>= 3.0.0)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "libsasl2-modules-db",
+      "source_name": "cyrus-sasl2",
+      "source_version": "2.1.28+dfsg1-9ubuntu3",
+      "version": "2.1.28+dfsg1-9ubuntu3",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/c/cyrus-sasl2/libsasl2-modules-db_2.1.28+dfsg1-9ubuntu3_amd64.deb",
+      "sha256": "1de7b83844537091315210afb466ff2cd022874db5a6a785ce06b41bd3507eb3",
+      "license_path": "/usr/share/doc/libsasl2-modules-db/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.14), libdb5.3t64",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
       "name": "libsimdjson29",
       "source_name": "simdjson",
       "source_version": "4.2.4-1",
@@ -343,6 +802,40 @@
       "pre_depends": "",
       "component": "main",
       "suite": "resolute-updates"
+    },
+    {
+      "name": "libssh2-1t64",
+      "source_name": "libssh2",
+      "source_version": "1.11.1-1ubuntu0.26.04.4",
+      "version": "1.11.1-1ubuntu0.26.04.4",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/libs/libssh2/libssh2-1t64_1.11.1-1ubuntu0.26.04.4_amd64.deb",
+      "sha256": "bb3e334dc885d124d38cd4350f1cb4606c03ce58e9f53dc51a84c2c8d11c84e1",
+      "license_path": "/usr/share/doc/libssh2-1t64/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.38), libssl3t64 (>= 3.0.0), zlib1g (>= 1:1.1.4)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "libtasn1-6",
+      "source_name": "libtasn1-6",
+      "source_version": "4.21.0-2",
+      "version": "4.21.0-2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/libt/libtasn1-6/libtasn1-6_4.21.0-2_amd64.deb",
+      "sha256": "59c74951324ead0ff77ab945d561feb1b21bc189b793600b8e2b7cf4d39b1ee5",
+      "license_path": "/usr/share/doc/libtasn1-6/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.38)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
     },
     {
       "name": "libunistring5",
@@ -685,6 +1178,23 @@
       "suite": "resolute"
     },
     {
+      "name": "openssl",
+      "source_name": "openssl",
+      "source_version": "3.5.5-1ubuntu3.7",
+      "version": "3.5.5-1ubuntu3.7",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/o/openssl/openssl_3.5.5-1ubuntu3.7_amd64.deb",
+      "sha256": "6965aafe69e0a49ef34d2e26f8e83d09d1c6037b7e9ee37f19b292a3c6851621",
+      "license_path": "/usr/share/doc/openssl/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.38), libssl3t64 (>= 3.5.0)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
       "name": "python3",
       "source_name": "python3-defaults",
       "source_version": "3.14.3-0ubuntu2",
@@ -716,6 +1226,40 @@
       "depends": "",
       "pre_depends": "python3.14-minimal (>= 3.14.3)",
       "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "python3-pip-whl",
+      "source_name": "python-pip",
+      "source_version": "25.1.1+dfsg-1ubuntu2",
+      "version": "25.1.1+dfsg-1ubuntu2",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/p/python-pip/python3-pip-whl_25.1.1+dfsg-1ubuntu2_all.deb",
+      "sha256": "ee08bb36dcd86a0e0aa96611d4da8b87a3253c8220b535def261e91631bb47bd",
+      "license_path": "/usr/share/doc/python3-pip-whl/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "ca-certificates",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute"
+    },
+    {
+      "name": "python3-setuptools-whl",
+      "source_name": "setuptools",
+      "source_version": "78.1.1-0.1build1",
+      "version": "78.1.1-0.1build1",
+      "architecture": "all",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/s/setuptools/python3-setuptools-whl_78.1.1-0.1build1_all.deb",
+      "sha256": "e945108f14dab1ed9ac2ebe813286cca2073c962097bcc8a796bd141c8d15fcb",
+      "license_path": "/usr/share/doc/python3-setuptools-whl/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "",
+      "pre_depends": "",
+      "component": "universe",
       "suite": "resolute"
     },
     {
@@ -753,6 +1297,23 @@
       "suite": "resolute-updates"
     },
     {
+      "name": "python3.14-venv",
+      "source_name": "python3.14",
+      "source_version": "3.14.4-1ubuntu0.2",
+      "version": "3.14.4-1ubuntu0.2",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/universe/p/python3.14/python3.14-venv_3.14.4-1ubuntu0.2_amd64.deb",
+      "sha256": "cad2456bf3cb57cb18d2c82b48b549e5b4ac6eee9b3e14e65334209387e3d0ae",
+      "license_path": "/usr/share/doc/python3.14-venv/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "python3.14 (= 3.14.4-1ubuntu0.2), python3-pip-whl (>= 22.2), python3-setuptools-whl (>= 70.1)",
+      "pre_depends": "",
+      "component": "universe",
+      "suite": "resolute-updates"
+    },
+    {
       "name": "readline-common",
       "source_name": "readline",
       "source_version": "8.3-4",
@@ -785,6 +1346,57 @@
       "pre_depends": "",
       "component": "main",
       "suite": "resolute-updates"
+    },
+    {
+      "name": "unzip",
+      "source_name": "unzip",
+      "source_version": "6.0-29ubuntu1",
+      "version": "6.0-29ubuntu1",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/u/unzip/unzip_6.0-29ubuntu1_amd64.deb",
+      "sha256": "1f6f2bdcde84641e89c9367a7a99d90e990efa3e487a8d625241c2f9c55db5f4",
+      "license_path": "/usr/share/doc/unzip/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libbz2-1.0, libc6 (>= 2.34)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
+    },
+    {
+      "name": "wget",
+      "source_name": "wget",
+      "source_version": "1.25.0-2ubuntu4.4",
+      "version": "1.25.0-2ubuntu4.4",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/w/wget/wget_1.25.0-2ubuntu4.4_amd64.deb",
+      "sha256": "47f9cd72f1cf79865a128d101fbfb0fbf0db8606db318735078afab9af66be3b",
+      "license_path": "/usr/share/doc/wget/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libc6 (>= 2.38), libgnutls30t64 (>= 3.8.1), libidn2-0 (>= 0.6), libnettle8t64, libpcre2-8-0 (>= 10.22), libpsl5t64 (>= 0.16.0), libuuid1 (>= 2.16), zlib1g (>= 1:1.1.4)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute-updates"
+    },
+    {
+      "name": "zip",
+      "source_name": "zip",
+      "source_version": "3.0-15ubuntu3",
+      "version": "3.0-15ubuntu3",
+      "architecture": "amd64",
+      "url": "https://archive.ubuntu.com/ubuntu/pool/main/z/zip/zip_3.0-15ubuntu3_amd64.deb",
+      "sha256": "ef8e6376ecdaa82f4f7fbd1f6fb8cbf7818a1305c8e7b015c1aa9f4bdc77d12a",
+      "license_path": "/usr/share/doc/zip/copyright",
+      "required_by": [
+        "workload-tools"
+      ],
+      "depends": "libbz2-1.0, libc6 (>= 2.38)",
+      "pre_depends": "",
+      "component": "main",
+      "suite": "resolute"
     }
   ]
 }

@@ -519,6 +519,9 @@ impl Context {
                 "generation": vm.generation,
                 "processors": self.config.processors,
                 "memoryMiB": vm.memory_mib,
+                "sessionCapacity": self.session_isolation.then_some(self.config.session_capacity),
+                "sessionStorageMiB": self.session_isolation.then_some(
+                    crate::vm::session_storage_mib(vm.memory_mib, self.config.session_capacity)),
                 "idleMs": vm.idle().as_millis() as u64,
             })),
             "sessions": sessions,
@@ -990,6 +993,8 @@ impl Context {
     fn boot_probe(&self) -> Result<(), (String, String)> {
         let mut config = self.config.clone();
         config.memory_mib = protocol::PROBE_MEMORY_MIB;
+        // The capability VM only runs one probe; it does not host user sessions.
+        config.session_capacity = 1;
         config.store = self.config.store.join("probe");
         let _ = std::fs::remove_dir_all(&config.store);
         let vm = Vm::launch(config, |_| true)?;

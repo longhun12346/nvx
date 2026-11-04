@@ -38,9 +38,23 @@ jobs:
       GH_REPO: ${{ github.repository }}
       SHA: ${{ inputs.sha }}
     steps:
+      - name: Checkout publication tools
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Checkout the released source for metadata
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.sha }}
+          path: release-source
+          submodules: true
+          persist-credentials: false
+
       - name: Check the input
         run: |
           set -euo pipefail
+          python -m unittest discover -s scripts -p test_release_metadata.py
           [[ "${SHA}" =~ ^[0-9a-f]{40}$ ]] || { echo "sha must be a full lowercase commit hash"; exit 1; }
           echo "TAG=nvx-runtime-${SHA:0:8}" >> "${GITHUB_ENV}"
 
@@ -72,6 +86,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir out
+          python scripts/release_metadata.py --repo release-source --revision "${SHA}" \
+            --binaries dl/nvx-windows-x64 --guest dl/nvx-guest-assets --output out
           (cd dl/nvx-windows-x64 && zip -qr ../../out/nvx-windows-x64.zip .)
           (cd dl/nvx-guest-assets && zip -qr ../../out/nvx-guest-assets.zip .)
           {
@@ -85,6 +101,7 @@ jobs:
           - Binaries: run ${BINARIES_RUN} of Fork CI (nvx-windows-x64.zip: nvxd.exe, openvmm.exe, whp-legacy-cpuid-probe.exe).
           - Guest assets: run ${GUEST_RUN} of Fork guest assets (nvx-guest-assets.zip: vmlinux, base initramfs, nvxd-guest agent, EROFS distro layer, manifests).
           - SHA256SUMS covers the two zip files; CONTENT-SHA256SUMS.txt lists the files inside them.
+          - nvx-release-metadata.json records source identities, versions and every artifact file hash. Its checksum is in nvx-release-metadata.sha256. Consumers need no source checkout.
           - Nothing here is signed.
           - The Linux kernel (vmlinux) is GPL-2.0-only. Its corresponding source is Linux 6.18.38 (the archive named in vmlinux.provenance.json) with the patches in kernel/patches and the configuration kernel/config-microvm of this commit. The Ubuntu userland keeps its own licenses; its package list is in ubuntu-distro.erofs.manifest.json, and the sources are in the Ubuntu archive.
           - A rebuild of the same commit gives identical Ubuntu assets but a different vmlinux and different PE timestamps in the executables, so these files are the record to use, not a rebuild.
@@ -93,5 +110,5 @@ jobs:
       - name: Attach the files to the draft release
         run: |
           set -euo pipefail
-          gh release upload "${TAG}" out/nvx-windows-x64.zip out/nvx-guest-assets.zip out/SHA256SUMS out/CONTENT-SHA256SUMS.txt
+          gh release upload "${TAG}" out/nvx-windows-x64.zip out/nvx-guest-assets.zip out/SHA256SUMS out/CONTENT-SHA256SUMS.txt out/nvx-release-metadata.json out/nvx-release-metadata.sha256
           gh release edit "${TAG}" --title "NVX runtime assets ${SHA:0:8}" --notes-file out/NOTES.md
